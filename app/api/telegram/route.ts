@@ -46,6 +46,20 @@ function getSupabase() {
   return createClient(supabaseUrl, serviceRoleKey)
 }
 
+function isAllowedTelegramUser(telegramUserId: number): boolean {
+  const allowedTelegramUserIds = process.env.ALLOWED_TELEGRAM_USER_IDS
+
+  if (!allowedTelegramUserIds) {
+    return false
+  }
+
+  return allowedTelegramUserIds
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean)
+    .includes(String(telegramUserId))
+}
+
 async function findOrCreateUserAccount(params: FindOrCreateUserAccountParams): Promise<string> {
   const { supabase, platformUserId, username, firstName, lastName } = params
 
@@ -225,6 +239,20 @@ export async function POST(request: Request) {
       return new Response('OK', { status: 200 })
     }
 
+    const isLocalTestMode = process.env.LOCAL_TEST_MODE === 'true'
+
+    if (!isAllowedTelegramUser(from.id)) {
+      console.log('Blocked unauthorized Telegram user:', from.id)
+
+      if (isLocalTestMode) {
+        console.log('Local test unauthorized response:', 'Sorry, Bergi is currently private.')
+      } else {
+        await sendTelegramMessage(chatId, 'Sorry, Bergi is currently private.')
+      }
+
+      return new Response('OK', { status: 200 })
+    }
+
     const supabase = getSupabase()
     const userId = await findOrCreateUserAccount({
       supabase,
@@ -239,7 +267,6 @@ export async function POST(request: Request) {
     const recentMessages = await getRecentMessages({ supabase, userId })
     const trimmedMessages = trimMessagesByCharacterLimit(recentMessages, 4000)
     const llmResponse = await callLLM(trimmedMessages)
-    const isLocalTestMode = process.env.LOCAL_TEST_MODE === 'true'
 
     if (isLocalTestMode) {
       console.log('Local test LLM response:', llmResponse)
