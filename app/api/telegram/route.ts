@@ -1,9 +1,98 @@
+import { createClient } from '@supabase/supabase-js'
+
 type TelegramUpdate = {
   message?: {
+    from?: {
+      id?: number
+      username?: string
+      first_name?: string
+      last_name?: string
+    }
     chat?: {
       id?: number
     }
     text?: string
+  }
+}
+
+type FindOrCreateUserAccountParams = {
+  supabase: ReturnType<typeof getSupabase>
+  platformUserId: string
+  username?: string
+  firstName?: string
+  lastName?: string
+}
+
+type SaveMessageParams = {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  role: 'user' | 'assistant'
+  content: string
+}
+
+function getSupabase() {
+  const supabaseUrl = process.env.SUPABASE_URL
+  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+
+  if (!supabaseUrl || !serviceRoleKey) {
+    throw new Error('Missing Supabase environment variables')
+  }
+
+  return createClient(supabaseUrl, serviceRoleKey)
+}
+
+async function findOrCreateUserAccount(params: FindOrCreateUserAccountParams): Promise<string> {
+  const { supabase, platformUserId, username, firstName, lastName } = params
+
+  const { data: existingAccount, error: existingAccountError } = await supabase
+    .from('user_accounts')
+    .select('user_id')
+    .eq('platform', 'telegram')
+    .eq('platform_user_id', platformUserId)
+    .maybeSingle()
+
+  if (existingAccountError) {
+    throw existingAccountError
+  }
+
+  if (existingAccount?.user_id) {
+    return existingAccount.user_id
+  }
+
+  const { data: user, error: userError } = await supabase.from('users').insert({}).select('id').single()
+
+  if (userError) {
+    throw userError
+  }
+
+  const { error: userAccountError } = await supabase.from('user_accounts').insert({
+    user_id: user.id,
+    platform: 'telegram',
+    platform_user_id: platformUserId,
+    username: username ?? null,
+    first_name: firstName ?? null,
+    last_name: lastName ?? null,
+  })
+
+  if (userAccountError) {
+    throw userAccountError
+  }
+
+  return user.id
+}
+
+async function saveMessage(params: SaveMessageParams): Promise<void> {
+  const { supabase, userId, role, content } = params
+
+  const { error } = await supabase.from('messages').insert({
+    user_id: userId,
+    platform: 'telegram',
+    role,
+    content,
+  })
+
+  if (error) {
+    throw error
   }
 }
 
@@ -71,15 +160,29 @@ export async function POST(request: Request) {
     const update = (await request.json()) as TelegramUpdate
     const chatId = update.message?.chat?.id
     const userText = update.message?.text
+    const from = update.message?.from
 
     console.log('Telegram webhook message:', update.message)
 
-    if (chatId === undefined || !userText) {
+    if (chatId === undefined || !userText || from?.id === undefined) {
       return new Response('OK', { status: 200 })
     }
 
+    const supabase = getSupabase()
+    const userId = await findOrCreateUserAccount({
+      supabase,
+      platformUserId: String(from.id),
+      username: from.username,
+      firstName: from.first_name,
+      lastName: from.last_name,
+    })
+
+    await saveMessage({ supabase, userId, role: 'user', content: userText })
+
     const llmResponse = await callLLM(userText)
+
     await sendTelegramMessage(chatId, llmResponse)
+    await saveMessage({ supabase, userId, role: 'assistant', content: llmResponse })
   } catch (error) {
     console.error('Telegram webhook error:', error)
   }
