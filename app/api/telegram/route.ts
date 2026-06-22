@@ -15,6 +15,11 @@ type TelegramUpdate = {
   }
 }
 
+type ChatMessage = {
+  role: 'user' | 'assistant'
+  content: string
+}
+
 type FindOrCreateUserAccountParams = {
   supabase: ReturnType<typeof getSupabase>
   platformUserId: string
@@ -96,7 +101,58 @@ async function saveMessage(params: SaveMessageParams): Promise<void> {
   }
 }
 
-async function callLLM(userText: string): Promise<string> {
+async function getRecentMessages(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+}): Promise<Array<{ role: 'user' | 'assistant'; content: string }>> {
+  const { supabase, userId } = params
+
+  const { data, error } = await supabase
+    .from('messages')
+    .select('role, content')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+    .limit(20)
+
+  if (error) {
+    throw error
+  }
+
+  return (data ?? [])
+    .reverse()
+    .map((message) => ({ role: message.role as 'user' | 'assistant', content: message.content as string }))
+}
+
+function trimMessagesByCharacterLimit(
+  messages: Array<{ role: 'user' | 'assistant'; content: string }>,
+  maxCharacters: number
+): Array<{ role: 'user' | 'assistant'; content: string }> {
+  const selectedMessages: Array<{ role: 'user' | 'assistant'; content: string }> = []
+  let totalCharacters = 0
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    const messageLength = message.content.length
+
+    if (totalCharacters + messageLength > maxCharacters) {
+      if (selectedMessages.length === 0) {
+        selectedMessages.push({
+          ...message,
+          content: message.content.slice(0, maxCharacters),
+        })
+      }
+
+      continue
+    }
+
+    selectedMessages.push(message)
+    totalCharacters += messageLength
+  }
+
+  return selectedMessages.reverse()
+}
+
+async function callLLM(chatMessages: Array<{ role: 'user' | 'assistant'; content: string }>): Promise<string> {
   const baseUrl = process.env.OPENAI_BASE_URL
   const apiKey = process.env.OPENAI_API_KEY
   const model = process.env.OPENAI_MODEL
@@ -117,9 +173,10 @@ async function callLLM(userText: string): Promise<string> {
       messages: [
         {
           role: 'system',
-          content: "You are Bergi, Min's friendly AI companion. Reply casually, warmly, and concisely.",
+          content:
+            "You are Bergi, Min's friendly AI companion. Reply casually, warmly, and concisely. Use recent chat history for context, but do not over-explain.",
         },
-        { role: 'user', content: userText },
+        ...chatMessages,
       ],
     }),
   })
@@ -179,7 +236,15 @@ export async function POST(request: Request) {
 
     await saveMessage({ supabase, userId, role: 'user', content: userText })
 
-    const llmResponse = await callLLM(userText)
+    const recentMessages = await getRecentMessages({ supabase, userId })
+    const trimmedMessages = trimMessagesByCharacterLimit(recentMessages, 4000)
+    const llmResponse = await callLLM(trimmedMessages)
+
+    if (chatId === 123) {
+      console.log('Local test LLM response:', llmResponse)
+      await saveMessage({ supabase, userId, role: 'assistant', content: llmResponse })
+      return new Response('OK', { status: 200 })
+    }
 
     await sendTelegramMessage(chatId, llmResponse)
     await saveMessage({ supabase, userId, role: 'assistant', content: llmResponse })
