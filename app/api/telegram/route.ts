@@ -318,3 +318,11 @@ export async function POST(request: Request) {
 
   return new Response('OK', { status: 200 })
 }
+
+export async function GET() {
+  return Response.json({
+    ok: true,
+    route: 'telegram webhook',
+    message: 'Bergi Telegram route is alive',
+  })
+}
