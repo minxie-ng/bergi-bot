@@ -260,9 +260,11 @@ async function sendTelegramMessage(chatId: number, text: string): Promise<void> 
 }
 
 export async function POST(request: Request) {
+  let chatId: number | undefined
+
   try {
     const update = (await request.json()) as TelegramUpdate
-    const chatId = update.message?.chat?.id
+    chatId = update.message?.chat?.id
     const userText = update.message?.text
     const from = update.message?.from
 
@@ -314,6 +316,14 @@ export async function POST(request: Request) {
     }
   } catch (error) {
     console.error('Telegram webhook error:', error)
+
+    try {
+      if (chatId !== undefined) {
+        await sendTelegramMessage(chatId, 'eh minxie I glitch a bit just now 😵‍💫 try again later can?')
+      }
+    } catch (fallbackError) {
+      console.error('Telegram fallback message error:', fallbackError)
+    }
   }
 
   return new Response('OK', { status: 200 })
