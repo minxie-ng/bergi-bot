@@ -322,6 +322,12 @@ export async function POST(request: Request) {
         await sendTelegramMessage(chatId, nonTextReply)
       }
 
+      try {
+        await saveMessage({ supabase, userId, role: 'assistant', content: nonTextReply })
+      } catch (saveAssistantError) {
+        console.error('Failed to save non-text assistant reply:', saveAssistantError)
+      }
+
       return new Response('OK', { status: 200 })
     }
 
