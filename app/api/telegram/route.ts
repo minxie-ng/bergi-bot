@@ -239,15 +239,15 @@ export async function POST(request: Request) {
     const recentMessages = await getRecentMessages({ supabase, userId })
     const trimmedMessages = trimMessagesByCharacterLimit(recentMessages, 4000)
     const llmResponse = await callLLM(trimmedMessages)
+    const isLocalTestMode = process.env.LOCAL_TEST_MODE === 'true'
 
-    if (chatId === 123) {
+    if (isLocalTestMode) {
       console.log('Local test LLM response:', llmResponse)
       await saveMessage({ supabase, userId, role: 'assistant', content: llmResponse })
-      return new Response('OK', { status: 200 })
+    } else {
+      await sendTelegramMessage(chatId, llmResponse)
+      await saveMessage({ supabase, userId, role: 'assistant', content: llmResponse })
     }
-
-    await sendTelegramMessage(chatId, llmResponse)
-    await saveMessage({ supabase, userId, role: 'assistant', content: llmResponse })
   } catch (error) {
     console.error('Telegram webhook error:', error)
   }
