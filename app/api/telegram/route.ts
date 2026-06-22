@@ -12,6 +12,9 @@ type TelegramUpdate = {
       id?: number
     }
     text?: string
+    sticker?: unknown
+    animation?: unknown
+    voice?: unknown
   }
 }
 
@@ -267,14 +270,13 @@ export async function POST(request: Request) {
     chatId = update.message?.chat?.id
     const userText = update.message?.text
     const from = update.message?.from
+    const isLocalTestMode = process.env.LOCAL_TEST_MODE === 'true'
 
     console.log('Telegram webhook message:', update.message)
 
-    if (chatId === undefined || !userText || from?.id === undefined) {
+    if (chatId === undefined || from?.id === undefined) {
       return new Response('OK', { status: 200 })
     }
-
-    const isLocalTestMode = process.env.LOCAL_TEST_MODE === 'true'
 
     if (!isAllowedTelegramUser(from.id)) {
       console.log('Blocked unauthorized Telegram user:', from.id)
@@ -283,6 +285,26 @@ export async function POST(request: Request) {
         console.log('Local test unauthorized response:', 'Sorry, Bergi is currently private.')
       } else {
         await sendTelegramMessage(chatId, 'Sorry, Bergi is currently private.')
+      }
+
+      return new Response('OK', { status: 200 })
+    }
+
+    if (userText === undefined) {
+      let nonTextReply = "eh I received something, but I don't know how to process it yet 😵‍💫"
+
+      if (update.message?.sticker) {
+        nonTextReply = 'wah sticker only ah, I cannot read your mind yet 😭'
+      } else if (update.message?.animation) {
+        nonTextReply = 'gif received but I not smart enough to understand it yet sia'
+      } else if (update.message?.voice) {
+        nonTextReply = 'voice message received, but I cannot listen yet. next upgrade lah 🎤'
+      }
+
+      if (isLocalTestMode) {
+        console.log('Local test non-text response:', nonTextReply)
+      } else {
+        await sendTelegramMessage(chatId, nonTextReply)
       }
 
       return new Response('OK', { status: 200 })
