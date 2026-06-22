@@ -35,6 +35,12 @@ type SaveMessageParams = {
   content: string
 }
 
+type UserProfile = {
+  displayName: string | null
+  preferredLanguage: string | null
+  personalityPrompt: string
+}
+
 function getSupabase() {
   const supabaseUrl = process.env.SUPABASE_URL
   const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -115,6 +121,33 @@ async function saveMessage(params: SaveMessageParams): Promise<void> {
   }
 }
 
+async function getUserProfile(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+}): Promise<UserProfile | null> {
+  const { supabase, userId } = params
+
+  const { data, error } = await supabase
+    .from('user_profiles')
+    .select('display_name, preferred_language, personality_prompt')
+    .eq('user_id', userId)
+    .maybeSingle()
+
+  if (error) {
+    throw error
+  }
+
+  if (!data) {
+    return null
+  }
+
+  return {
+    displayName: data.display_name,
+    preferredLanguage: data.preferred_language,
+    personalityPrompt: data.personality_prompt,
+  }
+}
+
 async function getRecentMessages(params: {
   supabase: ReturnType<typeof getSupabase>
   userId: string
@@ -166,7 +199,8 @@ function trimMessagesByCharacterLimit(
   return selectedMessages.reverse()
 }
 
-async function callLLM(chatMessages: Array<{ role: 'user' | 'assistant'; content: string }>): Promise<string> {
+async function callLLM(params: { chatMessages: ChatMessage[]; systemPrompt: string }): Promise<string> {
+  const { chatMessages, systemPrompt } = params
   const baseUrl = process.env.OPENAI_BASE_URL
   const apiKey = process.env.OPENAI_API_KEY
   const model = process.env.OPENAI_MODEL
@@ -187,8 +221,7 @@ async function callLLM(chatMessages: Array<{ role: 'user' | 'assistant'; content
       messages: [
         {
           role: 'system',
-          content:
-            "You are Bergi, Min's friendly AI companion. Reply casually, warmly, and concisely. Use recent chat history for context, but do not over-explain.",
+          content: systemPrompt,
         },
         ...chatMessages,
       ],
@@ -264,9 +297,13 @@ export async function POST(request: Request) {
 
     await saveMessage({ supabase, userId, role: 'user', content: userText })
 
+    const profile = await getUserProfile({ supabase, userId })
+    const systemPrompt =
+      profile?.personalityPrompt ??
+      'You are Bergi, a private AI friend on Telegram. Reply casually, warmly, and concisely. Use recent chat history for context, but do not over-explain.'
     const recentMessages = await getRecentMessages({ supabase, userId })
     const trimmedMessages = trimMessagesByCharacterLimit(recentMessages, 4000)
-    const llmResponse = await callLLM(trimmedMessages)
+    const llmResponse = await callLLM({ chatMessages: trimmedMessages, systemPrompt })
 
     if (isLocalTestMode) {
       console.log('Local test LLM response:', llmResponse)
