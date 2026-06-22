@@ -292,14 +292,29 @@ export async function POST(request: Request) {
 
     if (userText === undefined) {
       let nonTextReply = "eh I received something, but I don't know how to process it yet 😵‍💫"
+      let nonTextContent = '[unknown] user sent an unsupported message type'
 
       if (update.message?.sticker) {
         nonTextReply = 'wah sticker only ah, I cannot read your mind yet 😭'
+        nonTextContent = '[sticker] user sent a sticker'
       } else if (update.message?.animation) {
         nonTextReply = 'gif received but I not smart enough to understand it yet sia'
+        nonTextContent = '[gif] user sent a GIF'
       } else if (update.message?.voice) {
         nonTextReply = 'voice message received, but I cannot listen yet. next upgrade lah 🎤'
+        nonTextContent = '[voice] user sent a voice message'
       }
+
+      const supabase = getSupabase()
+      const userId = await findOrCreateUserAccount({
+        supabase,
+        platformUserId: String(from.id),
+        username: from.username,
+        firstName: from.first_name,
+        lastName: from.last_name,
+      })
+
+      await saveMessage({ supabase, userId, role: 'user', content: nonTextContent })
 
       if (isLocalTestMode) {
         console.log('Local test non-text response:', nonTextReply)
