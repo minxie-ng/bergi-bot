@@ -359,6 +359,7 @@ export async function POST(request: Request) {
     const update = (await request.json()) as TelegramUpdate
     chatId = update.message?.chat?.id
     const userText = update.message?.text
+    const voice = update.message?.voice
     const from = update.message?.from
     const isLocalTestMode = process.env.LOCAL_TEST_MODE === 'true'
 
@@ -380,7 +381,7 @@ export async function POST(request: Request) {
       return new Response('OK', { status: 200 })
     }
 
-    if (userText === undefined) {
+    if (userText === undefined && voice === undefined) {
       let nonTextReply = "eh I received something, but I don't know how to process it yet 😵‍💫"
       let nonTextContent = '[unknown] user sent an unsupported message type'
 
@@ -390,9 +391,6 @@ export async function POST(request: Request) {
       } else if (update.message?.animation) {
         nonTextReply = 'gif received but I not smart enough to understand it yet sia'
         nonTextContent = '[gif] user sent a GIF'
-      } else if (update.message?.voice) {
-        nonTextReply = 'voice message received, but I cannot listen yet. next upgrade lah 🎤'
-        nonTextContent = '[voice] user sent a voice message'
       }
 
       const supabase = getSupabase()
@@ -430,14 +428,42 @@ export async function POST(request: Request) {
       lastName: from.last_name,
     })
 
-    await saveMessage({ supabase, userId, role: 'user', content: userText })
+    let userMessageToSave: string
+    let userMessageForLLM: string
+
+    if (voice !== undefined) {
+      const filePath = await getTelegramFilePath(voice.file_id)
+      const audioBuffer = await downloadTelegramFile(filePath)
+      const transcript = await transcribeAudio(audioBuffer)
+
+      userMessageToSave = `[voice transcript] ${transcript}`
+      userMessageForLLM = formatVoiceTranscriptForLLM(transcript)
+    } else {
+      userMessageToSave = userText
+      userMessageForLLM = userText
+    }
+
+    await saveMessage({ supabase, userId, role: 'user', content: userMessageToSave })
 
     const profile = await getUserProfile({ supabase, userId })
     const systemPrompt =
       profile?.personalityPrompt ??
       'You are Bergi, a private AI friend on Telegram. Reply casually, warmly, and concisely. Use recent chat history for context, but do not over-explain.'
     const recentMessages = await getRecentMessages({ supabase, userId })
-    const trimmedMessages = trimMessagesByCharacterLimit(recentMessages, 4000)
+    const recentMessagesForLLM = [...recentMessages]
+
+    if (voice !== undefined) {
+      for (let index = recentMessagesForLLM.length - 1; index >= 0; index -= 1) {
+        const message = recentMessagesForLLM[index]
+
+        if (message.role === 'user') {
+          recentMessagesForLLM[index] = { ...message, content: userMessageForLLM }
+          break
+        }
+      }
+    }
+
+    const trimmedMessages = trimMessagesByCharacterLimit(recentMessagesForLLM, 4000)
     const llmResponse = await callLLM({ chatMessages: trimmedMessages, systemPrompt })
 
     if (isLocalTestMode) {
