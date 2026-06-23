@@ -597,6 +597,35 @@ Reply naturally as Bergi using the recent conversation context.`
           break
         }
       }
+    } else if (userText !== undefined) {
+      let latestUserMessageIndex = -1
+
+      for (let index = recentMessagesForLLM.length - 1; index >= 0; index -= 1) {
+        if (recentMessagesForLLM[index].role === 'user') {
+          latestUserMessageIndex = index
+          break
+        }
+      }
+
+      const latestPhotoContext = recentMessagesForLLM
+        .slice(0, latestUserMessageIndex)
+        .reverse()
+        .find((message) => message.role === 'user' && message.content.startsWith('[photo]'))?.content
+
+      if (latestUserMessageIndex !== -1 && latestPhotoContext) {
+        recentMessagesForLLM[latestUserMessageIndex] = {
+          ...recentMessagesForLLM[latestUserMessageIndex],
+          content: `The user sent this text message after a recent photo.
+
+Recent photo context:
+${latestPhotoContext}
+
+Current text message:
+${userText}
+
+Reply naturally as Bergi. If the current text seems related to the photo, use the photo context. If it does not seem related, prioritize the text message.`,
+        }
+      }
     }
 
     const trimmedMessages = trimMessagesByCharacterLimit(recentMessagesForLLM, 4000)
