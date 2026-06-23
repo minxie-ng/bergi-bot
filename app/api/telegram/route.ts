@@ -57,6 +57,34 @@ type UserProfile = {
   personalityPrompt: string
 }
 
+type ReminderExtraction =
+  | {
+      action: 'create_reminder'
+      reminder_text: string
+      event_time: string | null
+      remind_at: string
+      timezone: string
+      confirmation_message: string
+    }
+  | {
+      action: 'ask_clarifying_question'
+      clarifying_question: string
+    }
+  | {
+      action: 'not_reminder'
+    }
+
+type SaveReminderParams = {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+  reminderText: string
+  eventTime: string | null
+  remindAt: string
+  timezone: string
+  sourceMessageContent: string
+}
+
 function getSupabase() {
   const supabaseUrl = process.env.SUPABASE_URL
   const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -90,6 +118,19 @@ function chooseTelegramPhotoSize(
   }
 
   return photoSizes[photoSizes.length - 1]
+}
+
+function isLikelyReminderRequest(text: string): boolean {
+  const lower = text.toLowerCase()
+  return (
+    lower.includes('remind me') ||
+    lower.includes('reminder') ||
+    lower.includes('提醒我') ||
+    lower.includes('提醒') ||
+    lower.includes('叫我') ||
+    lower.includes('let me know') ||
+    lower.includes('tell me before')
+  )
 }
 
 async function findOrCreateUserAccount(params: FindOrCreateUserAccountParams): Promise<string> {
@@ -140,6 +181,146 @@ async function saveMessage(params: SaveMessageParams): Promise<void> {
     platform: 'telegram',
     role,
     content,
+  })
+
+  if (error) {
+    throw error
+  }
+}
+
+function hasExplicitTimezoneOffset(value: string): boolean {
+  return /(?:Z|[+-]\d{2}:\d{2})$/i.test(value)
+}
+
+function parseReminderExtraction(raw: string): ReminderExtraction {
+  const cleaned = raw
+    .trim()
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/```$/i, '')
+    .trim()
+
+  try {
+    return JSON.parse(cleaned) as ReminderExtraction
+  } catch {
+    const firstBrace = cleaned.indexOf('{')
+    const lastBrace = cleaned.lastIndexOf('}')
+
+    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+      return JSON.parse(cleaned.slice(firstBrace, lastBrace + 1)) as ReminderExtraction
+    }
+
+    throw new Error(`Failed to parse reminder extraction JSON: ${raw}`)
+  }
+}
+
+async function extractReminderFromText(text: string): Promise<ReminderExtraction> {
+  const now = new Date()
+  const nowIso = now.toISOString()
+  const singaporeNow = new Intl.DateTimeFormat('en-SG', {
+    timeZone: 'Asia/Singapore',
+    dateStyle: 'full',
+    timeStyle: 'long',
+  }).format(now)
+  const parserPrompt = `You are extracting reminder information for Bergi.
+
+Current UTC time: ${nowIso}
+Current Asia/Singapore time: ${singaporeNow}
+Default timezone: Asia/Singapore
+
+Return ONLY valid JSON.
+
+If the user clearly asks to be reminded and enough information is available, return:
+{
+  "action": "create_reminder",
+  "reminder_text": "...",
+  "event_time": "ISO timestamp or null",
+  "remind_at": "ISO timestamp",
+  "timezone": "Asia/Singapore",
+  "confirmation_message": "..."
+}
+
+If the user asks for a reminder but the reminder time is unclear, return:
+{
+  "action": "ask_clarifying_question",
+  "clarifying_question": "..."
+}
+
+If this is not a reminder request, return:
+{
+  "action": "not_reminder"
+}
+
+Rules:
+- Default timezone is Asia/Singapore.
+- If the user does not mention a timezone or location, assume Asia/Singapore.
+- Resolve relative dates like "today", "tomorrow", "tonight", and "next week" based on the timezone being used, not UTC.
+- In confirmation_message, always mention the timezone used, for example "Singapore time".
+- If the user explicitly mentions a timezone or location, use the best matching timezone:
+  - Singapore / SG → Asia/Singapore
+  - China / Hangzhou / Shanghai / Beijing → Asia/Shanghai
+  - Malaysia / KL → Asia/Kuala_Lumpur
+  - Japan / Tokyo → Asia/Tokyo
+  - Korea / Seoul → Asia/Seoul
+  - Germany / Berlin → Europe/Berlin
+  - UK / London → Europe/London
+- If the user says something ambiguous like "local time", "when I'm overseas", or implies travel without a clear location/timezone, return:
+{
+  "action": "ask_clarifying_question",
+  "clarifying_question": "Which timezone should I use for this reminder — Singapore time or your local time?"
+}
+- For create_reminder, set the timezone field to the IANA timezone actually used.
+- remind_at and event_time should be valid ISO timestamps representing the correct instant for that timezone.
+- remind_at and event_time must include an explicit timezone offset or Z.
+- Good examples: 2026-06-24T18:30:00+08:00, 2026-06-24T10:30:00.000Z.
+- Bad example: 2026-06-24T18:30:00.
+- If the user says "meeting tomorrow at 7pm, remind me half an hour before", event_time should be tomorrow 7pm in the chosen timezone and remind_at should be 30 minutes before.
+- If the user says "remind me at 6:30pm tomorrow to prep for SMUX meeting", event_time can be null and remind_at should be tomorrow 6:30pm in the chosen timezone.
+- confirmation_message must clearly say this is captured/saved as a draft only and reminder sending is not active yet, for example:
+"Got it — I saved this reminder draft for tomorrow 6:30pm Singapore time. Reminder sending is not active yet, but the row is captured in Supabase."`
+
+  const response = await callLLM({
+    systemPrompt: parserPrompt,
+    chatMessages: [{ role: 'user', content: text }],
+  })
+
+  return parseReminderExtraction(response)
+}
+
+async function saveReminder(params: SaveReminderParams): Promise<void> {
+  const { supabase, userId, chatId, reminderText, eventTime, remindAt, sourceMessageContent } = params
+  const timezone = params.timezone || 'Asia/Singapore'
+
+  if (!reminderText.trim()) {
+    throw new Error('Reminder text is required')
+  }
+
+  if (Number.isNaN(Date.parse(remindAt))) {
+    throw new Error('Reminder remind_at is invalid')
+  }
+
+  if (!hasExplicitTimezoneOffset(remindAt)) {
+    throw new Error('Reminder remind_at must include timezone offset or Z')
+  }
+
+  if (eventTime !== null && Number.isNaN(Date.parse(eventTime))) {
+    throw new Error('Reminder event_time is invalid')
+  }
+
+  if (eventTime !== null && !hasExplicitTimezoneOffset(eventTime)) {
+    throw new Error('Reminder event_time must include timezone offset or Z')
+  }
+
+  const { error } = await supabase.from('reminders').insert({
+    user_id: userId,
+    platform: 'telegram',
+    telegram_chat_id: chatId,
+    reminder_text: reminderText,
+    event_time: eventTime,
+    remind_at: remindAt,
+    timezone,
+    status: 'draft',
+    source_message_content: sourceMessageContent,
   })
 
   if (error) {
@@ -590,6 +771,47 @@ Reply naturally as Bergi using the recent conversation context.`
     }
 
     await saveMessage({ supabase, userId, role: 'user', content: userMessageToSave })
+
+    if (userText !== undefined && voice === undefined && selectedPhoto === null && isLikelyReminderRequest(userText)) {
+      const reminderExtraction = await extractReminderFromText(userText)
+
+      if (reminderExtraction.action === 'create_reminder') {
+        await saveReminder({
+          supabase,
+          userId,
+          chatId,
+          reminderText: reminderExtraction.reminder_text,
+          eventTime: reminderExtraction.event_time,
+          remindAt: reminderExtraction.remind_at,
+          timezone: reminderExtraction.timezone || 'Asia/Singapore',
+          sourceMessageContent: userText,
+        })
+
+        const reminderConfirmation = formatForTelegramPlainText(reminderExtraction.confirmation_message)
+
+        if (isLocalTestMode) {
+          console.log('Local test reminder confirmation:', reminderConfirmation)
+        } else {
+          await sendTelegramMessage(chatId, reminderConfirmation)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: reminderConfirmation })
+        return new Response('OK', { status: 200 })
+      }
+
+      if (reminderExtraction.action === 'ask_clarifying_question') {
+        const clarifyingQuestion = formatForTelegramPlainText(reminderExtraction.clarifying_question)
+
+        if (isLocalTestMode) {
+          console.log('Local test reminder clarifying question:', clarifyingQuestion)
+        } else {
+          await sendTelegramMessage(chatId, clarifyingQuestion)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: clarifyingQuestion })
+        return new Response('OK', { status: 200 })
+      }
+    }
 
     const profile = await getUserProfile({ supabase, userId })
     const systemPrompt =
