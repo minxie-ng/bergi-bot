@@ -12,6 +12,7 @@ type TelegramUpdate = {
       id?: number
     }
     text?: string
+    caption?: string
     sticker?: unknown
     animation?: unknown
     voice?: {
@@ -261,7 +262,7 @@ async function callLLM(params: { chatMessages: ChatMessage[]; systemPrompt: stri
   return data.choices?.[0]?.message?.content ?? 'Sorry, I could not generate a response.'
 }
 
-async function describeImage(imageBuffer: ArrayBuffer, mimeType = 'image/jpeg'): Promise<string> {
+async function describeImage(imageBuffer: ArrayBuffer, mimeType = 'image/jpeg', caption?: string): Promise<string> {
   const baseUrl = process.env.OPENAI_BASE_URL
   const apiKey = process.env.OPENAI_API_KEY
   const model = process.env.OPENAI_MODEL
@@ -272,6 +273,12 @@ async function describeImage(imageBuffer: ArrayBuffer, mimeType = 'image/jpeg'):
 
   const base64Image = Buffer.from(imageBuffer).toString('base64')
   const imageDataUrl = `data:${mimeType};base64,${base64Image}`
+  const prompt = caption
+    ? `The user sent a Telegram photo with this caption/question:
+${caption}
+
+Analyze the image specifically to help answer the caption/question. Focus only on what is visible in the image. If the caption asks for a count, estimate the count from the visible image. If unsure, say that it is approximate. Do not write as Bergi. Do not make jokes. Do not suggest a reply. Return only a short neutral image analysis that can be used as context for a later chat reply.`
+    : 'Describe this image briefly in 1–2 sentences. Focus only on what is visibly in the image. Do not suggest a reply. Do not write as Bergi. Do not include headings, bullet points, or labels. Just return a short neutral description that can be used as context for a later chat reply.'
 
   const response = await fetch(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
     method: 'POST',
@@ -287,7 +294,7 @@ async function describeImage(imageBuffer: ArrayBuffer, mimeType = 'image/jpeg'):
           content: [
             {
               type: 'text',
-              text: 'Describe this image briefly in 1–2 sentences. Focus only on what is visibly in the image. Do not suggest a reply. Do not write as Bergi. Do not include headings, bullet points, or labels. Just return a short neutral description that can be used as context for a later chat reply.',
+              text: prompt,
             },
             {
               type: 'image_url',
@@ -430,6 +437,7 @@ export async function POST(request: Request) {
     const update = (await request.json()) as TelegramUpdate
     chatId = update.message?.chat?.id
     const userText = update.message?.text
+    const caption = update.message?.caption
     const voice = update.message?.voice
     const photo = update.message?.photo
     const from = update.message?.from
@@ -540,15 +548,28 @@ export async function POST(request: Request) {
     } else if (selectedPhoto !== null) {
       const filePath = await getTelegramFilePath(selectedPhoto.file_id)
       const imageBuffer = await downloadTelegramFile(filePath)
-      const imageDescription = await describeImage(imageBuffer)
+      const imageDescription = await describeImage(imageBuffer, 'image/jpeg', caption)
 
-      userMessageToSave = `[photo] ${imageDescription}`
-      userMessageForLLM = `The user sent a Telegram photo. The image was analyzed automatically.
+      if (caption) {
+        userMessageToSave = `[photo] ${imageDescription}\n[caption] ${caption}`
+        userMessageForLLM = `The user sent a Telegram photo with a caption/question. Use the image analysis below to answer the user's caption/question directly first. After answering, you may add Bergi personality lightly, but do not ignore the question.
+
+Image description:
+${imageDescription}
+
+User caption:
+${caption}
+
+Reply naturally as Bergi using the recent conversation context.`
+      } else {
+        userMessageToSave = `[photo] ${imageDescription}`
+        userMessageForLLM = `The user sent a Telegram photo. The image was analyzed automatically.
 
 Image description:
 ${imageDescription}
 
 Reply naturally as Bergi using the recent conversation context.`
+      }
     } else {
       if (userText === undefined) {
         throw new Error('Expected text message but userText was undefined')
