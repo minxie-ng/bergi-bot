@@ -439,6 +439,10 @@ export async function POST(request: Request) {
       userMessageToSave = `[voice transcript] ${transcript}`
       userMessageForLLM = formatVoiceTranscriptForLLM(transcript)
     } else {
+      if (userText === undefined) {
+        throw new Error('Expected text message but userText was undefined')
+      }
+
       userMessageToSave = userText
       userMessageForLLM = userText
     }
