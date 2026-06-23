@@ -74,6 +74,29 @@ type ReminderExtraction =
       action: 'not_reminder'
     }
 
+type FutureEventExtraction =
+  | {
+      action: 'future_event_detected'
+      event_title: string
+      event_time: string
+      timezone: string
+      ask_message: string
+    }
+  | {
+      action: 'ask_clarifying_question'
+      clarifying_question: string
+    }
+  | {
+      action: 'not_future_event'
+    }
+
+type AwaitingReminderRow = {
+  id: string
+  event_time: string
+  timezone: string
+  reminder_text: string
+}
+
 type SaveReminderParams = {
   supabase: ReturnType<typeof getSupabase>
   userId: string
@@ -135,6 +158,87 @@ function isLikelyReminderRequest(text: string): boolean {
     lower.includes('erinnerung') ||
     lower.includes('erinnere mich daran') ||
     lower.includes('erinner mich daran')
+  )
+}
+
+function isLikelyFutureEventMention(text: string): boolean {
+  const lower = text.toLowerCase()
+
+  const hasTimeOrDate =
+    /\b\d{1,2}(:\d{2})?\s*(am|pm)\b/i.test(text) ||
+    /\b\d{1,2}\.\d{2}\s*(am|pm)?\b/i.test(text) ||
+    /\b\d{1,2}\s*uhr\b/i.test(text) ||
+    /\b\d{1,2}\.\s*(januar|februar|märz|maerz|april|mai|juni|juli|august|september|oktober|november|dezember)\b/i.test(lower) ||
+    lower.includes('later') ||
+    lower.includes('tomorrow') ||
+    lower.includes('next ') ||
+    lower.includes('today') ||
+    lower.includes('tonight') ||
+    lower.includes('morgen') ||
+    lower.includes('heute') ||
+    lower.includes('heute abend') ||
+    lower.includes('nächste') ||
+    lower.includes('naechste') ||
+    lower.includes('nächsten') ||
+    lower.includes('naechsten') ||
+    lower.includes('明天') ||
+    lower.includes('今天') ||
+    lower.includes('今晚')
+
+  const hasEventWord =
+    lower.includes('meeting') ||
+    lower.includes('class') ||
+    lower.includes('call') ||
+    lower.includes('interview') ||
+    lower.includes('appointment') ||
+    lower.includes('project') ||
+    lower.includes('presentation') ||
+    lower.includes('exam') ||
+    lower.includes('test') ||
+    lower.includes('deadline') ||
+    lower.includes('meetup') ||
+    lower.includes('trek') ||
+    lower.includes('treffen') ||
+    lower.includes('termin') ||
+    lower.includes('unterricht') ||
+    lower.includes('prüfung') ||
+    lower.includes('pruefung') ||
+    lower.includes('projekt') ||
+    lower.includes('projektmeeting') ||
+    lower.includes('anruf') ||
+    lower.includes('präsentation') ||
+    lower.includes('praesentation') ||
+    lower.includes('会议') ||
+    lower.includes('开会') ||
+    lower.includes('课') ||
+    lower.includes('考试') ||
+    lower.includes('面试') ||
+    lower.includes('项目') ||
+    lower.includes('截止')
+
+  return hasTimeOrDate && hasEventWord
+}
+
+function isLikelyReminderPreferenceReply(text: string): boolean {
+  const lower = text.toLowerCase().trim()
+  return (
+    lower.includes('mins before') ||
+    lower.includes('minutes before') ||
+    lower.includes('min before') ||
+    lower.includes('before') ||
+    lower.includes('half an hour before') ||
+    lower.includes('30 mins') ||
+    lower.includes('10 mins') ||
+    lower.includes('5 mins') ||
+    /\b\d+\s*(mins?|minutes?)\b/i.test(text) ||
+    /\b\d+\s*minuten\b/i.test(lower) ||
+    lower.includes('vorher') ||
+    /(?:提前)?\d+\s*分钟(?:前)?/.test(text) ||
+    lower === 'no' ||
+    lower === 'nah' ||
+    lower === 'no need' ||
+    lower.includes('不用') ||
+    lower.includes('不需要')
   )
 }
 
@@ -219,6 +323,44 @@ function parseReminderExtraction(raw: string): ReminderExtraction {
   }
 }
 
+function parseFutureEventExtraction(raw: string): FutureEventExtraction {
+  const cleaned = raw
+    .trim()
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/```$/i, '')
+    .trim()
+
+  try {
+    return JSON.parse(cleaned) as FutureEventExtraction
+  } catch {
+    const firstBrace = cleaned.indexOf('{')
+    const lastBrace = cleaned.lastIndexOf('}')
+
+    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+      return JSON.parse(cleaned.slice(firstBrace, lastBrace + 1)) as FutureEventExtraction
+    }
+
+    throw new Error(`Failed to parse future event extraction JSON: ${raw}`)
+  }
+}
+
+function getTimezoneLabel(timezone: string): string {
+  if (timezone === 'Asia/Singapore') {
+    return 'Singapore time'
+  }
+
+  return timezone
+}
+
+function formatReminderTimeForUser(value: string, timezone: string): string {
+  return new Intl.DateTimeFormat('en-SG', {
+    timeZone: timezone,
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(new Date(value))
+}
+
 async function extractReminderFromText(text: string): Promise<ReminderExtraction> {
   const now = new Date()
   const nowIso = now.toISOString()
@@ -296,6 +438,66 @@ Rules:
   return parseReminderExtraction(response)
 }
 
+async function extractFutureEventFromText(text: string): Promise<FutureEventExtraction> {
+  const now = new Date()
+  const nowIso = now.toISOString()
+  const singaporeNow = new Intl.DateTimeFormat('en-SG', {
+    timeZone: 'Asia/Singapore',
+    dateStyle: 'full',
+    timeStyle: 'long',
+  }).format(now)
+  const parserPrompt = `You are detecting future events for Bergi.
+
+Current UTC time: ${nowIso}
+Current Asia/Singapore time: ${singaporeNow}
+Default timezone: Asia/Singapore
+
+Return ONLY valid JSON. Do not create reminders directly.
+
+If the user mentions a clear future event with enough event info and time info, return:
+{
+  "action": "future_event_detected",
+  "event_title": "...",
+  "event_time": "ISO timestamp with timezone offset or Z",
+  "timezone": "Asia/Singapore",
+  "ask_message": "..."
+}
+
+If the user seems to mention a future event but date/time is missing or unclear, return:
+{
+  "action": "ask_clarifying_question",
+  "clarifying_question": "..."
+}
+
+If this is not a future event mention, return:
+{
+  "action": "not_future_event"
+}
+
+Rules:
+- Default timezone is Asia/Singapore.
+- If the user does not mention a timezone or location, assume Asia/Singapore.
+- Resolve relative dates like "today", "later", "tomorrow", "tonight", and "next week" based on the timezone being used, not UTC.
+- Only detect future events that have enough event info and time info.
+- Do not create reminders directly. Ask whether Min wants a reminder.
+- event_time must include an explicit timezone offset or Z.
+- timezone must be an IANA timezone.
+- Also support simple German future event mentions, especially words like: Treffen, Termin, Unterricht, Prüfung, Projekt, Projektmeeting, Anruf, Präsentation.
+- German examples:
+  - "Ich habe morgen um 19 Uhr ein Treffen."
+  - "Ich habe nächsten Dienstag einen Termin."
+  - "Ich habe am 25. Juni 2026 um 8 Uhr ein Projektmeeting."
+- ask_message should ask whether Min wants to be reminded before the event.
+- Example ask_message: "Got it — meeting at 4:30pm Singapore time. Want me to remind you before it? Reply like '10 mins before' or 'no'."`
+
+  const response = await callLLM({
+    systemPrompt: parserPrompt,
+    chatMessages: [{ role: 'user', content: text }],
+  })
+
+  return parseFutureEventExtraction(response)
+}
+
 async function saveReminder(params: SaveReminderParams): Promise<void> {
   const { supabase, userId, chatId, reminderText, eventTime, remindAt, sourceMessageContent } = params
   const timezone = params.timezone || 'Asia/Singapore'
@@ -335,6 +537,139 @@ async function saveReminder(params: SaveReminderParams): Promise<void> {
   if (error) {
     throw error
   }
+}
+
+async function saveAwaitingReminderPreference(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+  eventTitle: string
+  eventTime: string
+  timezone: string
+  sourceMessageContent: string
+}): Promise<void> {
+  const { supabase, userId, chatId, eventTitle, eventTime, sourceMessageContent } = params
+  const timezone = params.timezone || 'Asia/Singapore'
+
+  if (!eventTitle.trim()) {
+    throw new Error('Future event title is required')
+  }
+
+  if (Number.isNaN(Date.parse(eventTime))) {
+    throw new Error('Future event_time is invalid')
+  }
+
+  if (!hasExplicitTimezoneOffset(eventTime)) {
+    throw new Error('Future event_time must include timezone offset or Z')
+  }
+
+  const { error } = await supabase.from('reminders').insert({
+    user_id: userId,
+    platform: 'telegram',
+    telegram_chat_id: chatId,
+    reminder_text: eventTitle,
+    event_time: eventTime,
+    remind_at: eventTime,
+    timezone,
+    status: 'awaiting_reminder_preference',
+    source_message_content: sourceMessageContent,
+  })
+
+  if (error) {
+    throw error
+  }
+}
+
+async function getLatestAwaitingReminder(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+}): Promise<AwaitingReminderRow | null> {
+  const { supabase, userId } = params
+  const sinceIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+
+  const { data, error } = await supabase
+    .from('reminders')
+    .select('id, event_time, timezone, reminder_text')
+    .eq('user_id', userId)
+    .eq('status', 'awaiting_reminder_preference')
+    .not('event_time', 'is', null)
+    .gte('created_at', sinceIso)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+
+  if (error) {
+    throw error
+  }
+
+  return data as AwaitingReminderRow | null
+}
+
+async function resolveReminderPreferenceReply(params: {
+  supabase: ReturnType<typeof getSupabase>
+  awaitingReminder: AwaitingReminderRow
+  userText: string
+}): Promise<string> {
+  const { supabase, awaitingReminder, userText } = params
+  const lower = userText.toLowerCase().trim()
+
+  if (lower === 'no' || lower === 'nah' || lower === 'no need' || lower.includes('不用') || lower.includes('不需要')) {
+    const { error } = await supabase
+      .from('reminders')
+      .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+      .eq('id', awaitingReminder.id)
+      .eq('status', 'awaiting_reminder_preference')
+
+    if (error) {
+      throw error
+    }
+
+    return "Okay, I won’t remind you for that."
+  }
+
+  let minutesBefore: number | null = null
+  const minutesMatch = lower.match(/(\d+)\s*(mins?|minutes?)(\s*before)?/)
+  const germanMinutesMatch = lower.match(/(\d+)\s*minuten\s*vorher/)
+  const chineseMinutesMatch = lower.match(/(?:提前)?(\d+)\s*分钟(?:前)?/)
+
+  if (minutesMatch) {
+    minutesBefore = Number(minutesMatch[1])
+  } else if (germanMinutesMatch) {
+    minutesBefore = Number(germanMinutesMatch[1])
+  } else if (chineseMinutesMatch) {
+    minutesBefore = Number(chineseMinutesMatch[1])
+  } else if (lower.includes('half an hour before') || lower.includes('30 mins')) {
+    minutesBefore = 30
+  } else if (lower.includes('10 mins')) {
+    minutesBefore = 10
+  } else if (lower.includes('5 mins')) {
+    minutesBefore = 5
+  }
+
+  if (minutesBefore === null || Number.isNaN(minutesBefore) || minutesBefore <= 0 || minutesBefore > 1440) {
+    return 'How early before should I remind you? For example, 10 mins before or 30 mins before.'
+  }
+
+  const remindAt = new Date(new Date(awaitingReminder.event_time).getTime() - minutesBefore * 60 * 1000).toISOString()
+
+  if (new Date(remindAt).getTime() <= Date.now()) {
+    return 'That reminder time has already passed. Do you want me to remind you now, or choose another time?'
+  }
+  const { error } = await supabase
+    .from('reminders')
+    .update({
+      remind_at: remindAt,
+      status: 'pending',
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', awaitingReminder.id)
+    .eq('status', 'awaiting_reminder_preference')
+
+  if (error) {
+    throw error
+  }
+
+  return `Okay, I’ll remind you at ${formatReminderTimeForUser(remindAt, awaitingReminder.timezone)} ${getTimezoneLabel(awaitingReminder.timezone)}.`
 }
 
 async function getUserProfile(params: {
@@ -781,7 +1116,9 @@ Reply naturally as Bergi using the recent conversation context.`
 
     await saveMessage({ supabase, userId, role: 'user', content: userMessageToSave })
 
-    if (userText !== undefined && voice === undefined && selectedPhoto === null && isLikelyReminderRequest(userText)) {
+    const isPlainTextMessage = userText !== undefined && voice === undefined && selectedPhoto === null
+
+    if (isPlainTextMessage && isLikelyReminderRequest(userText)) {
       const reminderExtraction = await extractReminderFromText(userText)
 
       if (reminderExtraction.action === 'create_reminder') {
@@ -819,6 +1156,65 @@ Reply naturally as Bergi using the recent conversation context.`
 
         await saveMessage({ supabase, userId, role: 'assistant', content: clarifyingQuestion })
         return new Response('OK', { status: 200 })
+      }
+    }
+
+    if (isPlainTextMessage && !isLikelyReminderRequest(userText)) {
+      const awaitingReminder = await getLatestAwaitingReminder({ supabase, userId })
+
+      if (awaitingReminder && isLikelyReminderPreferenceReply(userText)) {
+        const preferenceReply = formatForTelegramPlainText(
+          await resolveReminderPreferenceReply({ supabase, awaitingReminder, userText })
+        )
+
+        if (isLocalTestMode) {
+          console.log('Local test reminder preference reply:', preferenceReply)
+        } else {
+          await sendTelegramMessage(chatId, preferenceReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: preferenceReply })
+        return new Response('OK', { status: 200 })
+      }
+
+      if (isLikelyFutureEventMention(userText)) {
+        const futureEventExtraction = await extractFutureEventFromText(userText)
+
+        if (futureEventExtraction.action === 'future_event_detected') {
+          await saveAwaitingReminderPreference({
+            supabase,
+            userId,
+            chatId,
+            eventTitle: futureEventExtraction.event_title,
+            eventTime: futureEventExtraction.event_time,
+            timezone: futureEventExtraction.timezone || 'Asia/Singapore',
+            sourceMessageContent: userText,
+          })
+
+          const askMessage = formatForTelegramPlainText(futureEventExtraction.ask_message)
+
+          if (isLocalTestMode) {
+            console.log('Local test future event ask message:', askMessage)
+          } else {
+            await sendTelegramMessage(chatId, askMessage)
+          }
+
+          await saveMessage({ supabase, userId, role: 'assistant', content: askMessage })
+          return new Response('OK', { status: 200 })
+        }
+
+        if (futureEventExtraction.action === 'ask_clarifying_question') {
+          const clarifyingQuestion = formatForTelegramPlainText(futureEventExtraction.clarifying_question)
+
+          if (isLocalTestMode) {
+            console.log('Local test future event clarifying question:', clarifyingQuestion)
+          } else {
+            await sendTelegramMessage(chatId, clarifyingQuestion)
+          }
+
+          await saveMessage({ supabase, userId, role: 'assistant', content: clarifyingQuestion })
+          return new Response('OK', { status: 200 })
+        }
       }
     }
 
