@@ -287,7 +287,7 @@ async function describeImage(imageBuffer: ArrayBuffer, mimeType = 'image/jpeg'):
           content: [
             {
               type: 'text',
-              text: 'Describe this image briefly and focus on details that would help Bergi reply naturally in a Telegram chat.',
+              text: 'Describe this image briefly in 1–2 sentences. Focus only on what is visibly in the image. Do not suggest a reply. Do not write as Bergi. Do not include headings, bullet points, or labels. Just return a short neutral description that can be used as context for a later chat reply.',
             },
             {
               type: 'image_url',
