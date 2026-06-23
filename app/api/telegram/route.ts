@@ -431,6 +431,7 @@ export async function POST(request: Request) {
     chatId = update.message?.chat?.id
     const userText = update.message?.text
     const voice = update.message?.voice
+    const photo = update.message?.photo
     const from = update.message?.from
     const isLocalTestMode = process.env.LOCAL_TEST_MODE === 'true'
 
@@ -452,7 +453,9 @@ export async function POST(request: Request) {
       return new Response('OK', { status: 200 })
     }
 
-    if (userText === undefined && voice === undefined) {
+    const selectedPhoto = chooseTelegramPhotoSize(photo)
+
+    if (userText === undefined && voice === undefined && selectedPhoto === null) {
       let nonTextReply = "eh I received something, but I don't know how to process it yet 😵‍💫"
       let nonTextContent = '[unknown] user sent an unsupported message type'
 
@@ -534,6 +537,18 @@ export async function POST(request: Request) {
 
       userMessageToSave = `[voice transcript] ${transcript}`
       userMessageForLLM = formatVoiceTranscriptForLLM(transcript)
+    } else if (selectedPhoto !== null) {
+      const filePath = await getTelegramFilePath(selectedPhoto.file_id)
+      const imageBuffer = await downloadTelegramFile(filePath)
+      const imageDescription = await describeImage(imageBuffer)
+
+      userMessageToSave = `[photo] ${imageDescription}`
+      userMessageForLLM = `The user sent a Telegram photo. The image was analyzed automatically.
+
+Image description:
+${imageDescription}
+
+Reply naturally as Bergi using the recent conversation context.`
     } else {
       if (userText === undefined) {
         throw new Error('Expected text message but userText was undefined')
@@ -552,7 +567,7 @@ export async function POST(request: Request) {
     const recentMessages = await getRecentMessages({ supabase, userId })
     const recentMessagesForLLM = [...recentMessages]
 
-    if (voice !== undefined) {
+    if (voice !== undefined || selectedPhoto !== null) {
       for (let index = recentMessagesForLLM.length - 1; index >= 0; index -= 1) {
         const message = recentMessagesForLLM[index]
 
