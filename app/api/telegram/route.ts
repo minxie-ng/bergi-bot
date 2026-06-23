@@ -81,6 +81,16 @@ function isAllowedTelegramUser(telegramUserId: number): boolean {
     .includes(String(telegramUserId))
 }
 
+function chooseTelegramPhotoSize(
+  photoSizes: NonNullable<TelegramUpdate['message']>['photo']
+): { file_id: string; width?: number; height?: number; file_size?: number } | null {
+  if (!photoSizes || photoSizes.length === 0) {
+    return null
+  }
+
+  return photoSizes[photoSizes.length - 1]
+}
+
 async function findOrCreateUserAccount(params: FindOrCreateUserAccountParams): Promise<string> {
   const { supabase, platformUserId, username, firstName, lastName } = params
 
