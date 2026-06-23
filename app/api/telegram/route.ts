@@ -129,7 +129,12 @@ function isLikelyReminderRequest(text: string): boolean {
     lower.includes('提醒') ||
     lower.includes('叫我') ||
     lower.includes('let me know') ||
-    lower.includes('tell me before')
+    lower.includes('tell me before') ||
+    lower.includes('erinnere mich') ||
+    lower.includes('erinner mich') ||
+    lower.includes('erinnerung') ||
+    lower.includes('erinnere mich daran') ||
+    lower.includes('erinner mich daran')
   )
 }
 
@@ -276,6 +281,10 @@ Rules:
 - Bad example: 2026-06-24T18:30:00.
 - If the user says "meeting tomorrow at 7pm, remind me half an hour before", event_time should be tomorrow 7pm in the chosen timezone and remind_at should be 30 minutes before.
 - If the user says "remind me at 6:30pm tomorrow to prep for SMUX meeting", event_time can be null and remind_at should be tomorrow 6:30pm in the chosen timezone.
+- German examples:
+  - "Erinnere mich in 3 Minuten daran, Wasser zu trinken."
+  - "Erinner mich morgen um 19 Uhr an mein Meeting."
+  - "Erinnere mich 30 Minuten vor meinem Treffen daran."
 - confirmation_message should clearly confirm the active reminder, mention the reminder time and timezone used, and stay concise.
 - Example confirmation_message: "Got it — I’ll remind you tomorrow at 6:30pm Singapore time."`
 
