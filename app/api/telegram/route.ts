@@ -14,7 +14,12 @@ type TelegramUpdate = {
     text?: string
     sticker?: unknown
     animation?: unknown
-    voice?: unknown
+    voice?: {
+      file_id: string
+      duration?: number
+      mime_type?: string
+      file_size?: number
+    }
   }
 }
 
@@ -237,6 +242,91 @@ async function callLLM(params: { chatMessages: ChatMessage[]; systemPrompt: stri
 
   const data = await response.json()
   return data.choices?.[0]?.message?.content ?? 'Sorry, I could not generate a response.'
+}
+
+async function getTelegramFilePath(fileId: string): Promise<string> {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN
+
+  if (!botToken) {
+    throw new Error('Missing Telegram bot token')
+  }
+
+  const response = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${encodeURIComponent(fileId)}`)
+
+  if (!response.ok) {
+    throw new Error(`Telegram getFile request failed: ${response.status}`)
+  }
+
+  const data = await response.json()
+  const filePath = data.result?.file_path
+
+  if (!data.ok || typeof filePath !== 'string') {
+    throw new Error('Telegram getFile response did not include a file path')
+  }
+
+  return filePath
+}
+
+async function downloadTelegramFile(filePath: string): Promise<ArrayBuffer> {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN
+
+  if (!botToken) {
+    throw new Error('Missing Telegram bot token')
+  }
+
+  const response = await fetch(`https://api.telegram.org/file/bot${botToken}/${filePath}`)
+
+  if (!response.ok) {
+    throw new Error(`Telegram file download failed: ${response.status}`)
+  }
+
+  return response.arrayBuffer()
+}
+
+async function transcribeAudio(audioBuffer: ArrayBuffer, filename = 'voice.ogg'): Promise<string> {
+  const baseUrl = process.env.TRANSCRIPTION_BASE_URL
+  const apiKey = process.env.TRANSCRIPTION_API_KEY
+  const model = process.env.TRANSCRIPTION_MODEL || 'whisper-1'
+
+  if (!baseUrl || !apiKey) {
+    throw new Error('Missing transcription environment variables')
+  }
+
+  const formData = new FormData()
+  const audioBlob = new Blob([audioBuffer], { type: 'audio/ogg' })
+
+  formData.append('model', model)
+  formData.append('file', audioBlob, filename)
+
+  const response = await fetch(`${baseUrl.replace(/\/$/, '')}/audio/transcriptions`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: formData,
+  })
+
+  if (!response.ok) {
+    throw new Error(`Audio transcription request failed: ${response.status}`)
+  }
+
+  const data = await response.json()
+
+  if (typeof data.text !== 'string') {
+    throw new Error('Audio transcription response did not include text')
+  }
+
+  return data.text
+}
+
+function formatVoiceTranscriptForLLM(transcript: string): string {
+  return `The user's message below was transcribed from a Telegram voice message.
+It may contain filler words, repeated phrases, incomplete sentences, mixed language, or transcription errors.
+Infer the user's intent carefully using the recent conversation context, but do not invent missing details.
+If the transcript is unclear, ask a brief clarifying question instead of pretending to understand.
+
+Transcript:
+${transcript}`
 }
 
 async function sendTelegramMessage(chatId: number, text: string): Promise<void> {
