@@ -97,6 +97,14 @@ type AwaitingReminderRow = {
   reminder_text: string
 }
 
+type ManagedReminderRow = {
+  id: string
+  reminder_text: string
+  remind_at: string
+  timezone: string
+  status: string
+}
+
 type SaveReminderParams = {
   supabase: ReturnType<typeof getSupabase>
   userId: string
@@ -247,6 +255,117 @@ function isLikelyReminderPreferenceReply(text: string): boolean {
     lower.includes('不用') ||
     lower.includes('不需要')
   )
+}
+
+function isLikelyListRemindersRequest(text: string): boolean {
+  const lower = text.toLowerCase().trim()
+  return (
+    lower.includes('list reminders') ||
+    lower.includes('show reminders') ||
+    lower.includes('what reminders do i have') ||
+    lower.includes('upcoming reminders') ||
+    lower.includes('my reminders') ||
+    lower.includes('我的提醒') ||
+    lower.includes('提醒列表') ||
+    lower.includes('有哪些提醒') ||
+    lower.includes('welche erinnerungen habe ich') ||
+    lower.includes('meine erinnerungen')
+  )
+}
+
+function isLikelyCancelReminderRequest(text: string): boolean {
+  const lower = text.toLowerCase().trim()
+  return (
+    lower.includes('cancel latest reminder') ||
+    lower.includes('cancel last reminder') ||
+    lower.includes('cancel my latest reminder') ||
+    lower.includes('delete latest reminder') ||
+    lower.includes('cancel next reminder') ||
+    lower.includes('delete next reminder') ||
+    lower.includes('remove next reminder') ||
+    lower.includes('cancel reminder') ||
+    lower.includes('delete reminder') ||
+    lower.includes('remove reminder') ||
+    lower.includes('取消最新提醒') ||
+    lower.includes('取消提醒')
+  )
+}
+
+function parseReminderCancelNumber(text: string): number | null {
+  const match = text.match(/(?:cancel|delete|remove)\s+reminder\s+(\d+)/i) ?? text.match(/取消提醒\s*(\d+)/)
+
+  if (!match) {
+    return null
+  }
+
+  return Number(match[1])
+}
+
+function formatManagedReminderTime(value: string, timezone: string): string {
+  return new Intl.DateTimeFormat('en-SG', {
+    timeZone: timezone,
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(new Date(value))
+}
+
+function formatUpcomingReminders(reminders: ManagedReminderRow[]): string {
+  if (reminders.length === 0) {
+    return 'You don’t have any upcoming reminders.'
+  }
+
+  const reminderLines = reminders.flatMap((reminder, index) => [
+    `${index + 1}. ${reminder.reminder_text}`,
+    `- Time: ${formatManagedReminderTime(reminder.remind_at, reminder.timezone)} ${getTimezoneLabel(reminder.timezone)}`,
+    `- Status: ${reminder.status}`,
+    '',
+  ])
+
+  return `Upcoming reminders:
+
+${reminderLines.join('\n').trim()}
+
+To cancel, say:
+cancel reminder 1`
+}
+
+async function getUpcomingReminders(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+}): Promise<ManagedReminderRow[]> {
+  const { supabase, userId } = params
+
+  const { data, error } = await supabase
+    .from('reminders')
+    .select('id, reminder_text, remind_at, timezone, status')
+    .eq('user_id', userId)
+    .in('status', ['pending', 'awaiting_reminder_preference'])
+    .gte('remind_at', new Date().toISOString())
+    .order('remind_at', { ascending: true })
+    .limit(10)
+
+  if (error) {
+    throw error
+  }
+
+  return (data ?? []) as ManagedReminderRow[]
+}
+
+async function cancelReminderById(params: {
+  supabase: ReturnType<typeof getSupabase>
+  reminderId: string
+}): Promise<void> {
+  const { supabase, reminderId } = params
+
+  const { error } = await supabase
+    .from('reminders')
+    .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+    .eq('id', reminderId)
+    .in('status', ['pending', 'awaiting_reminder_preference'])
+
+  if (error) {
+    throw error
+  }
 }
 
 async function findOrCreateUserAccount(params: FindOrCreateUserAccountParams): Promise<string> {
@@ -1152,6 +1271,66 @@ Reply naturally as Bergi using the recent conversation context.`
     await saveMessage({ supabase, userId, role: 'user', content: userMessageToSave })
 
     const isPlainTextMessage = userText !== undefined && voice === undefined && selectedPhoto === null
+
+    if (isPlainTextMessage && isLikelyListRemindersRequest(userText)) {
+      const upcomingReminders = await getUpcomingReminders({ supabase, userId })
+      const remindersReply = formatUpcomingReminders(upcomingReminders)
+
+      if (isLocalTestMode) {
+        console.log('Local test reminders list:', remindersReply)
+      } else {
+        await sendTelegramMessage(chatId, remindersReply)
+      }
+
+      await saveMessage({ supabase, userId, role: 'assistant', content: remindersReply })
+      return new Response('OK', { status: 200 })
+    }
+
+    if (isPlainTextMessage && isLikelyCancelReminderRequest(userText)) {
+      const upcomingReminders = await getUpcomingReminders({ supabase, userId })
+      const cancelNumber = parseReminderCancelNumber(userText)
+      const lowerUserText = userText.toLowerCase()
+      const shouldCancelNext =
+        lowerUserText.includes('cancel next reminder') ||
+        lowerUserText.includes('delete next reminder') ||
+        lowerUserText.includes('remove next reminder')
+      const shouldCancelLatest =
+        lowerUserText.includes('latest') || lowerUserText.includes('last') || lowerUserText.includes('最新')
+      let cancelReply: string
+
+      if (cancelNumber !== null) {
+        const reminderToCancel = upcomingReminders[cancelNumber - 1]
+
+        if (!reminderToCancel) {
+          cancelReply = `I can’t find reminder ${cancelNumber}. Say “list reminders” to see your upcoming reminders.`
+        } else {
+          await cancelReminderById({ supabase, reminderId: reminderToCancel.id })
+          cancelReply = `Cancelled reminder ${cancelNumber}: ${reminderToCancel.reminder_text}`
+        }
+      } else if (shouldCancelNext) {
+        const reminderToCancel = upcomingReminders[0]
+
+        if (!reminderToCancel) {
+          cancelReply = 'You don’t have any upcoming reminders.'
+        } else {
+          await cancelReminderById({ supabase, reminderId: reminderToCancel.id })
+          cancelReply = `Cancelled your next reminder: ${reminderToCancel.reminder_text}`
+        }
+      } else if (shouldCancelLatest) {
+        cancelReply = '“Latest” can be ambiguous. Say “list reminders” first, then “cancel reminder 1”, or say “cancel next reminder”.'
+      } else {
+        cancelReply = 'Which reminder should I cancel? Say “list reminders” to see them.'
+      }
+
+      if (isLocalTestMode) {
+        console.log('Local test cancel reminder reply:', cancelReply)
+      } else {
+        await sendTelegramMessage(chatId, cancelReply)
+      }
+
+      await saveMessage({ supabase, userId, role: 'assistant', content: cancelReply })
+      return new Response('OK', { status: 200 })
+    }
 
     if (isPlainTextMessage && isLikelyReminderRequest(userText)) {
       const reminderExtraction = await extractReminderFromText(userText)
