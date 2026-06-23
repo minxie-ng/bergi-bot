@@ -407,6 +407,16 @@ Transcript:
 ${transcript}`
 }
 
+function formatForTelegramPlainText(text: string): string {
+  return text
+    .replace(/\*\*(.*?)\*\*/g, '$1')
+    .replace(/\*(.*?)\*/g, '$1')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/^\s*(-{3,}|\*{3,}|_{3,})\s*$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
 async function sendTelegramMessage(chatId: number, text: string): Promise<void> {
   const botToken = process.env.TELEGRAM_BOT_TOKEN
 
@@ -605,18 +615,36 @@ Also use organise mode when Min sends a long, messy, brain-dump style message or
 
 In organise mode:
 - be clear and useful first
-- use short section titles
-- use bullet points or numbered steps
+- use compact plain-text structure
+- use short plain-text section labels like "Do this now:" or "Next steps:"
+- use numbered lists for priority/order
+- use simple bullets with "-"
 - remove repeated/filler ideas
 - preserve Min's intended meaning
 - do not invent missing details
 - ask a brief clarifying question if the message is too unclear
 - keep the output compact unless Min asks for detail
 
-In casual chat mode:
-- reply naturally as Bergi
-- keep the friend vibe
-- do not over-structure simple messages
+Telegram formatting rule:
+Telegram messages are currently sent as plain text. Do not use Markdown or HTML formatting.
+Never use:
+- **bold**
+- *italic*
+- ### headings
+- markdown tables
+- horizontal rules
+- backticks for emphasis
+
+Bad:
+**Do this now:**
+**1. Boss meeting prep**
+
+Good:
+Do this now:
+
+1. Boss meeting prep
+- What you finished
+- What is pending
 
 Style rule:
 Always answer Min's actual request first. Use humour, Singlish, and playful friend energy lightly, but not in every reply. Avoid turning every response into a comedy bit.
@@ -669,13 +697,14 @@ Reply naturally as Bergi. If the current text seems related to the photo, use th
 
     const trimmedMessages = trimMessagesByCharacterLimit(recentMessagesForLLM, 4000)
     const llmResponse = await callLLM({ chatMessages: trimmedMessages, systemPrompt: finalSystemPrompt })
+    const telegramReply = formatForTelegramPlainText(llmResponse)
 
     if (isLocalTestMode) {
-      console.log('Local test LLM response:', llmResponse)
-      await saveMessage({ supabase, userId, role: 'assistant', content: llmResponse })
+      console.log('Local test LLM response:', telegramReply)
+      await saveMessage({ supabase, userId, role: 'assistant', content: telegramReply })
     } else {
-      await sendTelegramMessage(chatId, llmResponse)
-      await saveMessage({ supabase, userId, role: 'assistant', content: llmResponse })
+      await sendTelegramMessage(chatId, telegramReply)
+      await saveMessage({ supabase, userId, role: 'assistant', content: telegramReply })
     }
   } catch (error) {
     console.error('Telegram webhook error:', error)
