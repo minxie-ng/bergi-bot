@@ -276,8 +276,8 @@ Rules:
 - Bad example: 2026-06-24T18:30:00.
 - If the user says "meeting tomorrow at 7pm, remind me half an hour before", event_time should be tomorrow 7pm in the chosen timezone and remind_at should be 30 minutes before.
 - If the user says "remind me at 6:30pm tomorrow to prep for SMUX meeting", event_time can be null and remind_at should be tomorrow 6:30pm in the chosen timezone.
-- confirmation_message must clearly say this is captured/saved as a draft only and reminder sending is not active yet, for example:
-"Got it — I saved this reminder draft for tomorrow 6:30pm Singapore time. Reminder sending is not active yet, but the row is captured in Supabase."`
+- confirmation_message should clearly confirm the active reminder, mention the reminder time and timezone used, and stay concise.
+- Example confirmation_message: "Got it — I’ll remind you tomorrow at 6:30pm Singapore time."`
 
   const response = await callLLM({
     systemPrompt: parserPrompt,
@@ -319,7 +319,7 @@ async function saveReminder(params: SaveReminderParams): Promise<void> {
     event_time: eventTime,
     remind_at: remindAt,
     timezone,
-    status: 'draft',
+    status: 'pending',
     source_message_content: sourceMessageContent,
   })
 
