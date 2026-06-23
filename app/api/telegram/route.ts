@@ -234,6 +234,13 @@ function isLikelyReminderPreferenceReply(text: string): boolean {
     /\b\d+\s*minuten\b/i.test(lower) ||
     lower.includes('vorher') ||
     /(?:提前)?\d+\s*分钟(?:前)?/.test(text) ||
+    /\b\d+\s*(hours?|hrs?)\b/i.test(text) ||
+    /\b\d+\s*stunden\b/i.test(lower) ||
+    /(?:提前)?\d+\s*小时(?:前)?/.test(text) ||
+    lower === 'now' ||
+    lower === 'remind me now' ||
+    lower.includes('现在') ||
+    lower.includes('马上') ||
     lower === 'no' ||
     lower === 'nah' ||
     lower === 'no need' ||
@@ -627,10 +634,32 @@ async function resolveReminderPreferenceReply(params: {
     return "Okay, I won’t remind you for that."
   }
 
+  if (lower === 'now' || lower === 'remind me now' || lower.includes('现在') || lower.includes('马上')) {
+    const nowIso = new Date().toISOString()
+    const { error } = await supabase
+      .from('reminders')
+      .update({
+        remind_at: nowIso,
+        status: 'pending',
+        updated_at: nowIso,
+      })
+      .eq('id', awaitingReminder.id)
+      .eq('status', 'awaiting_reminder_preference')
+
+    if (error) {
+      throw error
+    }
+
+    return 'Okay, I’ll remind you now.'
+  }
+
   let minutesBefore: number | null = null
   const minutesMatch = lower.match(/(\d+)\s*(mins?|minutes?)(\s*before)?/)
   const germanMinutesMatch = lower.match(/(\d+)\s*minuten\s*vorher/)
   const chineseMinutesMatch = lower.match(/(?:提前)?(\d+)\s*分钟(?:前)?/)
+  const hoursMatch = lower.match(/(\d+)\s*(hours?|hrs?)(\s*before)?/)
+  const germanHoursMatch = lower.match(/(\d+)\s*stunden\s*vorher/)
+  const chineseHoursMatch = lower.match(/(?:提前)?(\d+)\s*小时(?:前)?/)
 
   if (minutesMatch) {
     minutesBefore = Number(minutesMatch[1])
@@ -638,6 +667,12 @@ async function resolveReminderPreferenceReply(params: {
     minutesBefore = Number(germanMinutesMatch[1])
   } else if (chineseMinutesMatch) {
     minutesBefore = Number(chineseMinutesMatch[1])
+  } else if (hoursMatch) {
+    minutesBefore = Number(hoursMatch[1]) * 60
+  } else if (germanHoursMatch) {
+    minutesBefore = Number(germanHoursMatch[1]) * 60
+  } else if (chineseHoursMatch) {
+    minutesBefore = Number(chineseHoursMatch[1]) * 60
   } else if (lower.includes('half an hour before') || lower.includes('30 mins')) {
     minutesBefore = 30
   } else if (lower.includes('10 mins')) {
