@@ -432,6 +432,31 @@ export async function POST(request: Request) {
     let userMessageForLLM: string
 
     if (voice !== undefined) {
+      if (voice.duration !== undefined && voice.duration > 40) {
+        const voiceTooLongReply = 'wah minxie this voice note too long sia 😭 keep it under 40 seconds first'
+
+        await saveMessage({
+          supabase,
+          userId,
+          role: 'user',
+          content: '[voice too long] user sent a voice message longer than 40 seconds',
+        })
+
+        if (isLocalTestMode) {
+          console.log('Local test voice too long response:', voiceTooLongReply)
+        } else {
+          await sendTelegramMessage(chatId, voiceTooLongReply)
+        }
+
+        try {
+          await saveMessage({ supabase, userId, role: 'assistant', content: voiceTooLongReply })
+        } catch (saveAssistantError) {
+          console.error('Failed to save voice-too-long assistant reply:', saveAssistantError)
+        }
+
+        return new Response('OK', { status: 200 })
+      }
+
       const filePath = await getTelegramFilePath(voice.file_id)
       const audioBuffer = await downloadTelegramFile(filePath)
       const transcript = await transcribeAudio(audioBuffer)
