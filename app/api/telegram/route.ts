@@ -244,22 +244,16 @@ function isLikelyFutureEventMention(text: string): boolean {
 
 function isLikelyReminderPreferenceReply(text: string): boolean {
   const lower = text.toLowerCase().trim()
+  const standaloneDuration =
+    /^(?:yes,?\s*)?(?:remind me\s*)?\d+\s*(mins?|minutes?|hours?|hrs?)$/i.test(lower) ||
+    /^\d+\s*(minuten|stunden)$/i.test(lower) ||
+    /^\d+\s*(分钟|小时)$/.test(lower)
+
   return (
-    lower.includes('mins before') ||
-    lower.includes('minutes before') ||
-    lower.includes('min before') ||
     lower.includes('before') ||
-    lower.includes('half an hour before') ||
-    lower.includes('30 mins') ||
-    lower.includes('10 mins') ||
-    lower.includes('5 mins') ||
-    /\b\d+\s*(mins?|minutes?)\b/i.test(text) ||
-    /\b\d+\s*minuten\b/i.test(lower) ||
     lower.includes('vorher') ||
-    /(?:提前)?\d+\s*分钟(?:前)?/.test(text) ||
-    /\b\d+\s*(hours?|hrs?)\b/i.test(text) ||
-    /\b\d+\s*stunden\b/i.test(lower) ||
-    /(?:提前)?\d+\s*小时(?:前)?/.test(text) ||
+    /(?:提前\s*\d+\s*(分钟|小时)|\d+\s*(分钟|小时)\s*前)/.test(text) ||
+    standaloneDuration ||
     lower === 'now' ||
     lower === 'remind me now' ||
     lower.includes('现在') ||
@@ -269,6 +263,21 @@ function isLikelyReminderPreferenceReply(text: string): boolean {
     lower === 'no need' ||
     lower.includes('不用') ||
     lower.includes('不需要')
+  )
+}
+
+function isLikelyNewReminderCommand(text: string): boolean {
+  const lower = text.toLowerCase().trim()
+
+  return (
+    lower.includes('remind me to') ||
+    lower.includes('remind me about') ||
+    lower.includes('remind me at') ||
+    lower.includes('remind me in') ||
+    lower.includes('提醒我') ||
+    lower.includes('叫我') ||
+    lower.includes('erinnere mich') ||
+    lower.includes('erinner mich')
   )
 }
 
@@ -869,6 +878,7 @@ async function getLatestAwaitingReminder(params: {
 }): Promise<AwaitingReminderRow | null> {
   const { supabase, userId, chatId } = params
   const sinceIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+  const nowIso = new Date().toISOString()
 
   const { data, error } = await supabase
     .from('reminders')
@@ -877,6 +887,7 @@ async function getLatestAwaitingReminder(params: {
     .eq('telegram_chat_id', chatId)
     .eq('status', 'awaiting_reminder_preference')
     .not('event_time', 'is', null)
+    .gt('event_time', nowIso)
     .gte('created_at', sinceIso)
     .order('created_at', { ascending: false })
     .limit(1)
@@ -1589,8 +1600,13 @@ Reply naturally as Bergi using the recent conversation context.`
 
     if (isPlainTextMessage) {
       const awaitingReminder = await getLatestAwaitingReminder({ supabase, userId, chatId })
+      const lowerUserText = userText.toLowerCase().trim()
 
-      if (awaitingReminder && isLikelyReminderPreferenceReply(userText)) {
+      if (
+        awaitingReminder &&
+        isLikelyReminderPreferenceReply(userText) &&
+        (!isLikelyNewReminderCommand(userText) || lowerUserText === 'remind me now')
+      ) {
         const preferenceReply = formatForTelegramPlainText(
           await resolveReminderPreferenceReply({ supabase, awaitingReminder, userText })
         )
