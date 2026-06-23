@@ -54,7 +54,7 @@ function isAuthorized(request: Request): boolean {
   return bearerToken === cronSecret || querySecret === cronSecret
 }
 
-export async function GET(request: Request) {
+async function handleSendReminders(request: Request) {
   try {
     if (!process.env.CRON_SECRET) {
       return Response.json({ ok: false, error: 'Missing CRON_SECRET' }, { status: 500 })
@@ -155,4 +155,12 @@ export async function GET(request: Request) {
     console.error('Send reminders cron error:', error)
     return Response.json({ ok: false, error: 'Failed to send reminders' }, { status: 500 })
   }
+}
+
+export async function GET(request: Request) {
+  return handleSendReminders(request)
+}
+
+export async function POST(request: Request) {
+  return handleSendReminders(request)
 }
