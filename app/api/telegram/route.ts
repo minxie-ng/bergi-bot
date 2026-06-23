@@ -105,6 +105,21 @@ type ManagedReminderRow = {
   status: string
 }
 
+type ReminderManagementIntent =
+  | {
+      action: 'reschedule_reminder'
+      reminder_id: string
+      new_remind_at: string
+      reply: string
+    }
+  | {
+      action: 'ask_clarifying_question'
+      reply: string
+    }
+  | {
+      action: 'not_reminder_management'
+    }
+
 type SaveReminderParams = {
   supabase: ReturnType<typeof getSupabase>
   userId: string
@@ -291,6 +306,26 @@ function isLikelyCancelReminderRequest(text: string): boolean {
   )
 }
 
+function isLikelyRescheduleReminderRequest(text: string): boolean {
+  const lower = text.toLowerCase().trim()
+
+  const hasReminderWord =
+    lower.includes('reminder') || lower.includes('提醒') || lower.includes('erinnerung')
+
+  const hasRescheduleVerb =
+    lower.includes('reschedule') ||
+    lower.includes('move') ||
+    lower.includes('change') ||
+    lower.includes('update') ||
+    lower.includes('改') ||
+    lower.includes('修改') ||
+    lower.includes('verschiebe') ||
+    lower.includes('ändern') ||
+    lower.includes('aendern')
+
+  return hasReminderWord && hasRescheduleVerb
+}
+
 function parseReminderCancelNumber(text: string): number | null {
   const match = text.match(/(?:cancel|delete|remove)\s+reminder\s+(\d+)/i) ?? text.match(/取消提醒\s*(\d+)/)
 
@@ -468,6 +503,28 @@ function parseFutureEventExtraction(raw: string): FutureEventExtraction {
     }
 
     throw new Error(`Failed to parse future event extraction JSON: ${raw}`)
+  }
+}
+
+function parseReminderManagementIntent(raw: string): ReminderManagementIntent {
+  const cleaned = raw
+    .trim()
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/```$/i, '')
+    .trim()
+
+  try {
+    return JSON.parse(cleaned) as ReminderManagementIntent
+  } catch {
+    const firstBrace = cleaned.indexOf('{')
+    const lastBrace = cleaned.lastIndexOf('}')
+
+    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+      return JSON.parse(cleaned.slice(firstBrace, lastBrace + 1)) as ReminderManagementIntent
+    }
+
+    throw new Error(`Failed to parse reminder management JSON: ${raw}`)
   }
 }
 
@@ -665,6 +722,74 @@ async function saveReminder(params: SaveReminderParams): Promise<void> {
   }
 }
 
+async function extractReminderManagementIntent(params: {
+  userText: string
+  upcomingReminders: ManagedReminderRow[]
+}): Promise<ReminderManagementIntent> {
+  const { userText, upcomingReminders } = params
+  const now = new Date()
+  const nowIso = now.toISOString()
+  const singaporeNow = new Intl.DateTimeFormat('en-SG', {
+    timeZone: 'Asia/Singapore',
+    dateStyle: 'full',
+    timeStyle: 'long',
+  }).format(now)
+  const reminderList = upcomingReminders
+    .map(
+      (reminder, index) =>
+        `${index + 1}. id=${reminder.id}; reminder_text=${reminder.reminder_text}; remind_at=${reminder.remind_at}; timezone=${reminder.timezone}; status=${reminder.status}`
+    )
+    .join('\n')
+  const parserPrompt = `You are extracting reminder management intent for Bergi.
+
+Current UTC time: ${nowIso}
+Current Asia/Singapore time: ${singaporeNow}
+Default timezone: Asia/Singapore
+
+Upcoming reminders:
+${reminderList}
+
+Return ONLY valid JSON.
+
+If the user wants to reschedule an existing reminder, return:
+{
+  "action": "reschedule_reminder",
+  "reminder_id": "one of the provided reminder ids",
+  "new_remind_at": "ISO timestamp with timezone offset or Z",
+  "reply": "..."
+}
+
+If the request is ambiguous or missing the target reminder/time, return:
+{
+  "action": "ask_clarifying_question",
+  "reply": "..."
+}
+
+If this is not reminder management, return:
+{
+  "action": "not_reminder_management"
+}
+
+Rules:
+- The reminder_id must be one of the provided upcoming reminder ids.
+- If the user refers to reminder number 1, use the reminder with number 1 from the provided list.
+- If the user refers by meaning, choose only if the match is clear.
+- If ambiguous, ask a clarifying question.
+- Resolve relative dates/times using Asia/Singapore by default.
+- If the user says "later" or "earlier" while rescheduling an existing reminder, interpret it relative to that reminder's existing remind_at, not relative to the current time.
+- Example: If reminder 1 is at 6:00pm and the user says "move reminder 1 to 30 minutes later", new_remind_at should be 6:30pm.
+- new_remind_at must be an ISO timestamp with explicit timezone offset or Z.
+- If the requested new time is in the past, ask for a future time.
+- Do not invent reminders.`
+
+  const response = await callLLM({
+    systemPrompt: parserPrompt,
+    chatMessages: [{ role: 'user', content: userText }],
+  })
+
+  return parseReminderManagementIntent(response)
+}
+
 async function saveAwaitingReminderPreference(params: {
   supabase: ReturnType<typeof getSupabase>
   userId: string
@@ -824,6 +949,27 @@ async function resolveReminderPreferenceReply(params: {
   }
 
   return `Okay, I’ll remind you at ${formatReminderTimeForUser(remindAt, awaitingReminder.timezone)} ${getTimezoneLabel(awaitingReminder.timezone)}.`
+}
+
+async function rescheduleReminderById(params: {
+  supabase: ReturnType<typeof getSupabase>
+  reminderId: string
+  newRemindAt: string
+}): Promise<void> {
+  const { supabase, reminderId, newRemindAt } = params
+
+  const { error } = await supabase
+    .from('reminders')
+    .update({
+      remind_at: newRemindAt,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', reminderId)
+    .in('status', ['pending', 'awaiting_reminder_preference'])
+
+  if (error) {
+    throw error
+  }
 }
 
 async function getUserProfile(params: {
@@ -1330,6 +1476,72 @@ Reply naturally as Bergi using the recent conversation context.`
 
       await saveMessage({ supabase, userId, role: 'assistant', content: cancelReply })
       return new Response('OK', { status: 200 })
+    }
+
+    if (isPlainTextMessage && isLikelyRescheduleReminderRequest(userText)) {
+      const upcomingReminders = await getUpcomingReminders({ supabase, userId })
+
+      if (upcomingReminders.length === 0) {
+        const noRemindersReply = 'You don’t have any upcoming reminders to reschedule.'
+
+        if (isLocalTestMode) {
+          console.log('Local test reschedule no reminders reply:', noRemindersReply)
+        } else {
+          await sendTelegramMessage(chatId, noRemindersReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: noRemindersReply })
+        return new Response('OK', { status: 200 })
+      }
+
+      const managementIntent = await extractReminderManagementIntent({ userText, upcomingReminders })
+
+      if (managementIntent.action === 'ask_clarifying_question') {
+        const clarifyingReply = formatForTelegramPlainText(managementIntent.reply)
+
+        if (isLocalTestMode) {
+          console.log('Local test reschedule clarifying reply:', clarifyingReply)
+        } else {
+          await sendTelegramMessage(chatId, clarifyingReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: clarifyingReply })
+        return new Response('OK', { status: 200 })
+      }
+
+      if (managementIntent.action === 'reschedule_reminder') {
+        const reminderToReschedule = upcomingReminders.find((reminder) => reminder.id === managementIntent.reminder_id)
+        let rescheduleReply: string
+
+        if (!reminderToReschedule) {
+          rescheduleReply = 'I couldn’t find that reminder. Say “list reminders” to see your upcoming reminders.'
+        } else if (Number.isNaN(Date.parse(managementIntent.new_remind_at))) {
+          rescheduleReply = 'I couldn’t understand the new reminder time. Can you give me a clear future time?'
+        } else if (!hasExplicitTimezoneOffset(managementIntent.new_remind_at)) {
+          rescheduleReply = 'Please include a clear timezone for the new reminder time.'
+        } else if (new Date(managementIntent.new_remind_at).getTime() <= Date.now()) {
+          rescheduleReply = 'That new reminder time has already passed. Please choose a future time.'
+        } else {
+          await rescheduleReminderById({
+            supabase,
+            reminderId: managementIntent.reminder_id,
+            newRemindAt: managementIntent.new_remind_at,
+          })
+          rescheduleReply = `Moved "${reminderToReschedule.reminder_text}" to ${formatManagedReminderTime(
+            managementIntent.new_remind_at,
+            reminderToReschedule.timezone
+          )} ${getTimezoneLabel(reminderToReschedule.timezone)}.`
+        }
+
+        if (isLocalTestMode) {
+          console.log('Local test reschedule reply:', rescheduleReply)
+        } else {
+          await sendTelegramMessage(chatId, rescheduleReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: rescheduleReply })
+        return new Response('OK', { status: 200 })
+      }
     }
 
     if (isPlainTextMessage && isLikelyReminderRequest(userText)) {
