@@ -274,7 +274,7 @@ function isLikelyReminderPreferenceReply(text: string): boolean {
 
 function isLikelyListRemindersRequest(text: string): boolean {
   const lower = text.toLowerCase().trim()
-  return (
+  const existingChecks =
     lower.includes('list reminders') ||
     lower.includes('show reminders') ||
     lower.includes('what reminders do i have') ||
@@ -285,7 +285,24 @@ function isLikelyListRemindersRequest(text: string): boolean {
     lower.includes('有哪些提醒') ||
     lower.includes('welche erinnerungen habe ich') ||
     lower.includes('meine erinnerungen')
-  )
+  const hasListWord =
+    lower.includes('list') ||
+    lower.includes('show') ||
+    lower.includes('see') ||
+    lower.includes('view') ||
+    lower.includes('all') ||
+    lower.includes('有哪些') ||
+    lower.includes('列表') ||
+    lower.includes('zeige') ||
+    lower.includes('anzeigen')
+  const hasReminderWord =
+    lower.includes('reminder') ||
+    lower.includes('reminders') ||
+    lower.includes('提醒') ||
+    lower.includes('erinnerung') ||
+    lower.includes('erinnerungen')
+
+  return existingChecks || (hasListWord && hasReminderWord)
 }
 
 function isLikelyCancelReminderRequest(text: string): boolean {
