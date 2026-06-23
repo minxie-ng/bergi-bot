@@ -261,6 +261,60 @@ async function callLLM(params: { chatMessages: ChatMessage[]; systemPrompt: stri
   return data.choices?.[0]?.message?.content ?? 'Sorry, I could not generate a response.'
 }
 
+async function describeImage(imageBuffer: ArrayBuffer, mimeType = 'image/jpeg'): Promise<string> {
+  const baseUrl = process.env.OPENAI_BASE_URL
+  const apiKey = process.env.OPENAI_API_KEY
+  const model = process.env.OPENAI_MODEL
+
+  if (!baseUrl || !apiKey || !model) {
+    throw new Error('Missing OpenAI environment variables')
+  }
+
+  const base64Image = Buffer.from(imageBuffer).toString('base64')
+  const imageDataUrl = `data:${mimeType};base64,${base64Image}`
+
+  const response = await fetch(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: 'Describe this image briefly and focus on details that would help Bergi reply naturally in a Telegram chat.',
+            },
+            {
+              type: 'image_url',
+              image_url: {
+                url: imageDataUrl,
+              },
+            },
+          ],
+        },
+      ],
+    }),
+  })
+
+  if (!response.ok) {
+    throw new Error(`Image description request failed: ${response.status}`)
+  }
+
+  const data = await response.json()
+  const content = data.choices?.[0]?.message?.content
+
+  if (typeof content !== 'string') {
+    throw new Error('Image description response did not include content')
+  }
+
+  return content
+}
+
 async function getTelegramFilePath(fileId: string): Promise<string> {
   const botToken = process.env.TELEGRAM_BOT_TOKEN
 
