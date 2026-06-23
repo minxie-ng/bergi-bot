@@ -384,14 +384,16 @@ cancel reminder 1`
 async function getUpcomingReminders(params: {
   supabase: ReturnType<typeof getSupabase>
   userId: string
+  chatId: number
 }): Promise<ManagedReminderRow[]> {
-  const { supabase, userId } = params
+  const { supabase, userId, chatId } = params
 
   const { data, error } = await supabase
     .from('reminders')
     .select('id, reminder_text, remind_at, timezone, status')
     .eq('user_id', userId)
-    .in('status', ['pending', 'awaiting_reminder_preference'])
+    .eq('telegram_chat_id', chatId)
+    .eq('status', 'pending')
     .gte('remind_at', new Date().toISOString())
     .order('remind_at', { ascending: true })
     .limit(10)
@@ -406,18 +408,22 @@ async function getUpcomingReminders(params: {
 async function cancelReminderById(params: {
   supabase: ReturnType<typeof getSupabase>
   reminderId: string
-}): Promise<void> {
+}): Promise<boolean> {
   const { supabase, reminderId } = params
 
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from('reminders')
     .update({ status: 'cancelled', updated_at: new Date().toISOString() })
     .eq('id', reminderId)
-    .in('status', ['pending', 'awaiting_reminder_preference'])
+    .eq('status', 'pending')
+    .select('id')
+    .maybeSingle()
 
   if (error) {
     throw error
   }
+
+  return data !== null
 }
 
 async function findOrCreateUserAccount(params: FindOrCreateUserAccountParams): Promise<string> {
@@ -714,6 +720,10 @@ async function saveReminder(params: SaveReminderParams): Promise<void> {
     throw new Error('Reminder remind_at must include timezone offset or Z')
   }
 
+  if (new Date(remindAt).getTime() <= Date.now()) {
+    throw new Error('Reminder remind_at must be in the future')
+  }
+
   if (eventTime !== null && Number.isNaN(Date.parse(eventTime))) {
     throw new Error('Reminder event_time is invalid')
   }
@@ -831,6 +841,10 @@ async function saveAwaitingReminderPreference(params: {
     throw new Error('Future event_time must include timezone offset or Z')
   }
 
+  if (new Date(eventTime).getTime() <= Date.now()) {
+    throw new Error('Future event_time must be in the future')
+  }
+
   const { error } = await supabase.from('reminders').insert({
     user_id: userId,
     platform: 'telegram',
@@ -851,14 +865,16 @@ async function saveAwaitingReminderPreference(params: {
 async function getLatestAwaitingReminder(params: {
   supabase: ReturnType<typeof getSupabase>
   userId: string
+  chatId: number
 }): Promise<AwaitingReminderRow | null> {
-  const { supabase, userId } = params
+  const { supabase, userId, chatId } = params
   const sinceIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
 
   const { data, error } = await supabase
     .from('reminders')
     .select('id, event_time, timezone, reminder_text')
     .eq('user_id', userId)
+    .eq('telegram_chat_id', chatId)
     .eq('status', 'awaiting_reminder_preference')
     .not('event_time', 'is', null)
     .gte('created_at', sinceIso)
@@ -972,21 +988,25 @@ async function rescheduleReminderById(params: {
   supabase: ReturnType<typeof getSupabase>
   reminderId: string
   newRemindAt: string
-}): Promise<void> {
+}): Promise<boolean> {
   const { supabase, reminderId, newRemindAt } = params
 
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from('reminders')
     .update({
       remind_at: newRemindAt,
       updated_at: new Date().toISOString(),
     })
     .eq('id', reminderId)
-    .in('status', ['pending', 'awaiting_reminder_preference'])
+    .eq('status', 'pending')
+    .select('id')
+    .maybeSingle()
 
   if (error) {
     throw error
   }
+
+  return data !== null
 }
 
 async function getUserProfile(params: {
@@ -1436,7 +1456,7 @@ Reply naturally as Bergi using the recent conversation context.`
     const isPlainTextMessage = userText !== undefined && voice === undefined && selectedPhoto === null
 
     if (isPlainTextMessage && isLikelyListRemindersRequest(userText)) {
-      const upcomingReminders = await getUpcomingReminders({ supabase, userId })
+      const upcomingReminders = await getUpcomingReminders({ supabase, userId, chatId })
       const remindersReply = formatUpcomingReminders(upcomingReminders)
 
       if (isLocalTestMode) {
@@ -1450,7 +1470,7 @@ Reply naturally as Bergi using the recent conversation context.`
     }
 
     if (isPlainTextMessage && isLikelyCancelReminderRequest(userText)) {
-      const upcomingReminders = await getUpcomingReminders({ supabase, userId })
+      const upcomingReminders = await getUpcomingReminders({ supabase, userId, chatId })
       const cancelNumber = parseReminderCancelNumber(userText)
       const lowerUserText = userText.toLowerCase()
       const shouldCancelNext =
@@ -1467,8 +1487,10 @@ Reply naturally as Bergi using the recent conversation context.`
         if (!reminderToCancel) {
           cancelReply = `I can’t find reminder ${cancelNumber}. Say “list reminders” to see your upcoming reminders.`
         } else {
-          await cancelReminderById({ supabase, reminderId: reminderToCancel.id })
-          cancelReply = `Cancelled reminder ${cancelNumber}: ${reminderToCancel.reminder_text}`
+          const didCancel = await cancelReminderById({ supabase, reminderId: reminderToCancel.id })
+          cancelReply = didCancel
+            ? `Cancelled reminder ${cancelNumber}: ${reminderToCancel.reminder_text}`
+            : 'That reminder is no longer active. Say “list reminders” to see your upcoming reminders.'
         }
       } else if (shouldCancelNext) {
         const reminderToCancel = upcomingReminders[0]
@@ -1476,8 +1498,10 @@ Reply naturally as Bergi using the recent conversation context.`
         if (!reminderToCancel) {
           cancelReply = 'You don’t have any upcoming reminders.'
         } else {
-          await cancelReminderById({ supabase, reminderId: reminderToCancel.id })
-          cancelReply = `Cancelled your next reminder: ${reminderToCancel.reminder_text}`
+          const didCancel = await cancelReminderById({ supabase, reminderId: reminderToCancel.id })
+          cancelReply = didCancel
+            ? `Cancelled your next reminder: ${reminderToCancel.reminder_text}`
+            : 'That reminder is no longer active. Say “list reminders” to see your upcoming reminders.'
         }
       } else if (shouldCancelLatest) {
         cancelReply = '“Latest” can be ambiguous. Say “list reminders” first, then “cancel reminder 1”, or say “cancel next reminder”.'
@@ -1496,7 +1520,7 @@ Reply naturally as Bergi using the recent conversation context.`
     }
 
     if (isPlainTextMessage && isLikelyRescheduleReminderRequest(userText)) {
-      const upcomingReminders = await getUpcomingReminders({ supabase, userId })
+      const upcomingReminders = await getUpcomingReminders({ supabase, userId, chatId })
 
       if (upcomingReminders.length === 0) {
         const noRemindersReply = 'You don’t have any upcoming reminders to reschedule.'
@@ -1539,15 +1563,17 @@ Reply naturally as Bergi using the recent conversation context.`
         } else if (new Date(managementIntent.new_remind_at).getTime() <= Date.now()) {
           rescheduleReply = 'That new reminder time has already passed. Please choose a future time.'
         } else {
-          await rescheduleReminderById({
+          const didReschedule = await rescheduleReminderById({
             supabase,
             reminderId: managementIntent.reminder_id,
             newRemindAt: managementIntent.new_remind_at,
           })
-          rescheduleReply = `Moved "${reminderToReschedule.reminder_text}" to ${formatManagedReminderTime(
-            managementIntent.new_remind_at,
-            reminderToReschedule.timezone
-          )} ${getTimezoneLabel(reminderToReschedule.timezone)}.`
+          rescheduleReply = didReschedule
+            ? `Moved "${reminderToReschedule.reminder_text}" to ${formatManagedReminderTime(
+                managementIntent.new_remind_at,
+                reminderToReschedule.timezone
+              )} ${getTimezoneLabel(reminderToReschedule.timezone)}.`
+            : 'That reminder is no longer active. Say “list reminders” to see your upcoming reminders.'
         }
 
         if (isLocalTestMode) {
@@ -1557,6 +1583,25 @@ Reply naturally as Bergi using the recent conversation context.`
         }
 
         await saveMessage({ supabase, userId, role: 'assistant', content: rescheduleReply })
+        return new Response('OK', { status: 200 })
+      }
+    }
+
+    if (isPlainTextMessage) {
+      const awaitingReminder = await getLatestAwaitingReminder({ supabase, userId, chatId })
+
+      if (awaitingReminder && isLikelyReminderPreferenceReply(userText)) {
+        const preferenceReply = formatForTelegramPlainText(
+          await resolveReminderPreferenceReply({ supabase, awaitingReminder, userText })
+        )
+
+        if (isLocalTestMode) {
+          console.log('Local test reminder preference reply:', preferenceReply)
+        } else {
+          await sendTelegramMessage(chatId, preferenceReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: preferenceReply })
         return new Response('OK', { status: 200 })
       }
     }
@@ -1603,23 +1648,6 @@ Reply naturally as Bergi using the recent conversation context.`
     }
 
     if (isPlainTextMessage && !isLikelyReminderRequest(userText)) {
-      const awaitingReminder = await getLatestAwaitingReminder({ supabase, userId })
-
-      if (awaitingReminder && isLikelyReminderPreferenceReply(userText)) {
-        const preferenceReply = formatForTelegramPlainText(
-          await resolveReminderPreferenceReply({ supabase, awaitingReminder, userText })
-        )
-
-        if (isLocalTestMode) {
-          console.log('Local test reminder preference reply:', preferenceReply)
-        } else {
-          await sendTelegramMessage(chatId, preferenceReply)
-        }
-
-        await saveMessage({ supabase, userId, role: 'assistant', content: preferenceReply })
-        return new Response('OK', { status: 200 })
-      }
-
       if (isLikelyFutureEventMention(userText)) {
         const futureEventExtraction = await extractFutureEventFromText(userText)
 
