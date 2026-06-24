@@ -1115,25 +1115,69 @@ async function logOpenAIChatCompletionFailure(response: Response): Promise<void>
   })
 }
 
-async function callLLM(params: { chatMessages: ChatMessage[]; systemPrompt: string }): Promise<string> {
-  const { chatMessages, systemPrompt } = params
-  const baseUrl = process.env.OPENAI_BASE_URL
-  const apiKey = process.env.OPENAI_API_KEY
-  const model = process.env.OPENAI_MODEL
+function shouldRetryOpenAIChatCompletion(status: number): boolean {
+  return status === 503 || status === 429 || status === 500
+}
 
-  if (!baseUrl || !apiKey || !model) {
-    throw new Error('Missing OpenAI environment variables')
-  }
+async function fetchOpenAIChatCompletion(params: {
+  baseUrl: string
+  apiKey: string
+  model: string
+  body: Record<string, unknown>
+}): Promise<Response> {
+  const { baseUrl, apiKey, model, body } = params
 
-  const response = await fetch(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
+  return fetch(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
+      ...body,
       model,
-      max_tokens: 300,
+    }),
+  })
+}
+
+async function fetchOpenAIChatCompletionWithFallback(params: {
+  baseUrl: string
+  apiKey: string
+  model: string
+  fallbackModel?: string
+  body: Record<string, unknown>
+}): Promise<Response> {
+  const response = await fetchOpenAIChatCompletion(params)
+
+  if (!response.ok && params.fallbackModel && shouldRetryOpenAIChatCompletion(response.status)) {
+    await logOpenAIChatCompletionFailure(response)
+    return fetchOpenAIChatCompletion({
+      ...params,
+      model: params.fallbackModel,
+    })
+  }
+
+  return response
+}
+
+async function callLLM(params: { chatMessages: ChatMessage[]; systemPrompt: string }): Promise<string> {
+  const { chatMessages, systemPrompt } = params
+  const baseUrl = process.env.OPENAI_BASE_URL
+  const apiKey = process.env.OPENAI_API_KEY
+  const model = process.env.OPENAI_MODEL
+  const fallbackModel = process.env.OPENAI_FALLBACK_MODEL
+
+  if (!baseUrl || !apiKey || !model) {
+    throw new Error('Missing OpenAI environment variables')
+  }
+
+  const response = await fetchOpenAIChatCompletionWithFallback({
+    baseUrl,
+    apiKey,
+    model,
+    fallbackModel,
+    body: {
+      max_completion_tokens: 300,
       messages: [
         {
           role: 'system',
@@ -1141,7 +1185,7 @@ async function callLLM(params: { chatMessages: ChatMessage[]; systemPrompt: stri
         },
         ...chatMessages,
       ],
-    }),
+    },
   })
 
   if (!response.ok) {
@@ -1157,6 +1201,7 @@ async function describeImage(imageBuffer: ArrayBuffer, mimeType = 'image/jpeg', 
   const baseUrl = process.env.OPENAI_BASE_URL
   const apiKey = process.env.OPENAI_API_KEY
   const model = process.env.OPENAI_MODEL
+  const fallbackModel = process.env.OPENAI_FALLBACK_MODEL
 
   if (!baseUrl || !apiKey || !model) {
     throw new Error('Missing OpenAI environment variables')
@@ -1171,14 +1216,12 @@ ${caption}
 Analyze the image specifically to help answer the caption/question. Focus only on what is visible in the image. If the caption asks for a count, estimate the count from the visible image. If unsure, say that it is approximate. Do not write as Bergi. Do not make jokes. Do not suggest a reply. Return only a short neutral image analysis that can be used as context for a later chat reply.`
     : 'Describe this image briefly in 1–2 sentences. Focus only on what is visibly in the image. Do not suggest a reply. Do not write as Bergi. Do not include headings, bullet points, or labels. Just return a short neutral description that can be used as context for a later chat reply.'
 
-  const response = await fetch(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model,
+  const response = await fetchOpenAIChatCompletionWithFallback({
+    baseUrl,
+    apiKey,
+    model,
+    fallbackModel,
+    body: {
       messages: [
         {
           role: 'user',
@@ -1196,7 +1239,7 @@ Analyze the image specifically to help answer the caption/question. Focus only o
           ],
         },
       ],
-    }),
+    },
   })
 
   if (!response.ok) {
