@@ -1098,6 +1098,23 @@ function trimMessagesByCharacterLimit(
   return selectedMessages.reverse()
 }
 
+async function logOpenAIChatCompletionFailure(response: Response): Promise<void> {
+  let responseBodyText: string
+
+  try {
+    responseBodyText = await response.text()
+  } catch (error) {
+    responseBodyText = `Failed to read response body: ${error instanceof Error ? error.message : String(error)}`
+  }
+
+  console.error('OpenAI chat completion request failed', {
+    OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    status: response.status,
+    responseBodyText,
+  })
+}
+
 async function callLLM(params: { chatMessages: ChatMessage[]; systemPrompt: string }): Promise<string> {
   const { chatMessages, systemPrompt } = params
   const baseUrl = process.env.OPENAI_BASE_URL
@@ -1128,6 +1145,7 @@ async function callLLM(params: { chatMessages: ChatMessage[]; systemPrompt: stri
   })
 
   if (!response.ok) {
+    await logOpenAIChatCompletionFailure(response)
     throw new Error(`OpenAI API request failed: ${response.status}`)
   }
 
@@ -1182,6 +1200,7 @@ Analyze the image specifically to help answer the caption/question. Focus only o
   })
 
   if (!response.ok) {
+    await logOpenAIChatCompletionFailure(response)
     throw new Error(`Image description request failed: ${response.status}`)
   }
 
