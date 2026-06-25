@@ -20,7 +20,13 @@ import {
   getDailyRecapThreadFilter,
   isDailyRecapRequest,
 } from '@/lib/daily-recap'
-import { callFinanceWebhook, detectFinanceCandidate, isStrongFinanceCandidate } from '@/lib/finance-webhook'
+import {
+  createNotionExpenseLog,
+  detectFinanceCandidate,
+  formatExpenseLoggedReply,
+  isValidExpenseLog,
+  parseExpenseLogWithLLM,
+} from '@/lib/finance-logging'
 import { generateDailyProactiveCheckins, getOrCreateProactivePreferences } from '@/lib/proactive-checkins'
 import { truncateText } from '@/lib/text-utils'
 
@@ -2762,25 +2768,43 @@ Reply naturally as Bergi using the recent conversation context.`
 
     if (isPlainTextMessage && detectFinanceCandidate(userText)) {
       try {
-        const financeResponse = await callFinanceWebhook({
+        const expenseLog = await parseExpenseLogWithLLM({
           text: userText,
-          userId,
-          telegramChatId: chatId,
-          timezone: 'Asia/Singapore',
+          localDate: getLocalDateString(new Date(), 'Asia/Singapore'),
+          callLLM,
         })
 
-        if (financeResponse.ok || isStrongFinanceCandidate(userText)) {
-          const financeReply = financeResponse.message
+        if (!isValidExpenseLog(expenseLog)) {
+          const financeClarificationReply = "I couldn't find a valid amount to log."
 
           if (isLocalTestMode) {
-            console.log('Local test finance reply generated')
+            console.log('Local test finance clarification reply generated')
           } else {
-            await sendTelegramMessage(chatId, financeReply)
+            await sendTelegramMessage(chatId, financeClarificationReply)
           }
 
-          await saveMessage({ supabase, userId, role: 'assistant', content: financeReply })
+          await saveMessage({ supabase, userId, role: 'assistant', content: financeClarificationReply })
           return new Response('OK', { status: 200 })
         }
+
+        await createNotionExpenseLog({
+          expense: expenseLog.expense,
+          date: expenseLog.date,
+          amount: expenseLog.amount,
+          category: expenseLog.category,
+          comment: expenseLog.comment ?? userText,
+        })
+
+        const financeReply = formatExpenseLoggedReply(expenseLog)
+
+        if (isLocalTestMode) {
+          console.log('Local test finance reply generated')
+        } else {
+          await sendTelegramMessage(chatId, financeReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: financeReply })
+        return new Response('OK', { status: 200 })
       } catch {
         const financeToolErrorReply = 'I tried logging that, but my finance tool is not reachable right now.'
 
