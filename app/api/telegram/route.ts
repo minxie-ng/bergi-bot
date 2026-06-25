@@ -108,6 +108,12 @@ type ManagedReminderRow = {
   status: string
 }
 
+type RecentSentProactiveCheckinRow = {
+  id: string
+  message_text: string | null
+  sent_at: string | null
+}
+
 type ReminderManagementIntent =
   | {
       action: 'reschedule_reminder'
@@ -920,6 +926,20 @@ Do not announce memory mechanics. Do not say "according to your saved notes", "i
 Do not force callbacks when relevance is weak. If the notes are not clearly relevant, ignore them completely.`
 }
 
+function formatRecentProactiveCheckinForPrompt(checkin: RecentSentProactiveCheckinRow | null): string {
+  if (!checkin?.message_text) {
+    return ''
+  }
+
+  return `Recent proactive check-in Bergi sent:
+"${truncateText(checkin.message_text, 240)}"
+
+The user's current message may be answering this check-in. If so, respond as if continuing that check-in naturally.
+Keep the reply short. Prefer validating whether the reply counts as progress, reflection, or an answer to the check-in.
+Good style: "that counts. something became clearer — that’s real progress." or "nice, that makes the next step less blurry."
+Do not say "based on the proactive check-in", "your response to my check-in indicates", "database", or anything technical. Avoid long coaching frameworks.`
+}
+
 function parseReminderCancelNumber(text: string): number | null {
   const match = text.match(/(?:cancel|delete|remove)\s+reminder\s+(\d+)/i) ?? text.match(/取消提醒\s*(\d+)/)
 
@@ -1074,6 +1094,52 @@ async function countFutureScheduledProactiveCheckins(params: {
   }
 
   return count ?? 0
+}
+
+async function getRecentSentProactiveCheckinForReplyContext(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+}): Promise<RecentSentProactiveCheckinRow | null> {
+  const { supabase, userId, chatId } = params
+  const sinceIso = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString()
+  const { data: checkin, error: checkinError } = await supabase
+    .from('proactive_checkins')
+    .select('id, message_text, sent_at')
+    .eq('user_id', userId)
+    .eq('platform', 'telegram')
+    .eq('telegram_chat_id', chatId)
+    .eq('status', 'sent')
+    .not('sent_at', 'is', null)
+    .gte('sent_at', sinceIso)
+    .order('sent_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+
+  if (checkinError) {
+    throw checkinError
+  }
+
+  if (!checkin?.sent_at || !checkin.message_text) {
+    return null
+  }
+
+  const { count: messagesSinceCheckin, error: messagesError } = await supabase
+    .from('messages')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', userId)
+    .eq('platform', 'telegram')
+    .gte('created_at', checkin.sent_at)
+
+  if (messagesError) {
+    throw messagesError
+  }
+
+  if ((messagesSinceCheckin ?? 0) > 8) {
+    return null
+  }
+
+  return checkin as RecentSentProactiveCheckinRow
 }
 
 async function restoreTodayFutureCancelledProactiveCheckins(params: {
@@ -2711,11 +2777,13 @@ Better endings: "what did you touch today, even roughly?", "that one counts, hon
     const mostRelevantLifeThreadNote = findMostRelevantLifeThreadNote(userMessageForLLM, recentLifeThreadNotes)
     const mostRelevantLifeThreadNoteContext = formatMostRelevantLifeThreadNoteForPrompt(mostRelevantLifeThreadNote)
     const lifeThreadNotesContext = formatRecentLifeThreadNotesForPrompt(recentLifeThreadNotes)
+    const recentProactiveCheckin = await getRecentSentProactiveCheckinForReplyContext({ supabase, userId, chatId })
+    const recentProactiveCheckinContext = formatRecentProactiveCheckinForPrompt(recentProactiveCheckin)
     const finalSystemPrompt = `${systemPrompt}
 
-${mostRelevantLifeThreadNoteContext ? `${mostRelevantLifeThreadNoteContext}\n\n` : ''}${responseModeGuidance}${
-      lifeThreadNotesContext ? `\n${lifeThreadNotesContext}` : ''
-    }`
+${recentProactiveCheckinContext ? `${recentProactiveCheckinContext}\n\n` : ''}${
+      mostRelevantLifeThreadNoteContext ? `${mostRelevantLifeThreadNoteContext}\n\n` : ''
+    }${responseModeGuidance}${lifeThreadNotesContext ? `\n${lifeThreadNotesContext}` : ''}`
     const recentMessages = await getRecentMessages({ supabase, userId })
     const recentMessagesForLLM = [...recentMessages]
 
