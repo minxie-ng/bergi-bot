@@ -738,7 +738,10 @@ function formatRecentLifeThreadNotesForPrompt(notes: LifeThreadNotePromptContext
   return `Recent things Min asked me to keep track of:
 ${noteLines.join('\n')}
 
-Use the recent notes only if they are relevant to the current message. If you use one, mention it naturally and briefly, like a friend remembering something from before. Do not announce that you are using saved notes. Do not say phrases like "according to your saved memory", "stored this in my database", or "based on your life_thread_notes". If the notes are not relevant, ignore them.`
+Recent captured notes are things Min explicitly asked Bergi to keep track of. Use them only when relevant.
+If Min's current message clearly overlaps with one of these notes, briefly callback to the remembered idea near the start, in the first 1-2 lines, like a friend remembering an earlier conversation. After the callback, continue helping normally.
+Do not announce memory mechanics. Do not say "according to your saved notes", "in my memory", "saved note", "database", "life_thread_notes", "memory context", or anything technical.
+Do not force callbacks when relevance is weak. If the notes are not clearly relevant, ignore them completely.`
 }
 
 function parseReminderCancelNumber(text: string): number | null {
