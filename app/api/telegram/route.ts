@@ -885,8 +885,13 @@ The user previously asked Bergi to keep track of this:
 - Summary: ${truncateText(note.summary, 240)}
 - Original wording excerpt: ${truncateText(note.raw_text, 280)}
 
-If the current message is clearly related to this remembered thought, briefly callback to the idea near the start, like a friend continuing an earlier conversation. Do not say "saved note", "memory", "database", or "according to". Keep it natural.
-Prefer phrases like "this sounds like that thing you mentioned earlier about...", "yeah, this connects to what you were saying before...", or "wait, this is close to your earlier point about...". Then give one simple reframe or one small question. Avoid bullets/lists unless Min explicitly asks for a template or framework.`
+A relevant remembered thought has already been selected for this user message.
+When this block is present, start your reply with one short, natural callback to the remembered idea before giving advice or answering. Do not skip the callback.
+The callback must appear in the first 1-2 lines and should sound like a friend remembering an earlier conversation.
+Good: "yeah, this connects to what you said earlier about internship days passing fast and progress feeling invisible."
+Bad: "according to your saved note..." "based on my memory..." "from the database..."
+After the callback, keep the reply short. Give one simple reframe or one small question.
+Avoid bullets/lists/frameworks unless Min explicitly asks for a template, checklist, or plan.`
 }
 
 function formatRecentLifeThreadNotesForPrompt(notes: LifeThreadNotePromptContext[]): string {
