@@ -379,14 +379,24 @@ function normalizeTelegramCommand(text: string): TelegramSlashCommand | null {
 }
 
 function getHelpReply(): string {
-  return `here’s what I can do:
+  return `hey, I’m Bergi — kind of an AI companion you can talk to.
 
-/checkin_status — see whether proactive check-ins are on
-/pause_checkins — pause proactive check-ins
-/resume_checkins — resume proactive check-ins
+you can:
+• chat with me normally
+• send me voice notes
+• send me photos and ask about them
+• ask me to organise messy thoughts
+• ask me to remind you about things
+• practise German casually with me
+• let me check in on you during the day
+
+commands:
+/checkin_status — see whether check-ins are on
+/pause_checkins — pause check-ins
+/resume_checkins — resume check-ins
 /list_reminders — show active reminders
 
-you can also just talk to me normally.`
+you don’t need exact commands most of the time — just talk to me naturally.`
 }
 
 function getProactiveCheckinControlActionFromCommand(
