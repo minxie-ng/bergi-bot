@@ -1,5 +1,6 @@
 import { createClient } from '@supabase/supabase-js'
 
+import { getRecentLifeThreadNotes } from '@/lib/life-thread-notes'
 import { selectProactiveCheckinMessage } from '@/lib/proactive-message-templates'
 
 type ProactiveCheckinRow = {
@@ -85,6 +86,20 @@ async function getRecentSentProactiveMessages(params: {
     .filter((messageText): messageText is string => typeof messageText === 'string')
 }
 
+async function getRecentProactiveContextNotes(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+}) {
+  const notes = await getRecentLifeThreadNotes({
+    supabase: params.supabase,
+    userId: params.userId,
+    limit: 5,
+  })
+  const sevenDaysAgoMs = Date.now() - 7 * 24 * 60 * 60 * 1000
+
+  return notes.filter((note) => Date.parse(note.created_at) >= sevenDaysAgoMs)
+}
+
 async function handleSendProactiveCheckins(request: Request) {
   try {
     if (!process.env.CRON_SECRET) {
@@ -142,9 +157,14 @@ async function handleSendProactiveCheckins(request: Request) {
         platform: claimedCheckin.platform,
         telegramChatId: claimedCheckin.telegram_chat_id,
       })
+      const recentNotes = await getRecentProactiveContextNotes({
+        supabase,
+        userId: claimedCheckin.user_id,
+      })
       const messageText = selectProactiveCheckinMessage({
         block: claimedCheckin.block,
         recentMessages,
+        recentNotes,
       })
 
       try {

@@ -1,5 +1,40 @@
+import type { LifeThreadNotePromptContext } from './life-thread-notes'
+
 type ProactiveCheckinBlock = 'morning' | 'afternoon' | 'evening'
 type ProactiveTemplateBank = Record<ProactiveCheckinBlock, Record<string, readonly string[]>>
+type ProactiveContextCategory = 'internship_progress' | 'bergi_product' | 'german_learning'
+
+const CONTEXT_AWARE_PROACTIVE_TEMPLATES: Record<ProactiveContextCategory, readonly string[]> = {
+  internship_progress: [
+    'small check-in — did anything become clearer, smaller, or easier today?',
+    'quick internship check — what changed between this morning and now?',
+    'tiny progress check: are you less stuck than earlier?',
+  ],
+  bergi_product: [
+    'quick bergi thought — did anything become clearer about what makes it feel different from chatgpt?',
+    'small product check — what part of bergi feels most alive so far?',
+    'one bergi question: what still feels too generic?',
+  ],
+  german_learning: [
+    'mini deutsch check — describe your day in one simple german sentence?',
+    'quick german moment: one sentence about today, then i’ll correct only the main thing.',
+  ],
+}
+
+const CONTEXT_CATEGORY_KEYWORDS: Record<ProactiveContextCategory, readonly string[]> = {
+  internship_progress: [
+    'internship',
+    'progress',
+    'productive',
+    'learn',
+    'learned',
+    'stuck',
+    'clearer',
+    'tomorrow easier',
+  ],
+  bergi_product: ['bergi', 'chatgpt', 'moat', 'companion', 'product', 'feature', 'memory', 'proactive'],
+  german_learning: ['german', 'deutsch', 'b1', 'sentence', 'practice', 'grammar'],
+}
 
 const PROACTIVE_CHECKIN_TEMPLATES: ProactiveTemplateBank = {
   morning: {
@@ -81,19 +116,63 @@ function chooseRandomItem<T>(items: readonly T[], random: () => number): T {
   return items[Math.floor(Math.min(Math.max(random(), 0), 0.9999999999999999) * items.length)]
 }
 
+function getNoteSearchText(note: LifeThreadNotePromptContext): string {
+  return [note.title, note.summary, note.open_question, note.next_step, note.raw_text]
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    .join(' ')
+    .toLowerCase()
+}
+
+function getContextCategoryScore(noteText: string, category: ProactiveContextCategory): number {
+  return CONTEXT_CATEGORY_KEYWORDS[category].reduce(
+    (score, keyword) => score + (noteText.includes(keyword) ? 1 : 0),
+    0
+  )
+}
+
+function findContextCategory(recentNotes: LifeThreadNotePromptContext[] = []): ProactiveContextCategory | null {
+  let bestCategory: ProactiveContextCategory | null = null
+  let bestScore = 0
+
+  for (const note of recentNotes) {
+    const noteText = getNoteSearchText(note)
+
+    for (const category of Object.keys(CONTEXT_CATEGORY_KEYWORDS) as ProactiveContextCategory[]) {
+      const score = getContextCategoryScore(noteText, category)
+
+      if (score > bestScore) {
+        bestCategory = category
+        bestScore = score
+      }
+    }
+  }
+
+  return bestScore >= 2 ? bestCategory : null
+}
+
 export function selectProactiveCheckinMessage(params: {
   block: string
   recentMessages?: string[]
+  recentNotes?: LifeThreadNotePromptContext[]
   random?: () => number
 }): string {
   const random = params.random ?? Math.random
+  const recentMessages = new Set(params.recentMessages ?? [])
+  const contextCategory = findContextCategory(params.recentNotes)
+
+  if (contextCategory) {
+    const contextTemplates = CONTEXT_AWARE_PROACTIVE_TEMPLATES[contextCategory]
+    const freshContextTemplates = contextTemplates.filter((template) => !recentMessages.has(template))
+
+    return chooseRandomItem(freshContextTemplates.length > 0 ? freshContextTemplates : contextTemplates, random)
+  }
+
   const templatesByCategory = isProactiveCheckinBlock(params.block)
     ? PROACTIVE_CHECKIN_TEMPLATES[params.block]
     : PROACTIVE_CHECKIN_TEMPLATES.afternoon
   const categories = Object.keys(templatesByCategory)
   const category = chooseRandomItem(categories, random)
   const templates = templatesByCategory[category]
-  const recentMessages = new Set(params.recentMessages ?? [])
   const freshTemplates = templates.filter((template) => !recentMessages.has(template))
 
   return chooseRandomItem(freshTemplates.length > 0 ? freshTemplates : templates, random)
