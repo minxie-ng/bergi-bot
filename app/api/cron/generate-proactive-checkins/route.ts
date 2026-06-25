@@ -71,9 +71,9 @@ async function handleGenerateProactiveCheckins(request: Request) {
         generated += rows.length
       } catch (error) {
         console.error('Failed to generate proactive check-ins for preference:', {
-          userId: preference.user_id,
           platform: preference.platform,
-          telegramChatId: preference.telegram_chat_id,
+          hasUserId: Boolean(preference.user_id),
+          hasTelegramChatId: preference.telegram_chat_id !== undefined,
           error,
         })
         failed += 1

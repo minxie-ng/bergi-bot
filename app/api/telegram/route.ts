@@ -40,6 +40,21 @@ type TelegramUpdate = {
   }
 }
 
+function getTelegramMessageTypes(message: TelegramUpdate['message']): string[] {
+  if (!message) {
+    return []
+  }
+
+  return [
+    typeof message.text === 'string' ? 'text' : null,
+    typeof message.caption === 'string' ? 'caption' : null,
+    message.voice ? 'voice' : null,
+    message.photo ? 'photo' : null,
+    message.sticker ? 'sticker' : null,
+    message.animation ? 'animation' : null,
+  ].filter((messageType): messageType is string => messageType !== null)
+}
+
 type ChatMessage = {
   role: 'user' | 'assistant'
   content: string
@@ -2258,19 +2273,8 @@ function trimMessagesByCharacterLimit(
 }
 
 async function logOpenAIChatCompletionFailure(response: Response): Promise<void> {
-  let responseBodyText: string
-
-  try {
-    responseBodyText = await response.text()
-  } catch (error) {
-    responseBodyText = `Failed to read response body: ${error instanceof Error ? error.message : String(error)}`
-  }
-
   console.error('OpenAI chat completion request failed', {
-    OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
-    OPENAI_MODEL: process.env.OPENAI_MODEL,
     status: response.status,
-    responseBodyText,
   })
 }
 
@@ -2547,17 +2551,22 @@ export async function POST(request: Request) {
     const from = update.message?.from
     const isLocalTestMode = process.env.LOCAL_TEST_MODE === 'true'
 
-    console.log('Telegram webhook message:', update.message)
+    console.log('Telegram webhook received', {
+      hasMessage: Boolean(update.message),
+      messageTypes: getTelegramMessageTypes(update.message),
+      hasChatId: chatId !== undefined,
+      hasUserId: from?.id !== undefined,
+    })
 
     if (chatId === undefined || from?.id === undefined) {
       return new Response('OK', { status: 200 })
     }
 
     if (!isAllowedTelegramUser(from.id)) {
-      console.log('Blocked unauthorized Telegram user:', from.id)
+      console.log('Blocked unauthorized Telegram user')
 
       if (isLocalTestMode) {
-        console.log('Local test unauthorized response:', 'Sorry, Bergi is currently private.')
+        console.log('Local test unauthorized response generated')
       } else {
         await sendTelegramMessage(chatId, 'Sorry, Bergi is currently private.')
       }
@@ -2591,7 +2600,7 @@ export async function POST(request: Request) {
       await saveMessage({ supabase, userId, role: 'user', content: nonTextContent })
 
       if (isLocalTestMode) {
-        console.log('Local test non-text response:', nonTextReply)
+        console.log('Local test non-text response generated')
       } else {
         await sendTelegramMessage(chatId, nonTextReply)
       }
@@ -2629,7 +2638,7 @@ export async function POST(request: Request) {
         })
 
         if (isLocalTestMode) {
-          console.log('Local test voice too long response:', voiceTooLongReply)
+          console.log('Local test voice-too-long response generated')
         } else {
           await sendTelegramMessage(chatId, voiceTooLongReply)
         }
@@ -2689,7 +2698,7 @@ Reply naturally as Bergi using the recent conversation context.`
       const thoughtCaptureReply = await resolveThoughtCaptureReply({ supabase, userId })
 
       if (isLocalTestMode) {
-        console.log('Local test thought capture reply:', thoughtCaptureReply)
+        console.log('Local test thought capture reply generated')
       } else {
         await sendTelegramMessage(chatId, thoughtCaptureReply)
       }
@@ -2707,7 +2716,7 @@ Reply naturally as Bergi using the recent conversation context.`
         const helpReply = getHelpReply()
 
         if (isLocalTestMode) {
-          console.log('Local test help reply:', helpReply)
+          console.log('Local test help reply generated')
         } else {
           await sendTelegramMessage(chatId, helpReply)
         }
@@ -2721,7 +2730,7 @@ Reply naturally as Bergi using the recent conversation context.`
         const notesReply = formatRecentLifeThreadNotesForTelegram(recentNotes)
 
         if (isLocalTestMode) {
-          console.log('Local test notes reply:', notesReply)
+          console.log('Local test notes reply generated')
         } else {
           await sendTelegramMessage(chatId, notesReply)
         }
@@ -2735,7 +2744,7 @@ Reply naturally as Bergi using the recent conversation context.`
         const memorySummaryReply = formatNaturalMemorySummary(recentNotes)
 
         if (isLocalTestMode) {
-          console.log('Local test natural memory summary reply:', memorySummaryReply)
+          console.log('Local test natural memory summary reply generated')
         } else {
           await sendTelegramMessage(chatId, memorySummaryReply)
         }
@@ -2748,7 +2757,7 @@ Reply naturally as Bergi using the recent conversation context.`
         const dailyRecapReply = await resolveDailyRecapReply({ supabase, userId, chatId, userText })
 
         if (isLocalTestMode) {
-          console.log('Local test daily recap reply:', dailyRecapReply)
+          console.log('Local test daily recap reply generated')
         } else {
           await sendTelegramMessage(chatId, dailyRecapReply)
         }
@@ -2769,7 +2778,7 @@ Reply naturally as Bergi using the recent conversation context.`
         })
 
         if (isLocalTestMode) {
-          console.log('Local test proactive check-in control reply:', proactiveCheckinReply)
+          console.log('Local test proactive check-in control reply generated')
         } else {
           await sendTelegramMessage(chatId, proactiveCheckinReply)
         }
@@ -2787,7 +2796,7 @@ Reply naturally as Bergi using the recent conversation context.`
       const remindersReply = formatUpcomingReminders(upcomingReminders)
 
       if (isLocalTestMode) {
-        console.log('Local test reminders list:', remindersReply)
+        console.log('Local test reminders list reply generated')
       } else {
         await sendTelegramMessage(chatId, remindersReply)
       }
@@ -2837,7 +2846,7 @@ Reply naturally as Bergi using the recent conversation context.`
       }
 
       if (isLocalTestMode) {
-        console.log('Local test cancel reminder reply:', cancelReply)
+        console.log('Local test cancel reminder reply generated')
       } else {
         await sendTelegramMessage(chatId, cancelReply)
       }
@@ -2853,7 +2862,7 @@ Reply naturally as Bergi using the recent conversation context.`
         const noRemindersReply = 'You don’t have any upcoming reminders to reschedule.'
 
         if (isLocalTestMode) {
-          console.log('Local test reschedule no reminders reply:', noRemindersReply)
+          console.log('Local test reschedule no-reminders reply generated')
         } else {
           await sendTelegramMessage(chatId, noRemindersReply)
         }
@@ -2868,7 +2877,7 @@ Reply naturally as Bergi using the recent conversation context.`
         const clarifyingReply = formatForTelegramPlainText(managementIntent.reply)
 
         if (isLocalTestMode) {
-          console.log('Local test reschedule clarifying reply:', clarifyingReply)
+          console.log('Local test reschedule clarifying reply generated')
         } else {
           await sendTelegramMessage(chatId, clarifyingReply)
         }
@@ -2904,7 +2913,7 @@ Reply naturally as Bergi using the recent conversation context.`
         }
 
         if (isLocalTestMode) {
-          console.log('Local test reschedule reply:', rescheduleReply)
+          console.log('Local test reschedule reply generated')
         } else {
           await sendTelegramMessage(chatId, rescheduleReply)
         }
@@ -2928,7 +2937,7 @@ Reply naturally as Bergi using the recent conversation context.`
         )
 
         if (isLocalTestMode) {
-          console.log('Local test reminder preference reply:', preferenceReply)
+          console.log('Local test reminder preference reply generated')
         } else {
           await sendTelegramMessage(chatId, preferenceReply)
         }
@@ -2956,7 +2965,7 @@ Reply naturally as Bergi using the recent conversation context.`
         const reminderConfirmation = formatForTelegramPlainText(reminderExtraction.confirmation_message)
 
         if (isLocalTestMode) {
-          console.log('Local test reminder confirmation:', reminderConfirmation)
+          console.log('Local test reminder confirmation generated')
         } else {
           await sendTelegramMessage(chatId, reminderConfirmation)
         }
@@ -2969,7 +2978,7 @@ Reply naturally as Bergi using the recent conversation context.`
         const clarifyingQuestion = formatForTelegramPlainText(reminderExtraction.clarifying_question)
 
         if (isLocalTestMode) {
-          console.log('Local test reminder clarifying question:', clarifyingQuestion)
+          console.log('Local test reminder clarifying question generated')
         } else {
           await sendTelegramMessage(chatId, clarifyingQuestion)
         }
@@ -2997,7 +3006,7 @@ Reply naturally as Bergi using the recent conversation context.`
           const askMessage = formatForTelegramPlainText(futureEventExtraction.ask_message)
 
           if (isLocalTestMode) {
-            console.log('Local test future event ask message:', askMessage)
+            console.log('Local test future event ask message generated')
           } else {
             await sendTelegramMessage(chatId, askMessage)
           }
@@ -3010,7 +3019,7 @@ Reply naturally as Bergi using the recent conversation context.`
           const clarifyingQuestion = formatForTelegramPlainText(futureEventExtraction.clarifying_question)
 
           if (isLocalTestMode) {
-            console.log('Local test future event clarifying question:', clarifyingQuestion)
+            console.log('Local test future event clarifying question generated')
           } else {
             await sendTelegramMessage(chatId, clarifyingQuestion)
           }
@@ -3153,7 +3162,7 @@ Reply naturally as Bergi. If the current text seems related to the photo, use th
     const telegramReply = formatForTelegramPlainText(llmResponse)
 
     if (isLocalTestMode) {
-      console.log('Local test LLM response:', telegramReply)
+      console.log('Local test LLM response generated')
       await saveMessage({ supabase, userId, role: 'assistant', content: telegramReply })
     } else {
       await sendTelegramMessage(chatId, telegramReply)
