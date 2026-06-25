@@ -697,6 +697,143 @@ async function saveLifeThreadNote(params: {
   }
 }
 
+function isMeaningfulProactiveProgressReply(text: string): boolean {
+  const normalized = text
+    .toLowerCase()
+    .replace(/[’']/g, '')
+    .replace(/[?!。！？]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  if (
+    normalized.length < 18 ||
+    normalized.startsWith('/') ||
+    ['yes', 'no', 'ok', 'okay', 'idk', 'haha', 'lol', 'nah', 'nope'].includes(normalized)
+  ) {
+    return false
+  }
+
+  if (/^(can|could|would|will|do|does|did|is|are|what|why|how|when|where)\b/i.test(normalized)) {
+    return false
+  }
+
+  const progressSignals = [
+    'became clearer',
+    'become clearer',
+    'got clearer',
+    'more clear',
+    'clearer',
+    'got easier',
+    'easier',
+    'learned',
+    'learnt',
+    'understood',
+    'realised',
+    'realized',
+    'figured out',
+    'finished',
+    'completed',
+    'moved forward',
+    'made progress',
+    'less stuck',
+    'unstuck',
+    'managed to',
+    'i did',
+    'i got',
+    'i think i understood',
+  ]
+
+  return progressSignals.some((signal) => normalized.includes(signal))
+}
+
+function buildProactiveProgressFallbackNote(rawText: string): ThoughtNoteDraft {
+  return {
+    title: 'progress from check-in',
+    summary: truncateText(rawText, 240),
+    open_question: null,
+    next_step: null,
+  }
+}
+
+async function structureProactiveProgressNote(rawText: string): Promise<ThoughtNoteDraft> {
+  try {
+    const raw = await callLLM({
+      systemPrompt:
+        'You structure a short progress event from a user replying to a proactive check-in. Return only valid JSON with keys title, summary, open_question, next_step. Title should describe what changed. Summary should be one short sentence in third person using Min. Use null for open_question or next_step when not obvious. Do not add markdown.',
+      chatMessages: [
+        {
+          role: 'user',
+          content: `User proactive check-in reply:\n${rawText}`,
+        },
+      ],
+    })
+
+    return parseThoughtNoteDraft(raw, rawText)
+  } catch (error) {
+    console.error('Failed to structure proactive progress note:', error)
+    return buildProactiveProgressFallbackNote(rawText)
+  }
+}
+
+async function saveProactiveProgressNoteIfMeaningful(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  sourceMessageId: string
+  rawText: string
+  recentProactiveCheckin: RecentSentProactiveCheckinRow | null
+}): Promise<void> {
+  const { supabase, userId, sourceMessageId, rawText, recentProactiveCheckin } = params
+
+  if (!recentProactiveCheckin || !isMeaningfulProactiveProgressReply(rawText)) {
+    return
+  }
+
+  const { data: existingNote, error: existingNoteError } = await supabase
+    .from('life_thread_notes')
+    .select('id')
+    .eq('source_message_id', sourceMessageId)
+    .maybeSingle()
+
+  if (existingNoteError) {
+    throw existingNoteError
+  }
+
+  if (existingNote) {
+    return
+  }
+
+  const duplicateSinceIso = new Date(Date.now() - 10 * 60 * 1000).toISOString()
+  const { data: recentDuplicateNote, error: recentDuplicateNoteError } = await supabase
+    .from('life_thread_notes')
+    .select('id')
+    .eq('user_id', userId)
+    .eq('raw_text', rawText)
+    .gte('created_at', duplicateSinceIso)
+    .limit(1)
+    .maybeSingle()
+
+  if (recentDuplicateNoteError) {
+    throw recentDuplicateNoteError
+  }
+
+  if (recentDuplicateNote) {
+    return
+  }
+
+  const note = await structureProactiveProgressNote(rawText)
+  await saveLifeThreadNote({
+    supabase,
+    userId,
+    sourceMessageId,
+    rawText,
+    note: {
+      ...note,
+      title: note.title ?? 'check-in progress',
+      summary: `Check-in reply: ${note.summary}`,
+    },
+  })
+}
+
 async function resolveThoughtCaptureReply(params: {
   supabase: ReturnType<typeof getSupabase>
   userId: string
@@ -1333,19 +1470,25 @@ async function findOrCreateUserAccount(params: FindOrCreateUserAccountParams): P
   return user.id
 }
 
-async function saveMessage(params: SaveMessageParams): Promise<void> {
+async function saveMessage(params: SaveMessageParams): Promise<string> {
   const { supabase, userId, role, content } = params
 
-  const { error } = await supabase.from('messages').insert({
-    user_id: userId,
-    platform: 'telegram',
-    role,
-    content,
-  })
+  const { data, error } = await supabase
+    .from('messages')
+    .insert({
+      user_id: userId,
+      platform: 'telegram',
+      role,
+      content,
+    })
+    .select('id')
+    .single()
 
   if (error) {
     throw error
   }
+
+  return String(data.id)
 }
 
 function hasExplicitTimezoneOffset(value: string): boolean {
@@ -2397,7 +2540,7 @@ Reply naturally as Bergi using the recent conversation context.`
       return new Response('OK', { status: 200 })
     }
 
-    await saveMessage({ supabase, userId, role: 'user', content: userMessageToSave })
+    const savedUserMessageId = await saveMessage({ supabase, userId, role: 'user', content: userMessageToSave })
 
     if (isPlainTextMessage) {
       const telegramCommand = normalizeTelegramCommand(userText)
@@ -2778,6 +2921,13 @@ Better endings: "what did you touch today, even roughly?", "that one counts, hon
     const mostRelevantLifeThreadNoteContext = formatMostRelevantLifeThreadNoteForPrompt(mostRelevantLifeThreadNote)
     const lifeThreadNotesContext = formatRecentLifeThreadNotesForPrompt(recentLifeThreadNotes)
     const recentProactiveCheckin = await getRecentSentProactiveCheckinForReplyContext({ supabase, userId, chatId })
+    await saveProactiveProgressNoteIfMeaningful({
+      supabase,
+      userId,
+      sourceMessageId: savedUserMessageId,
+      rawText: userText ?? userMessageToSave,
+      recentProactiveCheckin,
+    })
     const recentProactiveCheckinContext = formatRecentProactiveCheckinForPrompt(recentProactiveCheckin)
     const finalSystemPrompt = `${systemPrompt}
 
