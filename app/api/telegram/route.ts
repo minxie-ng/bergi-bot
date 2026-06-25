@@ -767,8 +767,34 @@ async function saveLifeThreadNote(params: {
   })
 
   if (error) {
+    if (await isDuplicateLifeThreadSourceMessageError({ supabase, sourceMessageId, error })) {
+      return
+    }
+
     throw error
   }
+}
+
+async function isDuplicateLifeThreadSourceMessageError(params: {
+  supabase: ReturnType<typeof getSupabase>
+  sourceMessageId: string
+  error: { code?: string } | null
+}): Promise<boolean> {
+  if (params.error?.code !== '23505') {
+    return false
+  }
+
+  const { data, error } = await params.supabase
+    .from('life_thread_notes')
+    .select('id')
+    .eq('source_message_id', params.sourceMessageId)
+    .maybeSingle()
+
+  if (error) {
+    throw error
+  }
+
+  return Boolean(data)
 }
 
 function isMeaningfulProactiveProgressReply(text: string): boolean {

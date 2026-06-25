@@ -95,4 +95,8 @@ add column if not exists thread_label text;
 create index if not exists life_thread_notes_user_id_created_at_idx
 on life_thread_notes(user_id, created_at desc);
 
+create unique index if not exists life_thread_notes_source_message_id_unique
+on life_thread_notes(source_message_id)
+where source_message_id is not null;
+
 alter table life_thread_notes enable row level security;
