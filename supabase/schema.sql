@@ -74,3 +74,21 @@ create index if not exists proactive_checkins_user_id_scheduled_for_idx
 on proactive_checkins(user_id, scheduled_for);
 
 alter table proactive_checkins enable row level security;
+
+create table if not exists life_thread_notes (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references users(id) on delete cascade,
+  source_message_id uuid null references messages(id) on delete set null,
+  title text,
+  summary text not null,
+  open_question text,
+  next_step text,
+  raw_text text not null,
+  created_at timestamp with time zone not null default now(),
+  updated_at timestamp with time zone not null default now()
+);
+
+create index if not exists life_thread_notes_user_id_created_at_idx
+on life_thread_notes(user_id, created_at desc);
+
+alter table life_thread_notes enable row level security;

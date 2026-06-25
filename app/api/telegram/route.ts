@@ -134,7 +134,25 @@ type SaveReminderParams = {
 }
 
 type ProactiveCheckinControlAction = 'pause' | 'resume' | 'status'
-type TelegramSlashCommand = '/help' | '/checkin_status' | '/pause_checkins' | '/resume_checkins' | '/list_reminders'
+type TelegramSlashCommand =
+  | '/help'
+  | '/checkin_status'
+  | '/pause_checkins'
+  | '/resume_checkins'
+  | '/list_reminders'
+  | '/capture_this'
+
+type ThoughtCaptureSourceMessage = {
+  id: string
+  content: string
+}
+
+type ThoughtNoteDraft = {
+  title: string | null
+  summary: string
+  open_question: string | null
+  next_step: string | null
+}
 
 function getSupabase() {
   const supabaseUrl = process.env.SUPABASE_URL
@@ -372,6 +390,7 @@ function normalizeTelegramCommand(text: string): TelegramSlashCommand | null {
     case '/pause_checkins':
     case '/resume_checkins':
     case '/list_reminders':
+    case '/capture_this':
       return command
     default:
       return null
@@ -395,6 +414,7 @@ commands:
 /pause_checkins — pause check-ins
 /resume_checkins — resume check-ins
 /list_reminders — show active reminders
+/capture_this — save the previous thought as a thread note
 
 you don’t need exact commands most of the time — just talk to me naturally.`
 }
@@ -461,6 +481,214 @@ function getProactiveCheckinControlAction(text: string): ProactiveCheckinControl
   }
 
   return null
+}
+
+function isThoughtCaptureCommand(text: string): boolean {
+  if (normalizeTelegramCommand(text) === '/capture_this') {
+    return true
+  }
+
+  const normalized = text
+    .toLowerCase()
+    .replace(/[“”]/g, '"')
+    .replace(/[’']/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  return (
+    normalized === 'save this thought' ||
+    normalized === 'capture this' ||
+    normalized === 'save that thought' ||
+    normalized === 'remember this as a thread note'
+  )
+}
+
+function isMeaningfulThoughtSource(content: string): boolean {
+  const normalized = content
+    .toLowerCase()
+    .replace(/[’']/g, '')
+    .replace(/[.!?。！？]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  if (normalized.length < 8) {
+    return false
+  }
+
+  if (normalized.startsWith('/')) {
+    return false
+  }
+
+  if (isThoughtCaptureCommand(content)) {
+    return false
+  }
+
+  return !['yes', 'no', 'ok', 'okay', 'haha', 'idk', 'lol', 'nah', 'yep', 'nope'].includes(normalized)
+}
+
+function cleanJsonResponse(raw: string): string {
+  const cleaned = raw
+    .trim()
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/```$/i, '')
+    .trim()
+  const firstBrace = cleaned.indexOf('{')
+  const lastBrace = cleaned.lastIndexOf('}')
+
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    return cleaned.slice(firstBrace, lastBrace + 1)
+  }
+
+  return cleaned
+}
+
+function truncateText(text: string, maxLength: number): string {
+  const normalized = text.replace(/\s+/g, ' ').trim()
+
+  if (normalized.length <= maxLength) {
+    return normalized
+  }
+
+  return `${normalized.slice(0, maxLength - 1).trimEnd()}…`
+}
+
+function nullableShortString(value: unknown, maxLength: number): string | null {
+  if (typeof value !== 'string') {
+    return null
+  }
+
+  const trimmed = value.trim()
+
+  if (!trimmed) {
+    return null
+  }
+
+  return truncateText(trimmed, maxLength)
+}
+
+function fallbackThoughtNoteDraft(rawText: string): ThoughtNoteDraft {
+  return {
+    title: 'captured thought',
+    summary: truncateText(rawText, 240),
+    open_question: null,
+    next_step: null,
+  }
+}
+
+function parseThoughtNoteDraft(raw: string, rawText: string): ThoughtNoteDraft {
+  const parsed = JSON.parse(cleanJsonResponse(raw)) as Record<string, unknown>
+  const summary = nullableShortString(parsed.summary, 240)
+
+  if (!summary) {
+    return fallbackThoughtNoteDraft(rawText)
+  }
+
+  return {
+    title: nullableShortString(parsed.title, 80),
+    summary,
+    open_question: nullableShortString(parsed.open_question, 160),
+    next_step: nullableShortString(parsed.next_step, 160),
+  }
+}
+
+async function structureThoughtNote(rawText: string): Promise<ThoughtNoteDraft> {
+  try {
+    const raw = await callLLM({
+      systemPrompt:
+        'You structure a manually captured thought note. Return only valid JSON with keys title, summary, open_question, next_step. Keep every field short. Use null for open_question or next_step when not obvious. Do not add markdown.',
+      chatMessages: [
+        {
+          role: 'user',
+          content: `Raw thought:\n${rawText}`,
+        },
+      ],
+    })
+
+    return parseThoughtNoteDraft(raw, rawText)
+  } catch (error) {
+    console.error('Failed to structure thought note:', error)
+    return fallbackThoughtNoteDraft(rawText)
+  }
+}
+
+async function getLatestMeaningfulPreviousUserMessage(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+}): Promise<ThoughtCaptureSourceMessage | null> {
+  const { supabase, userId } = params
+  const { data, error } = await supabase
+    .from('messages')
+    .select('id, content')
+    .eq('user_id', userId)
+    .eq('platform', 'telegram')
+    .eq('role', 'user')
+    .order('created_at', { ascending: false })
+    .limit(20)
+
+  if (error) {
+    throw error
+  }
+
+  const sourceMessage = (data ?? []).find((message) => {
+    const content = typeof message.content === 'string' ? message.content : ''
+    return isMeaningfulThoughtSource(content)
+  })
+
+  if (!sourceMessage || typeof sourceMessage.content !== 'string') {
+    return null
+  }
+
+  return {
+    id: String(sourceMessage.id),
+    content: sourceMessage.content,
+  }
+}
+
+async function saveLifeThreadNote(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  sourceMessageId: string
+  rawText: string
+  note: ThoughtNoteDraft
+}): Promise<void> {
+  const { supabase, userId, sourceMessageId, rawText, note } = params
+  const { error } = await supabase.from('life_thread_notes').insert({
+    user_id: userId,
+    source_message_id: sourceMessageId,
+    title: note.title,
+    summary: note.summary,
+    open_question: note.open_question,
+    next_step: note.next_step,
+    raw_text: rawText,
+  })
+
+  if (error) {
+    throw error
+  }
+}
+
+async function resolveThoughtCaptureReply(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+}): Promise<string> {
+  const { supabase, userId } = params
+  const sourceMessage = await getLatestMeaningfulPreviousUserMessage({ supabase, userId })
+
+  if (!sourceMessage) {
+    return 'i don’t see a previous thought to capture yet — send me the thought first, then say “save this thought”.'
+  }
+
+  const note = await structureThoughtNote(sourceMessage.content)
+  await saveLifeThreadNote({
+    supabase,
+    userId,
+    sourceMessageId: sourceMessage.id,
+    rawText: sourceMessage.content,
+    note,
+  })
+
+  return `saved — i captured this as a thread note: ${truncateText(note.summary, 180)}`
 }
 
 function parseReminderCancelNumber(text: string): number | null {
@@ -1859,9 +2087,22 @@ Reply naturally as Bergi using the recent conversation context.`
       userMessageForLLM = userText
     }
 
-    await saveMessage({ supabase, userId, role: 'user', content: userMessageToSave })
-
     const isPlainTextMessage = userText !== undefined && voice === undefined && selectedPhoto === null
+
+    if (isPlainTextMessage && isThoughtCaptureCommand(userText)) {
+      const thoughtCaptureReply = await resolveThoughtCaptureReply({ supabase, userId })
+
+      if (isLocalTestMode) {
+        console.log('Local test thought capture reply:', thoughtCaptureReply)
+      } else {
+        await sendTelegramMessage(chatId, thoughtCaptureReply)
+      }
+
+      await saveMessage({ supabase, userId, role: 'assistant', content: thoughtCaptureReply })
+      return new Response('OK', { status: 200 })
+    }
+
+    await saveMessage({ supabase, userId, role: 'user', content: userMessageToSave })
 
     if (isPlainTextMessage) {
       const telegramCommand = normalizeTelegramCommand(userText)
