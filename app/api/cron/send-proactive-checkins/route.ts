@@ -1,7 +1,11 @@
 import { createClient } from '@supabase/supabase-js'
 
+import { selectProactiveCheckinMessage } from '@/lib/proactive-message-templates'
+
 type ProactiveCheckinRow = {
   id: string
+  user_id: string
+  platform: string
   telegram_chat_id: number
   block: string
 }
@@ -54,17 +58,31 @@ function isAuthorized(request: Request): boolean {
   return bearerToken === cronSecret || querySecret === cronSecret
 }
 
-function getProactiveCheckinMessage(block: string): string {
-  switch (block) {
-    case 'morning':
-      return 'morning min, quick check-in — what’s the main thing you want to get done today?'
-    case 'afternoon':
-      return 'quick check-in — how’s the day going so far?'
-    case 'evening':
-      return 'end-of-day check-in: anything worth remembering from today?'
-    default:
-      return 'quick check-in — how’s your day going?'
+async function getRecentSentProactiveMessages(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  platform: string
+  telegramChatId: number
+}): Promise<string[]> {
+  const { supabase, userId, platform, telegramChatId } = params
+  const { data, error } = await supabase
+    .from('proactive_checkins')
+    .select('message_text')
+    .eq('user_id', userId)
+    .eq('platform', platform)
+    .eq('telegram_chat_id', telegramChatId)
+    .eq('status', 'sent')
+    .not('message_text', 'is', null)
+    .order('sent_at', { ascending: false })
+    .limit(5)
+
+  if (error) {
+    throw error
   }
+
+  return (data ?? [])
+    .map((row) => row.message_text)
+    .filter((messageText): messageText is string => typeof messageText === 'string')
 }
 
 async function handleSendProactiveCheckins(request: Request) {
@@ -82,7 +100,7 @@ async function handleSendProactiveCheckins(request: Request) {
 
     const { data: dueCheckins, error: dueCheckinsError } = await supabase
       .from('proactive_checkins')
-      .select('id, telegram_chat_id, block')
+      .select('id, user_id, platform, telegram_chat_id, block')
       .eq('status', 'scheduled')
       .lte('scheduled_for', nowIso)
       .order('scheduled_for', { ascending: true })
@@ -105,7 +123,7 @@ async function handleSendProactiveCheckins(request: Request) {
         })
         .eq('id', checkin.id)
         .eq('status', 'scheduled')
-        .select('id, telegram_chat_id, block')
+        .select('id, user_id, platform, telegram_chat_id, block')
         .maybeSingle()
 
       if (claimError) {
@@ -118,7 +136,16 @@ async function handleSendProactiveCheckins(request: Request) {
         continue
       }
 
-      const messageText = getProactiveCheckinMessage(claimedCheckin.block)
+      const recentMessages = await getRecentSentProactiveMessages({
+        supabase,
+        userId: claimedCheckin.user_id,
+        platform: claimedCheckin.platform,
+        telegramChatId: claimedCheckin.telegram_chat_id,
+      })
+      const messageText = selectProactiveCheckinMessage({
+        block: claimedCheckin.block,
+        recentMessages,
+      })
 
       try {
         await sendTelegramMessage(claimedCheckin.telegram_chat_id, messageText)
