@@ -785,6 +785,49 @@ function scoreLifeThreadNoteRelevance(currentKeywords: Set<string>, note: LifeTh
   return score
 }
 
+type LifeThreadNoteRelevanceDebugEntry = {
+  note: LifeThreadNotePromptContext
+  score: number
+  overlapCount: number
+  crossedThreshold: boolean
+}
+
+type LifeThreadNoteRelevanceDebug = {
+  currentTextPreview: string
+  noteCount: number
+  entries: LifeThreadNoteRelevanceDebugEntry[]
+  matchedEntry: LifeThreadNoteRelevanceDebugEntry | null
+}
+
+function getLifeThreadNoteRelevanceDebug(
+  currentText: string,
+  notes: LifeThreadNotePromptContext[]
+): LifeThreadNoteRelevanceDebug {
+  const currentKeywords = getLifeThreadRecallKeywords(currentText)
+  const entries = notes.map((note) => {
+    const overlapCount = getLifeThreadNoteOverlapCount(currentKeywords, note)
+    const score = scoreLifeThreadNoteRelevance(currentKeywords, note)
+
+    return {
+      note,
+      score,
+      overlapCount,
+      crossedThreshold: currentKeywords.size >= 2 && overlapCount >= 2,
+    }
+  })
+  const matchedEntry =
+    entries
+      .filter((entry) => entry.crossedThreshold)
+      .sort((first, second) => second.score - first.score)[0] ?? null
+
+  return {
+    currentTextPreview: truncateText(currentText, 200),
+    noteCount: notes.length,
+    entries,
+    matchedEntry,
+  }
+}
+
 function findMostRelevantLifeThreadNote(
   currentText: string,
   notes: LifeThreadNotePromptContext[]
@@ -2642,9 +2685,38 @@ Style rule:
 Always answer Min's actual request first. Use humour, Singlish, and playful friend energy lightly, but not in every reply. Avoid turning every response into a comedy bit.
 `
     const recentLifeThreadNotes = await getRecentLifeThreadNotes({ supabase, userId, limit: 5 })
+    const noteRecallDebug = getLifeThreadNoteRelevanceDebug(userMessageForLLM, recentLifeThreadNotes)
     const mostRelevantLifeThreadNote = findMostRelevantLifeThreadNote(userMessageForLLM, recentLifeThreadNotes)
     const mostRelevantLifeThreadNoteContext = formatMostRelevantLifeThreadNoteForPrompt(mostRelevantLifeThreadNote)
     const lifeThreadNotesContext = formatRecentLifeThreadNotesForPrompt(recentLifeThreadNotes)
+    const matchedNoteDebugEntry = mostRelevantLifeThreadNote
+      ? noteRecallDebug.entries.find((entry) => entry.note === mostRelevantLifeThreadNote) ?? null
+      : null
+
+    console.log('[note-recall-debug]', {
+      currentText: noteRecallDebug.currentTextPreview,
+      recentNotesFetched: noteRecallDebug.noteCount,
+      notes: noteRecallDebug.entries.map((entry) => ({
+        title: getLifeThreadNoteTitle(entry.note),
+        summary: truncateText(entry.note.summary, 120),
+        rawTextExcerpt: truncateText(entry.note.raw_text, 120),
+        score: entry.score,
+        overlapCount: entry.overlapCount,
+        crossedThreshold: entry.crossedThreshold,
+      })),
+      selectedNote: matchedNoteDebugEntry
+        ? {
+            title: getLifeThreadNoteTitle(matchedNoteDebugEntry.note),
+            score: matchedNoteDebugEntry.score,
+            overlapCount: matchedNoteDebugEntry.overlapCount,
+            crossedThreshold: matchedNoteDebugEntry.crossedThreshold,
+          }
+        : null,
+      injectedMostRelevantThoughtBlock: mostRelevantLifeThreadNoteContext.length > 0,
+      injectedBlockPreview: mostRelevantLifeThreadNoteContext
+        ? truncateText(mostRelevantLifeThreadNoteContext, 500)
+        : null,
+    })
     const finalSystemPrompt = `${systemPrompt}
 
 ${mostRelevantLifeThreadNoteContext ? `${mostRelevantLifeThreadNoteContext}\n\n` : ''}${responseModeGuidance}${
