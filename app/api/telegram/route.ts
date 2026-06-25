@@ -1,5 +1,7 @@
 import { createClient } from '@supabase/supabase-js'
 
+import { generateDailyProactiveCheckins, getOrCreateProactivePreferences } from '@/lib/proactive-checkins'
+
 type TelegramUpdate = {
   message?: {
     from?: {
@@ -130,6 +132,8 @@ type SaveReminderParams = {
   timezone: string
   sourceMessageContent: string
 }
+
+type ProactiveCheckinControlAction = 'pause' | 'resume' | 'status'
 
 function getSupabase() {
   const supabaseUrl = process.env.SUPABASE_URL
@@ -352,6 +356,55 @@ function isLikelyRescheduleReminderRequest(text: string): boolean {
   return hasReminderWord && hasRescheduleVerb
 }
 
+function getProactiveCheckinControlAction(text: string): ProactiveCheckinControlAction | null {
+  const normalized = text
+    .toLowerCase()
+    .replace(/[’']/g, '')
+    .replace(/[-_]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  const mentionsCheckins =
+    normalized.includes('check in') ||
+    normalized.includes('checkins') ||
+    normalized.includes('proactive') ||
+    normalized.includes('proactive check') ||
+    normalized.includes('proactive message')
+
+  if (!mentionsCheckins) {
+    return null
+  }
+
+  if (
+    normalized.includes('pause') ||
+    normalized.includes('stop') ||
+    normalized.includes('turn off') ||
+    normalized.includes('disable')
+  ) {
+    return 'pause'
+  }
+
+  if (
+    normalized.includes('resume') ||
+    normalized.includes('start') ||
+    normalized.includes('turn on') ||
+    normalized.includes('enable')
+  ) {
+    return 'resume'
+  }
+
+  if (
+    normalized.includes('status') ||
+    normalized.includes('settings') ||
+    normalized.includes('setting') ||
+    normalized.includes('are check ins on') ||
+    normalized.includes('are checkins on')
+  ) {
+    return 'status'
+  }
+
+  return null
+}
+
 function parseReminderCancelNumber(text: string): number | null {
   const match = text.match(/(?:cancel|delete|remove)\s+reminder\s+(\d+)/i) ?? text.match(/取消提醒\s*(\d+)/)
 
@@ -433,6 +486,115 @@ async function cancelReminderById(params: {
   }
 
   return data !== null
+}
+
+async function setProactiveCheckinsEnabled(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+  enabled: boolean
+}): Promise<void> {
+  const { supabase, userId, chatId, enabled } = params
+  const preference = await getOrCreateProactivePreferences({
+    supabase,
+    userId,
+    telegramChatId: chatId,
+    platform: 'telegram',
+  })
+  const { error } = await supabase
+    .from('proactive_preferences')
+    .update({
+      enabled,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', preference.id)
+
+  if (error) {
+    throw error
+  }
+}
+
+async function cancelFutureScheduledProactiveCheckins(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+}): Promise<void> {
+  const { supabase, userId, chatId } = params
+  const { error } = await supabase
+    .from('proactive_checkins')
+    .update({
+      status: 'cancelled',
+      updated_at: new Date().toISOString(),
+    })
+    .eq('user_id', userId)
+    .eq('platform', 'telegram')
+    .eq('telegram_chat_id', chatId)
+    .eq('status', 'scheduled')
+    .gte('scheduled_for', new Date().toISOString())
+
+  if (error) {
+    throw error
+  }
+}
+
+async function countFutureScheduledProactiveCheckins(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+}): Promise<number> {
+  const { supabase, userId, chatId } = params
+  const { count, error } = await supabase
+    .from('proactive_checkins')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', userId)
+    .eq('platform', 'telegram')
+    .eq('telegram_chat_id', chatId)
+    .eq('status', 'scheduled')
+    .gte('scheduled_for', new Date().toISOString())
+
+  if (error) {
+    throw error
+  }
+
+  return count ?? 0
+}
+
+async function resolveProactiveCheckinControlReply(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+  action: ProactiveCheckinControlAction
+}): Promise<string> {
+  const { supabase, userId, chatId, action } = params
+
+  if (action === 'pause') {
+    await setProactiveCheckinsEnabled({ supabase, userId, chatId, enabled: false })
+    await cancelFutureScheduledProactiveCheckins({ supabase, userId, chatId })
+    return 'okay min, I’ll pause proactive check-ins for now.'
+  }
+
+  if (action === 'resume') {
+    await setProactiveCheckinsEnabled({ supabase, userId, chatId, enabled: true })
+    await generateDailyProactiveCheckins({
+      supabase,
+      userId,
+      telegramChatId: chatId,
+      platform: 'telegram',
+    })
+    return 'done min, proactive check-ins are back on.'
+  }
+
+  const preference = await getOrCreateProactivePreferences({
+    supabase,
+    userId,
+    telegramChatId: chatId,
+    platform: 'telegram',
+  })
+  const upcomingCount = await countFutureScheduledProactiveCheckins({ supabase, userId, chatId })
+  const enabledText = preference.enabled ? 'on' : 'off'
+  const checkinWord = upcomingCount === 1 ? 'check-in' : 'check-ins'
+
+  return `check-ins are ${enabledText}. You have ${upcomingCount} upcoming scheduled ${checkinWord}. Timezone: ${preference.timezone}.`
 }
 
 async function findOrCreateUserAccount(params: FindOrCreateUserAccountParams): Promise<string> {
@@ -1527,6 +1689,28 @@ Reply naturally as Bergi using the recent conversation context.`
     await saveMessage({ supabase, userId, role: 'user', content: userMessageToSave })
 
     const isPlainTextMessage = userText !== undefined && voice === undefined && selectedPhoto === null
+
+    if (isPlainTextMessage) {
+      const proactiveCheckinAction = getProactiveCheckinControlAction(userText)
+
+      if (proactiveCheckinAction !== null) {
+        const proactiveCheckinReply = await resolveProactiveCheckinControlReply({
+          supabase,
+          userId,
+          chatId,
+          action: proactiveCheckinAction,
+        })
+
+        if (isLocalTestMode) {
+          console.log('Local test proactive check-in control reply:', proactiveCheckinReply)
+        } else {
+          await sendTelegramMessage(chatId, proactiveCheckinReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: proactiveCheckinReply })
+        return new Response('OK', { status: 200 })
+      }
+    }
 
     if (isPlainTextMessage && isLikelyListRemindersRequest(userText)) {
       const upcomingReminders = await getUpcomingReminders({ supabase, userId, chatId })
