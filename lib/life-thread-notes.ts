@@ -52,6 +52,14 @@ type GetRecentLifeThreadNotesParams = {
   limit?: number
 }
 
+type GetLifeThreadNotesForDateRangeParams = {
+  supabase: SupabaseClient
+  userId: string
+  startIso: string
+  endIso: string
+  threadLabel?: LifeThreadLabel | null
+}
+
 export async function getRecentLifeThreadNotes(
   params: GetRecentLifeThreadNotesParams
 ): Promise<LifeThreadNotePromptContext[]> {
@@ -62,6 +70,30 @@ export async function getRecentLifeThreadNotes(
     .eq('user_id', userId)
     .order('created_at', { ascending: false })
     .limit(limit)
+
+  if (error) {
+    throw error
+  }
+
+  return (data ?? []) as LifeThreadNotePromptContext[]
+}
+
+export async function getLifeThreadNotesForDateRange(
+  params: GetLifeThreadNotesForDateRangeParams
+): Promise<LifeThreadNotePromptContext[]> {
+  let query = params.supabase
+    .from('life_thread_notes')
+    .select('title, summary, open_question, next_step, thread_label, raw_text, created_at')
+    .eq('user_id', params.userId)
+    .gte('created_at', params.startIso)
+    .lt('created_at', params.endIso)
+    .order('created_at', { ascending: true })
+
+  if (params.threadLabel) {
+    query = query.eq('thread_label', params.threadLabel)
+  }
+
+  const { data, error } = await query
 
   if (error) {
     throw error

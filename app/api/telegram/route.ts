@@ -2,6 +2,7 @@ import { createClient } from '@supabase/supabase-js'
 
 import {
   classifyLifeThreadLabel,
+  getLifeThreadNotesForDateRange,
   getRecentLifeThreadNotes,
   type LifeThreadLabel,
   type LifeThreadNotePromptContext,
@@ -534,6 +535,51 @@ function isNaturalMemorySummaryRequest(text: string): boolean {
     normalized === 'what are my recent thoughts' ||
     normalized === 'what have i captured recently' ||
     normalized === 'what did you remember'
+  )
+}
+
+function getDailyRecapThreadFilter(text: string): LifeThreadLabel | null {
+  const normalized = text
+    .toLowerCase()
+    .replace(/[’']/g, '')
+    .replace(/[?!.。！？]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  if (normalized.includes('internship')) {
+    return 'internship_progress'
+  }
+
+  if (normalized.includes('bergi') || normalized.includes('product')) {
+    return 'bergi_product'
+  }
+
+  if (normalized.includes('german') || normalized.includes('deutsch')) {
+    return 'german_learning'
+  }
+
+  return null
+}
+
+function isDailyRecapRequest(text: string): boolean {
+  const normalized = text
+    .toLowerCase()
+    .replace(/[’']/g, '')
+    .replace(/[?!.。！？]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  return (
+    normalized === 'what progress did i make today' ||
+    normalized === 'what changed today' ||
+    normalized === 'what did i learn today' ||
+    normalized === 'summarise today' ||
+    normalized === 'summarize today' ||
+    normalized === 'what happened today' ||
+    normalized === 'what happened in my internship thread today' ||
+    normalized === 'what changed in my bergi/product thread today' ||
+    normalized === 'what changed in my bergi thread today' ||
+    normalized === 'what changed in my product thread today'
   )
 }
 
@@ -1103,6 +1149,90 @@ The user's current message may be answering this check-in. If so, respond as if 
 Keep the reply short. Prefer validating whether the reply counts as progress, reflection, or an answer to the check-in.
 Good style: "that counts. something became clearer — that’s real progress." or "nice, that makes the next step less blurry."
 Do not say "based on the proactive check-in", "your response to my check-in indicates", "database", or anything technical. Avoid long coaching frameworks.`
+}
+
+async function getDailyRecapTimezone(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+}): Promise<string> {
+  const { data, error } = await params.supabase
+    .from('proactive_preferences')
+    .select('timezone')
+    .eq('user_id', params.userId)
+    .eq('platform', 'telegram')
+    .eq('telegram_chat_id', params.chatId)
+    .maybeSingle()
+
+  if (error) {
+    throw error
+  }
+
+  return typeof data?.timezone === 'string' && data.timezone.trim() ? data.timezone : 'Asia/Singapore'
+}
+
+function formatDailyRecapNotesForPrompt(notes: LifeThreadNotePromptContext[]): string {
+  return notes
+    .map((note, index) => {
+      const source = note.summary.startsWith('Check-in reply:') ? 'progress event' : 'captured thought'
+
+      return `${index + 1}. thread=${formatLifeThreadTopic(note.thread_label)}; source=${source}; title=${getLifeThreadNoteTitle(
+        note
+      )}; summary=${truncateText(note.summary, 240)}; raw_excerpt=${truncateText(note.raw_text, 220)}`
+    })
+    .join('\n')
+}
+
+async function resolveDailyRecapReply(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+  userText: string
+}): Promise<string> {
+  const timezone = await getDailyRecapTimezone(params)
+  const localDate = getLocalDateString(new Date(), timezone)
+  const startIso = zonedDateTimeToUtcIso(localDate, '00:00', timezone)
+  const endIso = zonedDateTimeToUtcIso(addDaysToLocalDate(localDate, 1), '00:00', timezone)
+  const threadFilter = getDailyRecapThreadFilter(params.userText)
+  const notes = await getLifeThreadNotesForDateRange({
+    supabase: params.supabase,
+    userId: params.userId,
+    startIso,
+    endIso,
+    threadLabel: threadFilter,
+  })
+
+  if (notes.length === 0) {
+    return 'i don’t have much saved from today yet, so i can’t really recap properly.'
+  }
+
+  const threadFocus = threadFilter ? formatLifeThreadTopic(threadFilter) : 'all saved threads'
+  const rawRecap = await callLLM({
+    systemPrompt: `You are Bergi, Min's AI companion. Write a short natural daily recap from saved notes/progress events.
+
+Rules:
+- Use only the provided notes. Do not invent progress.
+- Group by natural thread names: internship, bergi, german, general.
+- If there is only one note, say it simply and do not overstate.
+- A small clarity win counts as progress if the notes support it.
+- Sound like a friend reflecting the day back, not a report generator.
+- Keep it short. Plain text only.
+- Do not mention life_thread_notes, database, thread_label, SQL, implementation details, or "saved notes".`,
+    chatMessages: [
+      {
+        role: 'user',
+        content: `User asked: ${params.userText}
+Local date: ${localDate}
+Timezone: ${timezone}
+Thread focus: ${threadFocus}
+
+Today’s notes/progress events:
+${formatDailyRecapNotesForPrompt(notes)}`,
+      },
+    ],
+  })
+
+  return formatForTelegramPlainText(rawRecap)
 }
 
 function parseReminderCancelNumber(text: string): number | null {
@@ -2611,6 +2741,19 @@ Reply naturally as Bergi using the recent conversation context.`
         }
 
         await saveMessage({ supabase, userId, role: 'assistant', content: memorySummaryReply })
+        return new Response('OK', { status: 200 })
+      }
+
+      if (isDailyRecapRequest(userText)) {
+        const dailyRecapReply = await resolveDailyRecapReply({ supabase, userId, chatId, userText })
+
+        if (isLocalTestMode) {
+          console.log('Local test daily recap reply:', dailyRecapReply)
+        } else {
+          await sendTelegramMessage(chatId, dailyRecapReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: dailyRecapReply })
         return new Response('OK', { status: 200 })
       }
 
