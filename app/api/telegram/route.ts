@@ -411,13 +411,13 @@ you can:
 • ask me to remind you about things
 • practise German casually with me
 • let me check in on you during the day
+• ask me what i remember from recent thoughts
 
 commands:
 /checkin_status — see whether check-ins are on
 /pause_checkins — pause check-ins
 /resume_checkins — resume check-ins
 /list_reminders — show active reminders
-/notes — show recent captured notes
 /capture_this — save the previous thought as a note
 
 you don’t need exact commands most of the time — just talk to me naturally.`
@@ -504,6 +504,25 @@ function isThoughtCaptureCommand(text: string): boolean {
     normalized === 'capture this' ||
     normalized === 'save that thought' ||
     normalized === 'remember this as a thread note'
+  )
+}
+
+function isNaturalMemorySummaryRequest(text: string): boolean {
+  const normalized = text
+    .toLowerCase()
+    .replace(/[’']/g, '')
+    .replace(/[?!.。！？]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  return (
+    normalized === 'what do you remember from recently' ||
+    normalized === 'what do you remember about me recently' ||
+    normalized === 'what have i been thinking about' ||
+    normalized === 'what did i ask you to keep track of' ||
+    normalized === 'what are my recent thoughts' ||
+    normalized === 'what have i captured recently' ||
+    normalized === 'what did you remember'
   )
 }
 
@@ -829,6 +848,26 @@ ${summary}`
   return `latest notes:
 
 ${noteLines.join('\n\n')}`
+}
+
+function formatNaturalMemorySummary(notes: LifeThreadNotePromptContext[]): string {
+  if (notes.length === 0) {
+    return 'i don’t have much captured yet. if something feels worth keeping, just say “save this thought” after telling me.'
+  }
+
+  const noteLines = notes.map((note, index) => {
+    const title = getLifeThreadNoteTitle(note).toLowerCase()
+    const summary = truncateText(note.summary, 190)
+
+    return `${index + 1}. ${title}
+${summary}`
+  })
+
+  return `recently, you’ve mainly been thinking about:
+
+${noteLines.join('\n\n')}
+
+that’s the main thread i’m seeing so far.`
 }
 
 function formatMostRelevantLifeThreadNoteForPrompt(note: LifeThreadNotePromptContext | null): string {
@@ -2321,6 +2360,20 @@ Reply naturally as Bergi using the recent conversation context.`
         }
 
         await saveMessage({ supabase, userId, role: 'assistant', content: notesReply })
+        return new Response('OK', { status: 200 })
+      }
+
+      if (isNaturalMemorySummaryRequest(userText)) {
+        const recentNotes = await getRecentLifeThreadNotes({ supabase, userId, limit: 5 })
+        const memorySummaryReply = formatNaturalMemorySummary(recentNotes)
+
+        if (isLocalTestMode) {
+          console.log('Local test natural memory summary reply:', memorySummaryReply)
+        } else {
+          await sendTelegramMessage(chatId, memorySummaryReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: memorySummaryReply })
         return new Response('OK', { status: 200 })
       }
 
