@@ -541,7 +541,7 @@ async function setProactiveCheckinsEnabled(params: {
   userId: string
   chatId: number
   enabled: boolean
-}): Promise<void> {
+}): Promise<{ timezone: string }> {
   const { supabase, userId, chatId, enabled } = params
   const preference = await getOrCreateProactivePreferences({
     supabase,
@@ -560,6 +560,8 @@ async function setProactiveCheckinsEnabled(params: {
   if (error) {
     throw error
   }
+
+  return { timezone: preference.timezone }
 }
 
 async function cancelFutureScheduledProactiveCheckins(params: {
@@ -607,6 +609,106 @@ async function countFutureScheduledProactiveCheckins(params: {
   return count ?? 0
 }
 
+async function restoreTodayFutureCancelledProactiveCheckins(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+  timezone: string
+}): Promise<number> {
+  const { supabase, userId, chatId, timezone } = params
+  const now = new Date()
+  const localDate = getLocalDateString(now, timezone)
+  const nextLocalDate = addDaysToLocalDate(localDate, 1)
+  const nowIso = now.toISOString()
+  const nextDayStartIso = zonedDateTimeToUtcIso(nextLocalDate, '00:00', timezone)
+  const restoreTime = new Date().toISOString()
+  const { data, error } = await supabase
+    .from('proactive_checkins')
+    .update({
+      status: 'scheduled',
+      updated_at: restoreTime,
+    })
+    .eq('user_id', userId)
+    .eq('platform', 'telegram')
+    .eq('telegram_chat_id', chatId)
+    .eq('status', 'cancelled')
+    .gt('scheduled_for', nowIso)
+    .lt('scheduled_for', nextDayStartIso)
+    .select('id')
+
+  if (error) {
+    throw error
+  }
+
+  return data?.length ?? 0
+}
+
+function getLocalDateString(date: Date, timezone: string): string {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date)
+
+  return `${getDateTimePart(parts, 'year')}-${getDateTimePart(parts, 'month')}-${getDateTimePart(parts, 'day')}`
+}
+
+function zonedDateTimeToUtcIso(localDate: string, localTime: string, timezone: string): string {
+  const [year, month, day] = localDate.split('-').map(Number)
+  const [hour, minute, second] = normalizeTime(localTime).split(':').map(Number)
+  const utcGuess = Date.UTC(year, month - 1, day, hour, minute, second)
+  const firstPassUtc = utcGuess - getTimeZoneOffsetMs(new Date(utcGuess), timezone)
+  const secondPassUtc = utcGuess - getTimeZoneOffsetMs(new Date(firstPassUtc), timezone)
+
+  return new Date(secondPassUtc).toISOString()
+}
+
+function getTimeZoneOffsetMs(date: Date, timezone: string): number {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date)
+  const year = Number(getDateTimePart(parts, 'year'))
+  const month = Number(getDateTimePart(parts, 'month'))
+  const day = Number(getDateTimePart(parts, 'day'))
+  const hour = Number(getDateTimePart(parts, 'hour'))
+  const minute = Number(getDateTimePart(parts, 'minute'))
+  const second = Number(getDateTimePart(parts, 'second'))
+  const zonedAsUtc = Date.UTC(year, month - 1, day, hour, minute, second)
+
+  return zonedAsUtc - date.getTime()
+}
+
+function addDaysToLocalDate(localDate: string, days: number): string {
+  const [year, month, day] = localDate.split('-').map(Number)
+  const date = new Date(Date.UTC(year, month - 1, day + days))
+
+  return date.toISOString().slice(0, 10)
+}
+
+function getDateTimePart(parts: Intl.DateTimeFormatPart[], type: Intl.DateTimeFormatPartTypes): string {
+  const part = parts.find((candidate) => candidate.type === type)
+
+  if (!part) {
+    throw new Error(`Missing date time part: ${type}`)
+  }
+
+  return part.value
+}
+
+function normalizeTime(time: string): string {
+  const [hour = '00', minute = '00', second = '00'] = time.split(':')
+
+  return `${hour.padStart(2, '0')}:${minute.padStart(2, '0')}:${second.padStart(2, '0')}`
+}
+
 async function resolveProactiveCheckinControlReply(params: {
   supabase: ReturnType<typeof getSupabase>
   userId: string
@@ -622,12 +724,25 @@ async function resolveProactiveCheckinControlReply(params: {
   }
 
   if (action === 'resume') {
-    await setProactiveCheckinsEnabled({ supabase, userId, chatId, enabled: true })
+    const preference = await setProactiveCheckinsEnabled({ supabase, userId, chatId, enabled: true })
+    const restoredCount = await restoreTodayFutureCancelledProactiveCheckins({
+      supabase,
+      userId,
+      chatId,
+      timezone: preference.timezone,
+    })
+
+    if (restoredCount > 0) {
+      const checkinWord = restoredCount === 1 ? 'check-in' : 'check-ins'
+      return `done min, proactive check-ins are back on. I restored ${restoredCount} upcoming ${checkinWord} for today.`
+    }
+
     await generateDailyProactiveCheckins({
       supabase,
       userId,
       telegramChatId: chatId,
       platform: 'telegram',
+      timezone: preference.timezone,
     })
     return 'done min, proactive check-ins are back on.'
   }
