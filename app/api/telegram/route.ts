@@ -1,5 +1,6 @@
 import { createClient } from '@supabase/supabase-js'
 
+import { getRecentLifeThreadNotes, type LifeThreadNotePromptContext } from '@/lib/life-thread-notes'
 import { generateDailyProactiveCheckins, getOrCreateProactivePreferences } from '@/lib/proactive-checkins'
 
 type TelegramUpdate = {
@@ -141,6 +142,7 @@ type TelegramSlashCommand =
   | '/resume_checkins'
   | '/list_reminders'
   | '/capture_this'
+  | '/notes'
 
 type ThoughtCaptureSourceMessage = {
   id: string
@@ -391,6 +393,7 @@ function normalizeTelegramCommand(text: string): TelegramSlashCommand | null {
     case '/resume_checkins':
     case '/list_reminders':
     case '/capture_this':
+    case '/notes':
       return command
     default:
       return null
@@ -414,7 +417,8 @@ commands:
 /pause_checkins — pause check-ins
 /resume_checkins — resume check-ins
 /list_reminders — show active reminders
-/capture_this — save the previous thought as a thread note
+/notes — show recent captured notes
+/capture_this — save the previous thought as a note
 
 you don’t need exact commands most of the time — just talk to me naturally.`
 }
@@ -689,6 +693,52 @@ async function resolveThoughtCaptureReply(params: {
   })
 
   return `saved — i captured this as a thread note: ${truncateText(note.summary, 180)}`
+}
+
+function getLifeThreadNoteTitle(note: LifeThreadNotePromptContext): string {
+  return note.title?.trim() || 'captured thought'
+}
+
+function formatRecentLifeThreadNotesForTelegram(notes: LifeThreadNotePromptContext[]): string {
+  if (notes.length === 0) {
+    return 'no captured notes yet — send a thought, then say “save this thought”.'
+  }
+
+  const noteLines = notes.map((note, index) => {
+    const title = getLifeThreadNoteTitle(note)
+    const summary = truncateText(note.summary, 180)
+
+    return `${index + 1}. ${title}
+${summary}`
+  })
+
+  return `latest notes:
+
+${noteLines.join('\n\n')}`
+}
+
+function formatRecentLifeThreadNotesForPrompt(notes: LifeThreadNotePromptContext[]): string {
+  if (notes.length === 0) {
+    return ''
+  }
+
+  const noteLines = notes.map((note, index) => {
+    const title = getLifeThreadNoteTitle(note)
+    const details = [
+      note.summary,
+      note.open_question ? `open question: ${note.open_question}` : null,
+      note.next_step ? `next step: ${note.next_step}` : null,
+    ]
+      .filter(Boolean)
+      .join(' ')
+
+    return `${index + 1}. ${title} — ${truncateText(details, 260)}`
+  })
+
+  return `Recent things Min asked me to keep track of:
+${noteLines.join('\n')}
+
+Use the recent notes only if they are relevant to the current message. If you use one, mention it naturally and briefly, like a friend remembering something from before. Do not announce that you are using saved notes. Do not say phrases like "according to your saved memory", "stored this in my database", or "based on your life_thread_notes". If the notes are not relevant, ignore them.`
 }
 
 function parseReminderCancelNumber(text: string): number | null {
@@ -2120,6 +2170,20 @@ Reply naturally as Bergi using the recent conversation context.`
         return new Response('OK', { status: 200 })
       }
 
+      if (telegramCommand === '/notes') {
+        const recentNotes = await getRecentLifeThreadNotes({ supabase, userId, limit: 3 })
+        const notesReply = formatRecentLifeThreadNotesForTelegram(recentNotes)
+
+        if (isLocalTestMode) {
+          console.log('Local test notes reply:', notesReply)
+        } else {
+          await sendTelegramMessage(chatId, notesReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: notesReply })
+        return new Response('OK', { status: 200 })
+      }
+
       const proactiveCheckinAction =
         getProactiveCheckinControlActionFromCommand(telegramCommand) ?? getProactiveCheckinControlAction(userText)
 
@@ -2442,9 +2506,11 @@ Do this now:
 Style rule:
 Always answer Min's actual request first. Use humour, Singlish, and playful friend energy lightly, but not in every reply. Avoid turning every response into a comedy bit.
 `
+    const recentLifeThreadNotes = await getRecentLifeThreadNotes({ supabase, userId, limit: 5 })
+    const lifeThreadNotesContext = formatRecentLifeThreadNotesForPrompt(recentLifeThreadNotes)
     const finalSystemPrompt = `${systemPrompt}
 
-${responseModeGuidance}`
+${responseModeGuidance}${lifeThreadNotesContext ? `\n${lifeThreadNotesContext}` : ''}`
     const recentMessages = await getRecentMessages({ supabase, userId })
     const recentMessagesForLLM = [...recentMessages]
 
