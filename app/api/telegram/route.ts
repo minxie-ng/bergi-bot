@@ -20,6 +20,7 @@ import {
   getDailyRecapThreadFilter,
   isDailyRecapRequest,
 } from '@/lib/daily-recap'
+import { callFinanceWebhook, detectFinanceCandidate, isStrongFinanceCandidate } from '@/lib/finance-webhook'
 import { generateDailyProactiveCheckins, getOrCreateProactivePreferences } from '@/lib/proactive-checkins'
 import { truncateText } from '@/lib/text-utils'
 
@@ -2756,6 +2757,41 @@ Reply naturally as Bergi using the recent conversation context.`
           await saveMessage({ supabase, userId, role: 'assistant', content: clarifyingQuestion })
           return new Response('OK', { status: 200 })
         }
+      }
+    }
+
+    if (isPlainTextMessage && detectFinanceCandidate(userText)) {
+      try {
+        const financeResponse = await callFinanceWebhook({
+          text: userText,
+          userId,
+          telegramChatId: chatId,
+          timezone: 'Asia/Singapore',
+        })
+
+        if (financeResponse.ok || isStrongFinanceCandidate(userText)) {
+          const financeReply = financeResponse.message
+
+          if (isLocalTestMode) {
+            console.log('Local test finance reply generated')
+          } else {
+            await sendTelegramMessage(chatId, financeReply)
+          }
+
+          await saveMessage({ supabase, userId, role: 'assistant', content: financeReply })
+          return new Response('OK', { status: 200 })
+        }
+      } catch {
+        const financeToolErrorReply = 'I tried logging that, but my finance tool is not reachable right now.'
+
+        if (isLocalTestMode) {
+          console.log('Local test finance tool error reply generated')
+        } else {
+          await sendTelegramMessage(chatId, financeToolErrorReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: financeToolErrorReply })
+        return new Response('OK', { status: 200 })
       }
     }
 
