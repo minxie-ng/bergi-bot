@@ -1,6 +1,11 @@
 import { createClient } from '@supabase/supabase-js'
 
-import { getRecentLifeThreadNotes, type LifeThreadNotePromptContext } from '@/lib/life-thread-notes'
+import {
+  classifyLifeThreadLabel,
+  getRecentLifeThreadNotes,
+  type LifeThreadLabel,
+  type LifeThreadNotePromptContext,
+} from '@/lib/life-thread-notes'
 import { generateDailyProactiveCheckins, getOrCreateProactivePreferences } from '@/lib/proactive-checkins'
 
 type TelegramUpdate = {
@@ -682,6 +687,13 @@ async function saveLifeThreadNote(params: {
   note: ThoughtNoteDraft
 }): Promise<void> {
   const { supabase, userId, sourceMessageId, rawText, note } = params
+  const threadLabel = classifyLifeThreadLabel({
+    title: note.title,
+    summary: note.summary,
+    openQuestion: note.open_question,
+    nextStep: note.next_step,
+    rawText,
+  })
   const { error } = await supabase.from('life_thread_notes').insert({
     user_id: userId,
     source_message_id: sourceMessageId,
@@ -689,6 +701,7 @@ async function saveLifeThreadNote(params: {
     summary: note.summary,
     open_question: note.open_question,
     next_step: note.next_step,
+    thread_label: threadLabel,
     raw_text: rawText,
   })
 
@@ -861,6 +874,20 @@ function getLifeThreadNoteTitle(note: LifeThreadNotePromptContext): string {
   return note.title?.trim() || 'captured thought'
 }
 
+function formatLifeThreadTopic(threadLabel: LifeThreadLabel | null): string {
+  switch (threadLabel) {
+    case 'internship_progress':
+      return 'internship progress'
+    case 'bergi_product':
+      return 'bergi product building'
+    case 'german_learning':
+      return 'german learning'
+    case 'general_reflection':
+    case null:
+      return 'general reflection'
+  }
+}
+
 const LIFE_THREAD_NOTE_RECALL_STOPWORDS = new Set([
   'i',
   'me',
@@ -1021,6 +1048,7 @@ function formatMostRelevantLifeThreadNoteForPrompt(note: LifeThreadNotePromptCon
   return `Most relevant remembered thought:
 The user previously asked Bergi to keep track of this:
 - Title: ${getLifeThreadNoteTitle(note)}
+- Rough topic: ${formatLifeThreadTopic(note.thread_label)}
 - Summary: ${truncateText(note.summary, 240)}
 - Original wording excerpt: ${truncateText(note.raw_text, 280)}
 
@@ -1048,7 +1076,7 @@ function formatRecentLifeThreadNotesForPrompt(notes: LifeThreadNotePromptContext
       .filter(Boolean)
       .join(' ')
 
-    return `${index + 1}. ${title} — ${truncateText(details, 260)}`
+    return `${index + 1}. ${title} (${formatLifeThreadTopic(note.thread_label)}) — ${truncateText(details, 260)}`
   })
 
   return `Recent things Min asked me to keep track of:

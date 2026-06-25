@@ -83,10 +83,14 @@ create table if not exists life_thread_notes (
   summary text not null,
   open_question text,
   next_step text,
+  thread_label text,
   raw_text text not null,
   created_at timestamp with time zone not null default now(),
   updated_at timestamp with time zone not null default now()
 );
+
+alter table life_thread_notes
+add column if not exists thread_label text;
 
 create index if not exists life_thread_notes_user_id_created_at_idx
 on life_thread_notes(user_id, created_at desc);
