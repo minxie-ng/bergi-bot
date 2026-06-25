@@ -134,6 +134,7 @@ type SaveReminderParams = {
 }
 
 type ProactiveCheckinControlAction = 'pause' | 'resume' | 'status'
+type TelegramSlashCommand = '/help' | '/checkin_status' | '/pause_checkins' | '/resume_checkins' | '/list_reminders'
 
 function getSupabase() {
   const supabaseUrl = process.env.SUPABASE_URL
@@ -354,6 +355,53 @@ function isLikelyRescheduleReminderRequest(text: string): boolean {
     lower.includes('aendern')
 
   return hasReminderWord && hasRescheduleVerb
+}
+
+function normalizeTelegramCommand(text: string): TelegramSlashCommand | null {
+  const firstToken = text.trim().split(/\s+/)[0]?.toLowerCase()
+
+  if (!firstToken?.startsWith('/')) {
+    return null
+  }
+
+  const command = firstToken.split('@')[0]
+
+  switch (command) {
+    case '/help':
+    case '/checkin_status':
+    case '/pause_checkins':
+    case '/resume_checkins':
+    case '/list_reminders':
+      return command
+    default:
+      return null
+  }
+}
+
+function getHelpReply(): string {
+  return `here’s what I can do:
+
+/checkin_status — see whether proactive check-ins are on
+/pause_checkins — pause proactive check-ins
+/resume_checkins — resume proactive check-ins
+/list_reminders — show active reminders
+
+you can also just talk to me normally.`
+}
+
+function getProactiveCheckinControlActionFromCommand(
+  command: TelegramSlashCommand | null
+): ProactiveCheckinControlAction | null {
+  switch (command) {
+    case '/checkin_status':
+      return 'status'
+    case '/pause_checkins':
+      return 'pause'
+    case '/resume_checkins':
+      return 'resume'
+    default:
+      return null
+  }
 }
 
 function getProactiveCheckinControlAction(text: string): ProactiveCheckinControlAction | null {
@@ -1691,7 +1739,23 @@ Reply naturally as Bergi using the recent conversation context.`
     const isPlainTextMessage = userText !== undefined && voice === undefined && selectedPhoto === null
 
     if (isPlainTextMessage) {
-      const proactiveCheckinAction = getProactiveCheckinControlAction(userText)
+      const telegramCommand = normalizeTelegramCommand(userText)
+
+      if (telegramCommand === '/help') {
+        const helpReply = getHelpReply()
+
+        if (isLocalTestMode) {
+          console.log('Local test help reply:', helpReply)
+        } else {
+          await sendTelegramMessage(chatId, helpReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: helpReply })
+        return new Response('OK', { status: 200 })
+      }
+
+      const proactiveCheckinAction =
+        getProactiveCheckinControlActionFromCommand(telegramCommand) ?? getProactiveCheckinControlAction(userText)
 
       if (proactiveCheckinAction !== null) {
         const proactiveCheckinReply = await resolveProactiveCheckinControlReply({
@@ -1712,7 +1776,10 @@ Reply naturally as Bergi using the recent conversation context.`
       }
     }
 
-    if (isPlainTextMessage && isLikelyListRemindersRequest(userText)) {
+    if (
+      isPlainTextMessage &&
+      (normalizeTelegramCommand(userText) === '/list_reminders' || isLikelyListRemindersRequest(userText))
+    ) {
       const upcomingReminders = await getUpcomingReminders({ supabase, userId, chatId })
       const remindersReply = formatUpcomingReminders(upcomingReminders)
 
