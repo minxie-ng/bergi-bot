@@ -699,6 +699,120 @@ function getLifeThreadNoteTitle(note: LifeThreadNotePromptContext): string {
   return note.title?.trim() || 'captured thought'
 }
 
+const LIFE_THREAD_NOTE_RECALL_STOPWORDS = new Set([
+  'i',
+  'me',
+  'my',
+  'the',
+  'a',
+  'an',
+  'to',
+  'and',
+  'or',
+  'is',
+  'are',
+  'was',
+  'were',
+  'of',
+  'in',
+  'on',
+  'for',
+  'it',
+  'this',
+  'that',
+  'like',
+  'feel',
+  'feels',
+  'today',
+  'still',
+  'not',
+  'how',
+  'what',
+  'why',
+  'can',
+])
+
+function getLifeThreadRecallKeywords(text: string): Set<string> {
+  const words = text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .map((word) => word.trim())
+    .filter((word) => word.length >= 3 && !LIFE_THREAD_NOTE_RECALL_STOPWORDS.has(word))
+
+  return new Set(words)
+}
+
+function getLifeThreadNoteOverlapCount(currentKeywords: Set<string>, note: LifeThreadNotePromptContext): number {
+  const noteKeywords = new Set<string>()
+  const noteFields = [note.title ?? '', note.summary, note.open_question ?? '', note.next_step ?? '', note.raw_text]
+
+  for (const field of noteFields) {
+    for (const keyword of getLifeThreadRecallKeywords(field)) {
+      noteKeywords.add(keyword)
+    }
+  }
+
+  let overlapCount = 0
+
+  for (const keyword of currentKeywords) {
+    if (noteKeywords.has(keyword)) {
+      overlapCount += 1
+    }
+  }
+
+  return overlapCount
+}
+
+function scoreLifeThreadNoteRelevance(currentKeywords: Set<string>, note: LifeThreadNotePromptContext): number {
+  const weightedFields = [
+    { text: note.title ?? '', weight: 1 },
+    { text: note.summary, weight: 2 },
+    { text: note.open_question ?? '', weight: 1 },
+    { text: note.next_step ?? '', weight: 1 },
+    { text: note.raw_text, weight: 2 },
+  ]
+  let score = 0
+
+  for (const field of weightedFields) {
+    for (const keyword of getLifeThreadRecallKeywords(field.text)) {
+      if (currentKeywords.has(keyword)) {
+        score += field.weight
+      }
+    }
+  }
+
+  return score
+}
+
+function findMostRelevantLifeThreadNote(
+  currentText: string,
+  notes: LifeThreadNotePromptContext[]
+): LifeThreadNotePromptContext | null {
+  const currentKeywords = getLifeThreadRecallKeywords(currentText)
+
+  if (currentKeywords.size < 2) {
+    return null
+  }
+
+  let bestNote: LifeThreadNotePromptContext | null = null
+  let bestScore = 0
+  let bestOverlapCount = 0
+
+  for (const note of notes) {
+    const overlapCount = getLifeThreadNoteOverlapCount(currentKeywords, note)
+    const score = scoreLifeThreadNoteRelevance(currentKeywords, note)
+
+    if (score > bestScore) {
+      bestNote = note
+      bestScore = score
+      bestOverlapCount = overlapCount
+    }
+  }
+
+  return bestOverlapCount >= 2 ? bestNote : null
+}
+
 function formatRecentLifeThreadNotesForTelegram(notes: LifeThreadNotePromptContext[]): string {
   if (notes.length === 0) {
     return 'no captured notes yet — send a thought, then say “save this thought”.'
@@ -715,6 +829,21 @@ ${summary}`
   return `latest notes:
 
 ${noteLines.join('\n\n')}`
+}
+
+function formatMostRelevantLifeThreadNoteForPrompt(note: LifeThreadNotePromptContext | null): string {
+  if (!note) {
+    return ''
+  }
+
+  return `Most relevant remembered thought:
+The user previously asked Bergi to keep track of this:
+- Title: ${getLifeThreadNoteTitle(note)}
+- Summary: ${truncateText(note.summary, 240)}
+- Original wording excerpt: ${truncateText(note.raw_text, 280)}
+
+If the current message is clearly related to this remembered thought, briefly callback to the idea near the start, like a friend continuing an earlier conversation. Do not say "saved note", "memory", "database", or "according to". Keep it natural.
+Prefer phrases like "this sounds like that thing you mentioned earlier about...", "yeah, this connects to what you were saying before...", or "wait, this is close to your earlier point about...". Then give one simple reframe or one small question. Avoid bullets/lists unless Min explicitly asks for a template or framework.`
 }
 
 function formatRecentLifeThreadNotesForPrompt(notes: LifeThreadNotePromptContext[]): string {
@@ -2513,10 +2642,14 @@ Style rule:
 Always answer Min's actual request first. Use humour, Singlish, and playful friend energy lightly, but not in every reply. Avoid turning every response into a comedy bit.
 `
     const recentLifeThreadNotes = await getRecentLifeThreadNotes({ supabase, userId, limit: 5 })
+    const mostRelevantLifeThreadNote = findMostRelevantLifeThreadNote(userMessageForLLM, recentLifeThreadNotes)
+    const mostRelevantLifeThreadNoteContext = formatMostRelevantLifeThreadNoteForPrompt(mostRelevantLifeThreadNote)
     const lifeThreadNotesContext = formatRecentLifeThreadNotesForPrompt(recentLifeThreadNotes)
     const finalSystemPrompt = `${systemPrompt}
 
-${responseModeGuidance}${lifeThreadNotesContext ? `\n${lifeThreadNotesContext}` : ''}`
+${mostRelevantLifeThreadNoteContext ? `${mostRelevantLifeThreadNoteContext}\n\n` : ''}${responseModeGuidance}${
+      lifeThreadNotesContext ? `\n${lifeThreadNotesContext}` : ''
+    }`
     const recentMessages = await getRecentMessages({ supabase, userId })
     const recentMessagesForLLM = [...recentMessages]
 
