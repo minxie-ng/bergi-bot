@@ -2866,7 +2866,10 @@ Reply naturally as Bergi using the recent conversation context.`
           category: notionError.category,
         })
 
-        const financeToolErrorReply = 'I found the expense, but I couldn’t save it to Notion right now.'
+        const financeToolErrorReply =
+          notionError.category === 'notion_schema_mismatch'
+            ? 'I found the expense, but my Notion database fields don’t match what I expected yet.'
+            : 'I found the expense, but I couldn’t save it to Notion right now.'
 
         if (isLocalTestMode) {
           console.log('Local test finance tool error reply generated')

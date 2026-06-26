@@ -44,12 +44,46 @@ type CreateNotionExpenseLogInput = {
   comment?: string | null
 }
 
+type NotionOption = {
+  name?: unknown
+}
+
+type NotionDatabaseProperty = {
+  type?: unknown
+  select?: {
+    options?: NotionOption[]
+  }
+  status?: {
+    options?: NotionOption[]
+  }
+}
+
+type NotionDatabaseSchema = {
+  properties: Record<string, NotionDatabaseProperty>
+}
+
+type NotionExpensePropertySelection = {
+  title: string
+  amount: string
+  date?: string
+  category?: {
+    name: string
+    type: 'select' | 'status'
+  }
+  comment?: string
+  source?: {
+    name: string
+    type: 'select' | 'status'
+  }
+}
+
 export type NotionExpenseLogErrorCategory =
   | 'missing_env'
   | 'notion_unauthorized'
   | 'notion_forbidden_or_not_shared'
   | 'notion_database_not_found'
   | 'notion_validation_error'
+  | 'notion_schema_mismatch'
   | 'notion_timeout'
   | 'notion_unknown_error'
 
@@ -88,6 +122,9 @@ const FINANCE_KEYWORDS = [
   'top up',
   'topup',
 ]
+
+const NOTION_VERSION = '2022-06-28'
+let notionDatabaseSchemaCache: NotionDatabaseSchema | null = null
 
 function normalizeFinanceText(text: string): string {
   return text
@@ -229,6 +266,279 @@ async function parseNotionErrorCode(response: Response): Promise<string | undefi
   }
 }
 
+function isNotionDatabaseSchema(value: unknown): value is NotionDatabaseSchema {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'properties' in value &&
+    typeof (value as { properties?: unknown }).properties === 'object' &&
+    (value as { properties?: unknown }).properties !== null
+  )
+}
+
+function getPropertyType(schema: NotionDatabaseSchema, name: string): string | null {
+  const type = schema.properties[name]?.type
+
+  return typeof type === 'string' ? type : null
+}
+
+function findTitlePropertyName(schema: NotionDatabaseSchema): string | null {
+  const titleProperty = Object.entries(schema.properties).find(([, property]) => property.type === 'title')
+
+  return titleProperty?.[0] ?? null
+}
+
+function findNumberPropertyName(schema: NotionDatabaseSchema): string | null {
+  if (getPropertyType(schema, 'Amount') === 'number') {
+    return 'Amount'
+  }
+
+  const numberProperty = Object.entries(schema.properties).find(([, property]) => property.type === 'number')
+
+  return numberProperty?.[0] ?? null
+}
+
+function getOptionNames(property: NotionDatabaseProperty | undefined): string[] {
+  const options = property?.select?.options ?? property?.status?.options ?? []
+
+  return options
+    .map((option) => option.name)
+    .filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
+}
+
+function hasOption(schema: NotionDatabaseSchema, propertyName: string, optionName: string): boolean {
+  return getOptionNames(schema.properties[propertyName]).includes(optionName)
+}
+
+function getCompatibleSelectOrStatusProperty(
+  schema: NotionDatabaseSchema,
+  propertyName: string,
+  optionName: string
+): { name: string; type: 'select' | 'status' } | undefined {
+  const type = getPropertyType(schema, propertyName)
+
+  if ((type === 'select' || type === 'status') && hasOption(schema, propertyName, optionName)) {
+    return {
+      name: propertyName,
+      type,
+    }
+  }
+
+  return undefined
+}
+
+function getNotionDatabasePropertyMetadata(schema: NotionDatabaseSchema): Array<{ name: string; type: string }> {
+  return Object.entries(schema.properties)
+    .map(([name, property]) => ({
+      name,
+      type: typeof property.type === 'string' ? property.type : 'unknown',
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name))
+}
+
+function getNotionExpensePropertySelection(schema: NotionDatabaseSchema, input: CreateNotionExpenseLogInput) {
+  const title = findTitlePropertyName(schema)
+  const amount = findNumberPropertyName(schema)
+
+  if (!title || !amount) {
+    throw new NotionExpenseLogError({ category: 'notion_schema_mismatch' })
+  }
+
+  const selection: NotionExpensePropertySelection = {
+    title,
+    amount,
+  }
+
+  if (getPropertyType(schema, 'Date') === 'date') {
+    selection.date = 'Date'
+  }
+
+  if (getPropertyType(schema, 'Comment') === 'rich_text') {
+    selection.comment = 'Comment'
+  }
+
+  const category = getCompatibleSelectOrStatusProperty(schema, 'Category', input.category)
+
+  if (category) {
+    selection.category = category
+  }
+
+  const source = getCompatibleSelectOrStatusProperty(schema, 'Source', 'Bergi')
+
+  if (source) {
+    selection.source = source
+  }
+
+  return selection
+}
+
+function logNotionDatabaseSchemaLoaded(schema: NotionDatabaseSchema): void {
+  console.log('notion_database_schema_loaded', {
+    properties: getNotionDatabasePropertyMetadata(schema),
+  })
+}
+
+function logNotionExpensePropertiesSelected(selection: NotionExpensePropertySelection): void {
+  console.log('notion_expense_properties_selected', {
+    properties: [
+      { role: 'title', name: selection.title },
+      { role: 'amount', name: selection.amount },
+      selection.date ? { role: 'date', name: selection.date } : null,
+      selection.comment ? { role: 'comment', name: selection.comment } : null,
+      selection.category ? { role: 'category', name: selection.category.name, type: selection.category.type } : null,
+      selection.source ? { role: 'source', name: selection.source.name, type: selection.source.type } : null,
+    ].filter(Boolean),
+  })
+}
+
+function getNotionHeaders(notionToken: string): Record<string, string> {
+  return {
+    Authorization: `Bearer ${notionToken}`,
+    'Content-Type': 'application/json',
+    'Notion-Version': NOTION_VERSION,
+  }
+}
+
+function normalizeNotionDatabaseId(value: string): string {
+  const trimmed = value.trim()
+  const uuidMatch = trimmed.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)
+
+  if (uuidMatch) {
+    return uuidMatch[0]
+  }
+
+  const compactIdMatch = trimmed.match(/[0-9a-f]{32}/i)
+
+  if (compactIdMatch) {
+    const compactId = compactIdMatch[0]
+
+    return `${compactId.slice(0, 8)}-${compactId.slice(8, 12)}-${compactId.slice(12, 16)}-${compactId.slice(
+      16,
+      20
+    )}-${compactId.slice(20)}`
+  }
+
+  return trimmed
+}
+
+async function retrieveNotionDatabaseSchema(params: {
+  notionToken: string
+  databaseId: string
+}): Promise<NotionDatabaseSchema> {
+  if (notionDatabaseSchemaCache) {
+    logNotionDatabaseSchemaLoaded(notionDatabaseSchemaCache)
+    return notionDatabaseSchemaCache
+  }
+
+  const abortController = new AbortController()
+  const timeout = setTimeout(() => abortController.abort(), 1200)
+
+  try {
+    const response = await fetch(`https://api.notion.com/v1/databases/${params.databaseId}`, {
+      method: 'GET',
+      signal: abortController.signal,
+      headers: getNotionHeaders(params.notionToken),
+    })
+
+    if (!response.ok) {
+      const notionCode = await parseNotionErrorCode(response)
+      const category =
+        response.status === 400 && notionCode === 'validation_error'
+          ? 'notion_schema_mismatch'
+          : getNotionErrorCategory(response.status, notionCode)
+
+      throw new NotionExpenseLogError({
+        category,
+        status: response.status,
+        notionCode,
+      })
+    }
+
+    const data = (await response.json()) as unknown
+
+    if (!isNotionDatabaseSchema(data)) {
+      throw new NotionExpenseLogError({ category: 'notion_schema_mismatch' })
+    }
+
+    notionDatabaseSchemaCache = data
+    logNotionDatabaseSchemaLoaded(data)
+
+    return data
+  } catch (error) {
+    if (error instanceof NotionExpenseLogError) {
+      throw error
+    }
+
+    if (isAbortError(error)) {
+      throw new NotionExpenseLogError({ category: 'notion_timeout' })
+    }
+
+    throw new NotionExpenseLogError({ category: 'notion_unknown_error' })
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+function buildNotionExpenseProperties(
+  selection: NotionExpensePropertySelection,
+  input: CreateNotionExpenseLogInput
+): Record<string, unknown> {
+  const properties: Record<string, unknown> = {
+    [selection.title]: {
+      title: [
+        {
+          text: {
+            content: input.expense,
+          },
+        },
+      ],
+    },
+    [selection.amount]: {
+      number: input.amount,
+    },
+  }
+
+  if (selection.date) {
+    properties[selection.date] = {
+      date: {
+        start: input.date,
+      },
+    }
+  }
+
+  if (selection.category) {
+    properties[selection.category.name] = {
+      [selection.category.type]: {
+        name: input.category,
+      },
+    }
+  }
+
+  if (selection.comment) {
+    properties[selection.comment] = {
+      rich_text: input.comment
+        ? [
+            {
+              text: {
+                content: input.comment,
+              },
+            },
+          ]
+        : [],
+    }
+  }
+
+  if (selection.source) {
+    properties[selection.source.name] = {
+      [selection.source.type]: {
+        name: 'Bergi',
+      },
+    }
+  }
+
+  return properties
+}
+
 export async function parseExpenseLogWithLLM(params: CallFinanceParserParams): Promise<ParsedExpenseLog> {
   const allowedCategories = FINANCE_CATEGORIES.join(', ')
   const raw = await params.callLLM({
@@ -270,12 +580,20 @@ Rules:
 
 export async function createNotionExpenseLog(input: CreateNotionExpenseLogInput): Promise<void> {
   const notionToken = process.env.NOTION_TOKEN
-  const databaseId = process.env.NOTION_EXPENSES_DATABASE_ID
+  const rawDatabaseId = process.env.NOTION_EXPENSES_DATABASE_ID
 
-  if (!notionToken || !databaseId) {
+  if (!notionToken || !rawDatabaseId) {
     throw new NotionExpenseLogError({ category: 'missing_env' })
   }
 
+  const databaseId = normalizeNotionDatabaseId(rawDatabaseId)
+  const schema = await retrieveNotionDatabaseSchema({
+    notionToken,
+    databaseId,
+  })
+  const propertySelection = getNotionExpensePropertySelection(schema, input)
+  logNotionExpensePropertiesSelected(propertySelection)
+  const properties = buildNotionExpenseProperties(propertySelection, input)
   const abortController = new AbortController()
   const timeout = setTimeout(() => abortController.abort(), 1800)
 
@@ -283,55 +601,12 @@ export async function createNotionExpenseLog(input: CreateNotionExpenseLogInput)
     const response = await fetch('https://api.notion.com/v1/pages', {
       method: 'POST',
       signal: abortController.signal,
-      headers: {
-        Authorization: `Bearer ${notionToken}`,
-        'Content-Type': 'application/json',
-        'Notion-Version': '2022-06-28',
-      },
+      headers: getNotionHeaders(notionToken),
       body: JSON.stringify({
         parent: {
           database_id: databaseId,
         },
-        properties: {
-          Expense: {
-            title: [
-              {
-                text: {
-                  content: input.expense,
-                },
-              },
-            ],
-          },
-          Date: {
-            date: {
-              start: input.date,
-            },
-          },
-          Amount: {
-            number: input.amount,
-          },
-          Category: {
-            select: {
-              name: input.category,
-            },
-          },
-          Comment: {
-            rich_text: input.comment
-              ? [
-                  {
-                    text: {
-                      content: input.comment,
-                    },
-                  },
-                ]
-              : [],
-          },
-          Source: {
-            select: {
-              name: 'Bergi',
-            },
-          },
-        },
+        properties,
       }),
     })
 
