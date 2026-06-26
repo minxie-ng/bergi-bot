@@ -19,21 +19,25 @@ export type CalendarEvent = {
 
 export type CalendarReadErrorCategory =
   | 'missing_env'
-  | 'google_unauthorized'
-  | 'google_forbidden_or_not_shared'
-  | 'google_calendar_not_found'
-  | 'google_timeout'
+  | 'invalid_private_key'
+  | 'calendar_api_disabled'
+  | 'calendar_not_found_or_not_shared'
+  | 'calendar_permission_denied'
+  | 'google_auth_error'
+  | 'google_calendar_api_error'
   | 'google_unknown_error'
 
 export class CalendarReadError extends Error {
   category: CalendarReadErrorCategory
   status?: number
+  reason?: string
 
-  constructor(params: { category: CalendarReadErrorCategory; status?: number }) {
+  constructor(params: { category: CalendarReadErrorCategory; status?: number; reason?: string }) {
     super(params.category)
     this.name = 'CalendarReadError'
     this.category = params.category
     this.status = params.status
+    this.reason = params.reason
   }
 }
 
@@ -53,7 +57,34 @@ type GoogleCalendarEventsResponse = {
   items?: GoogleCalendarEvent[]
 }
 
+type CalendarReadEnvValidationMetadata = {
+  hasServiceAccountEmail: boolean
+  hasPrivateKey: boolean
+  privateKeyIncludesBeginPrivateKey: boolean
+  privateKeyIncludesEscapedNewline: boolean
+  hasCalendarId: boolean
+}
+
+type SafeGoogleErrorDetails = {
+  status?: number
+  reason?: string
+}
+
 let cachedAccessToken: { token: string; expiresAtMs: number } | null = null
+
+export function getCalendarReadEnvValidationMetadata(): CalendarReadEnvValidationMetadata {
+  const serviceAccountEmail = process.env.GOOGLE_CALENDAR_SERVICE_ACCOUNT_EMAIL
+  const privateKey = process.env.GOOGLE_CALENDAR_PRIVATE_KEY
+  const calendarId = process.env.GOOGLE_CALENDAR_ID
+
+  return {
+    hasServiceAccountEmail: Boolean(serviceAccountEmail),
+    hasPrivateKey: Boolean(privateKey),
+    privateKeyIncludesBeginPrivateKey: Boolean(privateKey?.includes('BEGIN PRIVATE KEY')),
+    privateKeyIncludesEscapedNewline: Boolean(privateKey?.includes('\\n')),
+    hasCalendarId: Boolean(calendarId),
+  }
+}
 
 function normalizeCalendarText(text: string): string {
   return text
@@ -120,20 +151,93 @@ function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError'
 }
 
-function getCalendarReadErrorCategory(status: number): CalendarReadErrorCategory {
-  if (status === 401) {
-    return 'google_unauthorized'
+function getSafeString(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined
   }
 
-  if (status === 403) {
-    return 'google_forbidden_or_not_shared'
+  const normalized = value.trim()
+
+  if (!normalized || !/^[a-zA-Z0-9_.:-]{1,80}$/.test(normalized)) {
+    return undefined
   }
 
-  if (status === 404) {
-    return 'google_calendar_not_found'
+  return normalized
+}
+
+function getRecord(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return undefined
+  }
+
+  return value as Record<string, unknown>
+}
+
+function getSafeGoogleErrorDetails(data: unknown, fallbackStatus?: number): SafeGoogleErrorDetails {
+  const root = getRecord(data)
+  const rootError = root?.error
+
+  if (typeof rootError === 'string') {
+    return {
+      status: typeof root?.code === 'number' ? root.code : fallbackStatus,
+      reason: getSafeString(rootError),
+    }
+  }
+
+  const error = getRecord(rootError)
+  const errors = Array.isArray(error?.errors) ? error.errors : []
+  const firstError = getRecord(errors[0])
+
+  return {
+    status: typeof error?.code === 'number' ? error.code : fallbackStatus,
+    reason:
+      getSafeString(firstError?.reason) ??
+      getSafeString(error?.status) ??
+      getSafeString(error?.reason) ??
+      getSafeString(root?.reason),
+  }
+}
+
+function getAuthErrorCategory(details: SafeGoogleErrorDetails): CalendarReadErrorCategory {
+  if (details.reason === 'invalid_grant' || details.reason === 'invalid_client' || details.status !== undefined) {
+    return 'google_auth_error'
   }
 
   return 'google_unknown_error'
+}
+
+function getCalendarApiErrorCategory(details: SafeGoogleErrorDetails): CalendarReadErrorCategory {
+  if (
+    details.reason === 'accessNotConfigured' ||
+    details.reason === 'serviceDisabled' ||
+    details.reason === 'SERVICE_DISABLED' ||
+    details.reason === 'API_DISABLED'
+  ) {
+    return 'calendar_api_disabled'
+  }
+
+  if (details.status === 404 || details.reason === 'notFound') {
+    return 'calendar_not_found_or_not_shared'
+  }
+
+  if (details.status === 401 || details.status === 403) {
+    return 'calendar_permission_denied'
+  }
+
+  if (details.status !== undefined) {
+    return 'google_calendar_api_error'
+  }
+
+  return 'google_unknown_error'
+}
+
+async function getSafeGoogleErrorDetailsFromResponse(response: Response): Promise<SafeGoogleErrorDetails> {
+  try {
+    const data = (await response.json()) as unknown
+    return getSafeGoogleErrorDetails(data, response.status)
+  } catch {
+    return { status: response.status }
+  }
 }
 
 async function getGoogleCalendarAccessToken(): Promise<string> {
@@ -142,6 +246,10 @@ async function getGoogleCalendarAccessToken(): Promise<string> {
 
   if (!serviceAccountEmail || !privateKey) {
     throw new CalendarReadError({ category: 'missing_env' })
+  }
+
+  if (!privateKey.includes('BEGIN PRIVATE KEY')) {
+    throw new CalendarReadError({ category: 'invalid_private_key' })
   }
 
   if (cachedAccessToken && cachedAccessToken.expiresAtMs > Date.now() + 60_000) {
@@ -166,7 +274,14 @@ async function getGoogleCalendarAccessToken(): Promise<string> {
   signer.update(unsignedJwt)
   signer.end()
 
-  const signature = base64UrlEncode(signer.sign(normalizePrivateKey(privateKey)))
+  let signature: string
+
+  try {
+    signature = base64UrlEncode(signer.sign(normalizePrivateKey(privateKey)))
+  } catch {
+    throw new CalendarReadError({ category: 'invalid_private_key' })
+  }
+
   const assertion = `${unsignedJwt}.${signature}`
   const abortController = new AbortController()
   const timeout = setTimeout(() => abortController.abort(), 1800)
@@ -185,7 +300,13 @@ async function getGoogleCalendarAccessToken(): Promise<string> {
     })
 
     if (!response.ok) {
-      throw new CalendarReadError({ category: getCalendarReadErrorCategory(response.status), status: response.status })
+      const details = await getSafeGoogleErrorDetailsFromResponse(response)
+
+      throw new CalendarReadError({
+        category: getAuthErrorCategory(details),
+        status: details.status,
+        reason: details.reason,
+      })
     }
 
     const data = (await response.json()) as { access_token?: unknown; expires_in?: unknown }
@@ -206,7 +327,7 @@ async function getGoogleCalendarAccessToken(): Promise<string> {
     }
 
     if (isAbortError(error)) {
-      throw new CalendarReadError({ category: 'google_timeout' })
+      throw new CalendarReadError({ category: 'google_unknown_error' })
     }
 
     throw new CalendarReadError({ category: 'google_unknown_error' })
@@ -270,7 +391,13 @@ export async function queryGoogleCalendarEvents(params: {
     )
 
     if (!response.ok) {
-      throw new CalendarReadError({ category: getCalendarReadErrorCategory(response.status), status: response.status })
+      const details = await getSafeGoogleErrorDetailsFromResponse(response)
+
+      throw new CalendarReadError({
+        category: getCalendarApiErrorCategory(details),
+        status: details.status,
+        reason: details.reason,
+      })
     }
 
     const data = (await response.json()) as GoogleCalendarEventsResponse
@@ -284,7 +411,7 @@ export async function queryGoogleCalendarEvents(params: {
     }
 
     if (isAbortError(error)) {
-      throw new CalendarReadError({ category: 'google_timeout' })
+      throw new CalendarReadError({ category: 'google_calendar_api_error' })
     }
 
     throw new CalendarReadError({ category: 'google_unknown_error' })

@@ -25,6 +25,7 @@ import {
   type CalendarEvent,
   type CalendarQueryIntent,
   detectCalendarQueryIntent,
+  getCalendarReadEnvValidationMetadata,
   queryGoogleCalendarEvents,
 } from '@/lib/calendar-read'
 import {
@@ -1268,6 +1269,7 @@ async function resolveCalendarQueryReply(params: {
 
   console.log('calendar_query_started', {
     period: params.intent.period,
+    env: getCalendarReadEnvValidationMetadata(),
   })
 
   const events = await queryGoogleCalendarEvents({
@@ -3143,6 +3145,8 @@ Reply naturally as Bergi using the recent conversation context.`
 
           console.error('calendar_query_failed', {
             category: calendarError.category,
+            status: calendarError.status,
+            reason: calendarError.reason,
           })
           calendarQueryReply =
             calendarError.category === 'missing_env'
