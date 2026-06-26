@@ -4,7 +4,7 @@
 
 Bergi is a Telegram-first AI companion and personal operator. The product direction is not to compete only on raw chat quality, but to build continuity: memory, proactive follow-up, reminders, personal workflows, and useful context that carries across days.
 
-Bergi Core owns personality, memory, reminders, proactive check-ins, finance routing, and decision logic. Supabase is the source of truth for Bergi internal state. Notion is currently used as the finance storage layer for expenses.
+Bergi Core owns personality, memory, reminders, proactive check-ins, finance routing, calendar read-only queries, and decision logic. Supabase is the source of truth for Bergi internal state. Notion is currently used as the finance storage layer for expenses. Google Calendar is currently used read-only for schedule queries.
 
 n8n is not active for finance logging anymore. The earlier Bergi Core -> n8n -> Notion finance prototype was removed. n8n may still be useful later for external automations such as Calendar, Gmail, Notion sync, or other tool workflows, but finance currently runs directly in Bergi Core.
 
@@ -29,6 +29,7 @@ n8n is not active for finance logging anymore. The earlier Bergi Core -> n8n -> 
 - Spoken-number voice finance support
 - Finance validation and edge-case handling
 - Finance query/read support from Notion
+- Google Calendar read-only schedule queries
 
 ## 3. Core architecture flow
 
@@ -42,6 +43,7 @@ High-level Telegram flow:
    - Slash command
    - Reminder management or creation
    - Finance query or logging
+   - Calendar schedule query
    - Thought capture
    - Daily recap
    - Memory recall
@@ -173,10 +175,43 @@ Known environment variables currently used:
 - `CRON_SECRET`
 - `NOTION_TOKEN`
 - `NOTION_EXPENSES_DATABASE_ID`
+- `GOOGLE_CALENDAR_SERVICE_ACCOUNT_EMAIL`
+- `GOOGLE_CALENDAR_PRIVATE_KEY`
+- `GOOGLE_CALENDAR_ID`
 
 Never commit real secrets.
 
-## 9. Cron jobs
+## 9. Google Calendar read-only integration
+
+Active path:
+
+Telegram -> Bergi Core -> calendar intent detector -> Google Calendar API `events.list`
+
+Auth approach:
+
+- Server-side Google service account with Calendar read-only scope.
+- The target Google Calendar must be shared with the service account email.
+- `GOOGLE_CALENDAR_ID` should point to the shared calendar ID, often the calendar owner's email address for a primary calendar.
+
+Required environment variables:
+
+- `GOOGLE_CALENDAR_SERVICE_ACCOUNT_EMAIL`
+- `GOOGLE_CALENDAR_PRIVATE_KEY`
+- `GOOGLE_CALENDAR_ID`
+
+Supported query examples:
+
+- `what do i have today?`
+- `what's my schedule today?`
+- `what do i have tomorrow?`
+- `anything this evening?`
+- `what do i have this week?`
+- `summarise my week`
+- `what's next on my calendar?`
+
+Calendar integration is read-only. Bergi does not create, update, delete, accept, decline, or modify calendar events.
+
+## 10. Cron jobs
 
 Current cron routes:
 
@@ -189,7 +224,7 @@ Timezone expectation:
 - Default is `Asia/Singapore`.
 - User preference timezone is used where available.
 
-## 10. Logging and privacy
+## 11. Logging and privacy
 
 Private webhook payload logging has been removed or redacted.
 
@@ -198,14 +233,16 @@ Logs should not include:
 - Raw Telegram updates or full payloads.
 - Raw user messages.
 - Raw voice transcripts.
+- Calendar event titles, descriptions, locations, attendees, or raw Calendar API responses.
 - Notion tokens.
+- Google service account credentials.
 - Database IDs.
 - Full Notion request payloads.
 - Full prompt bodies.
 
 Safe logs should use metadata only, such as candidate detection, status category, duration, count, transcript length, or safe error category.
 
-## 11. Current known limitations
+## 12. Current known limitations
 
 - Finance supports SGD only for now.
 - No multi-expense logging yet.
@@ -213,21 +250,23 @@ Safe logs should use metadata only, such as candidate detection, status category
 - No multi-currency conversion yet.
 - No charts or dashboard yet.
 - No full Life Thread Engine yet.
-- No Gmail or Calendar operator integration yet.
+- Calendar operator is read-only only.
+- No Gmail operator integration yet.
 - n8n is not active for finance anymore.
 - `app/api/telegram/route.ts` is partially modularized but still large and may need more refactor later.
 
-## 12. Suggested next features, later
+## 13. Suggested next features, later
 
 - Final finance audit.
 - Current architecture prompt/context file for future agents.
-- Calendar/Gmail read-only operator layer.
+- Gmail read-only operator layer.
+- Calendar write actions only after explicit confirmation and a separate safety design.
 - Notion note sync if needed.
 - Better memory correction/forget path later.
 - Scheduled daily/weekly summaries later.
 - Multi-currency finance later.
 
-## 13. Important recent commits
+## 14. Important recent commits
 
 - `54a9e3e` Remove private webhook payload logging.
 - `82782fa` Harden note idempotency.

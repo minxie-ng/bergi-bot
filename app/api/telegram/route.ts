@@ -21,6 +21,13 @@ import {
   isDailyRecapRequest,
 } from '@/lib/daily-recap'
 import {
+  CalendarReadError,
+  type CalendarEvent,
+  type CalendarQueryIntent,
+  detectCalendarQueryIntent,
+  queryGoogleCalendarEvents,
+} from '@/lib/calendar-read'
+import {
   classifyFinanceIntent,
   createNotionExpenseLog,
   detectFinanceCandidate,
@@ -1143,6 +1150,141 @@ async function resolveFinanceQueryReply(params: {
     result,
     intent: params.intent,
     rangeLabel: range.label,
+  })
+}
+
+function getCalendarQueryDateRange(params: {
+  intent: CalendarQueryIntent
+  timezone: string
+}): { timeMin: string; timeMax?: string; label: string; maxResults: number } {
+  const now = new Date()
+  const localDate = getLocalDateString(now, params.timezone)
+
+  if (params.intent.period === 'next') {
+    return {
+      label: 'next',
+      timeMin: now.toISOString(),
+      timeMax: zonedDateTimeToUtcIso(addDaysToLocalDate(localDate, 365), '00:00', params.timezone),
+      maxResults: 1,
+    }
+  }
+
+  if (params.intent.period === 'tomorrow') {
+    const tomorrow = addDaysToLocalDate(localDate, 1)
+
+    return {
+      label: 'tomorrow',
+      timeMin: zonedDateTimeToUtcIso(tomorrow, '00:00', params.timezone),
+      timeMax: zonedDateTimeToUtcIso(addDaysToLocalDate(tomorrow, 1), '00:00', params.timezone),
+      maxResults: 10,
+    }
+  }
+
+  if (params.intent.period === 'evening') {
+    return {
+      label: 'this evening',
+      timeMin: zonedDateTimeToUtcIso(localDate, '18:00', params.timezone),
+      timeMax: zonedDateTimeToUtcIso(addDaysToLocalDate(localDate, 1), '00:00', params.timezone),
+      maxResults: 10,
+    }
+  }
+
+  if (params.intent.period === 'week') {
+    const [year, month, day] = localDate.split('-').map(Number)
+    const dayOfWeek = new Date(Date.UTC(year, month - 1, day)).getUTCDay()
+    const daysSinceMonday = (dayOfWeek + 6) % 7
+    const weekStart = addDaysToLocalDate(localDate, -daysSinceMonday)
+
+    return {
+      label: 'this week',
+      timeMin: zonedDateTimeToUtcIso(weekStart, '00:00', params.timezone),
+      timeMax: zonedDateTimeToUtcIso(addDaysToLocalDate(weekStart, 7), '00:00', params.timezone),
+      maxResults: 20,
+    }
+  }
+
+  return {
+    label: 'today',
+    timeMin: zonedDateTimeToUtcIso(localDate, '00:00', params.timezone),
+    timeMax: zonedDateTimeToUtcIso(addDaysToLocalDate(localDate, 1), '00:00', params.timezone),
+    maxResults: 10,
+  }
+}
+
+function formatCalendarEventTime(event: CalendarEvent, timezone: string): string {
+  if (event.isAllDay) {
+    return 'all day'
+  }
+
+  return new Intl.DateTimeFormat('en-SG', {
+    timeZone: timezone,
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).format(new Date(event.start))
+}
+
+function formatCalendarQueryReply(params: {
+  events: CalendarEvent[]
+  intent: CalendarQueryIntent
+  timezone: string
+  label: string
+}): string {
+  const { events, intent, timezone, label } = params
+
+  if (events.length === 0) {
+    if (intent.period === 'next') {
+      return 'I don’t see any upcoming calendar events.'
+    }
+
+    return `your calendar looks clear ${label}.`
+  }
+
+  if (intent.period === 'next') {
+    const [event] = events
+
+    return `your next calendar event is ${event.title} at ${formatCalendarEventTime(event, timezone)}.`
+  }
+
+  const eventLines = events
+    .slice(0, 10)
+    .map((event) => `${formatCalendarEventTime(event, timezone)} — ${event.title}`)
+    .join('\n')
+  const moreLine = events.length > 10 ? `\n\nand ${events.length - 10} more.` : ''
+
+  return `${label} you have ${events.length} ${events.length === 1 ? 'thing' : 'things'}:
+
+${eventLines}${moreLine}`
+}
+
+async function resolveCalendarQueryReply(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+  intent: CalendarQueryIntent
+}): Promise<string> {
+  const timezone = await getDailyRecapTimezone(params)
+  const range = getCalendarQueryDateRange({ intent: params.intent, timezone })
+
+  console.log('calendar_query_started', {
+    period: params.intent.period,
+  })
+
+  const events = await queryGoogleCalendarEvents({
+    timeMin: range.timeMin,
+    timeMax: range.timeMax,
+    maxResults: range.maxResults,
+  })
+
+  console.log('calendar_query_success', {
+    count: events.length,
+  })
+
+  return formatCalendarQueryReply({
+    events,
+    intent: params.intent,
+    timezone,
+    label: range.label,
   })
 }
 
@@ -2973,6 +3115,49 @@ Reply naturally as Bergi using the recent conversation context.`
           await saveMessage({ supabase, userId, role: 'assistant', content: clarifyingQuestion })
           return new Response('OK', { status: 200 })
         }
+      }
+    }
+
+    if (financeText !== null) {
+      const calendarQueryIntent = detectCalendarQueryIntent(financeText)
+
+      if (calendarQueryIntent !== null) {
+        console.log('calendar_query_detected', {
+          period: calendarQueryIntent.period,
+        })
+
+        let calendarQueryReply: string
+
+        try {
+          calendarQueryReply = await resolveCalendarQueryReply({
+            supabase,
+            userId,
+            chatId,
+            intent: calendarQueryIntent,
+          })
+        } catch (error) {
+          const calendarError =
+            error instanceof CalendarReadError
+              ? error
+              : new CalendarReadError({ category: 'google_unknown_error' })
+
+          console.error('calendar_query_failed', {
+            category: calendarError.category,
+          })
+          calendarQueryReply =
+            calendarError.category === 'missing_env'
+              ? 'I can read your calendar once the Google Calendar connection is set up.'
+              : 'I couldn’t read your calendar right now.'
+        }
+
+        if (isLocalTestMode) {
+          console.log('Local test calendar query reply generated')
+        } else {
+          await sendTelegramMessage(chatId, calendarQueryReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: calendarQueryReply })
+        return new Response('OK', { status: 200 })
       }
     }
 
