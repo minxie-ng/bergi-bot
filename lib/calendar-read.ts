@@ -47,6 +47,7 @@ export type CalendarCreateEventInput = {
   end: string
   timezone: string
   description?: string | null
+  colorId?: string
 }
 
 const WEEKDAY_MATCHES: Array<{ index: 0 | 1 | 2 | 3 | 4 | 5 | 6; label: string; pattern: RegExp }> = [
@@ -690,6 +691,7 @@ export async function createGoogleCalendarEvent(params: CalendarCreateEventInput
       body: JSON.stringify({
         summary: params.title,
         description: params.description ?? undefined,
+        colorId: params.colorId,
         start: {
           dateTime: params.start,
           timeZone: params.timezone,

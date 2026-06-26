@@ -33,6 +33,7 @@ import {
   getCalendarReadEnvValidationMetadata,
   queryGoogleCalendarEvents,
 } from '@/lib/calendar-read'
+import { inferCalendarEventColor } from '@/lib/calendar-colors'
 import {
   classifyFinanceIntent,
   createNotionExpenseLog,
@@ -207,6 +208,16 @@ type CalendarEventDraft = {
   description: string | null
   datePeriod: string
   durationMinutes: number
+  colorCategory: string
+  colorId?: string
+}
+
+type CalendarCreateTimeRange = {
+  startTime: string
+  endTime: string
+  durationMinutes: number
+  crossesMidnight: boolean
+  needsClarification: boolean
 }
 
 type CalendarCreateIntent =
@@ -1600,7 +1611,7 @@ function parseCalendarCreateLocalDate(params: {
   }
 }
 
-function parseCalendarCreateDurationMinutes(text: string): number {
+function parseCalendarCreateExplicitDurationMinutes(text: string): number | null {
   const normalized = text.toLowerCase()
   const hoursMatch = normalized.match(/\b(\d+(?:\.\d+)?)\s*(hours?|hrs?|h)\b/)
   const minutesMatch = normalized.match(/\b(\d+)\s*(minutes?|mins?|m)\b/)
@@ -1613,7 +1624,7 @@ function parseCalendarCreateDurationMinutes(text: string): number {
     return Math.max(15, Number(minutesMatch[1]))
   }
 
-  return 60
+  return null
 }
 
 function parseCalendarCreateStartTime(text: string): string | null {
@@ -1677,19 +1688,37 @@ function resolveTimeParts(hourText: string, minuteText: string | undefined, meri
   return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`
 }
 
-function parseCalendarCreateTimeRange(text: string): { startTime: string; endTime: string; durationMinutes: number } | null {
+function parseCalendarCreateTimeRange(text: string): CalendarCreateTimeRange | null {
   const normalized = text.toLowerCase().replace(/[–—]/g, '-')
   const rangeMatch = normalized.match(
-    /\b([01]?\d|2[0-3])(?:(?::|\.)([0-5]\d))?\s*(am|pm)?\s*-\s*([01]?\d|2[0-3])(?:(?::|\.)([0-5]\d))?\s*(am|pm)?\b/
+    /\b(?:from\s+)?([01]?\d|2[0-3])(?:(?::|\.)([0-5]\d))?\s*(am|pm)?\s*(?:-|to)\s*([01]?\d|2[0-3])(?:(?::|\.)([0-5]\d))?\s*(am|pm)?\b/
   )
 
   if (!rangeMatch) {
     return null
   }
 
-  const inferredStartMeridiem = rangeMatch[3] ?? rangeMatch[6]
+  const rawStartHour = Number(rangeMatch[1])
+  const rawEndHour = Number(rangeMatch[4])
+  const startMeridiem = rangeMatch[3]
+  const endMeridiem = rangeMatch[6]
+  let inferredStartMeridiem = startMeridiem
+  let inferredEndMeridiem = endMeridiem
+
+  if (!inferredStartMeridiem && inferredEndMeridiem) {
+    if (inferredEndMeridiem === 'pm') {
+      inferredStartMeridiem = rawEndHour === 12 || rawStartHour > rawEndHour ? 'am' : 'pm'
+    } else {
+      inferredStartMeridiem = 'am'
+    }
+  }
+
+  if (inferredStartMeridiem && !inferredEndMeridiem) {
+    inferredEndMeridiem = inferredStartMeridiem
+  }
+
   const startTime = resolveTimeParts(rangeMatch[1], rangeMatch[2], inferredStartMeridiem)
-  const endTime = resolveTimeParts(rangeMatch[4], rangeMatch[5], rangeMatch[6] ?? rangeMatch[3])
+  const endTime = resolveTimeParts(rangeMatch[4], rangeMatch[5], inferredEndMeridiem)
 
   if (!startTime || !endTime) {
     return null
@@ -1699,8 +1728,22 @@ function parseCalendarCreateTimeRange(text: string): { startTime: string; endTim
   const [endHour, endMinute] = endTime.split(':').map(Number)
   const startTotal = startHour * 60 + startMinute
   let endTotal = endHour * 60 + endMinute
+  const clearlyOvernight =
+    /\bovernight\b/.test(normalized) ||
+    (inferredStartMeridiem === 'pm' && inferredEndMeridiem === 'am') ||
+    (rawStartHour >= 18 && rawEndHour <= 6)
 
   if (endTotal <= startTotal) {
+    if (!clearlyOvernight) {
+      return {
+        startTime,
+        endTime,
+        durationMinutes: endTotal - startTotal,
+        crossesMidnight: false,
+        needsClarification: true,
+      }
+    }
+
     endTotal += 24 * 60
   }
 
@@ -1708,11 +1751,26 @@ function parseCalendarCreateTimeRange(text: string): { startTime: string; endTim
     startTime,
     endTime,
     durationMinutes: endTotal - startTotal,
+    crossesMidnight: endTotal >= 24 * 60,
+    needsClarification: false,
   }
 }
 
 function addMinutesToIso(iso: string, minutes: number): string {
   return new Date(Date.parse(iso) + minutes * 60 * 1000).toISOString()
+}
+
+function getCalendarRangeEndAt(params: {
+  localDate: string
+  endTime: string
+  timezone: string
+  crossesMidnight: boolean
+}): string {
+  return zonedDateTimeToUtcIso(
+    params.crossesMidnight ? addDaysToLocalDate(params.localDate, 1) : params.localDate,
+    params.endTime,
+    params.timezone
+  )
 }
 
 function titleCaseCalendarTitle(title: string): string {
@@ -1757,6 +1815,14 @@ function parseCalendarCreateIntent(params: {
   const timeRange = parseCalendarCreateTimeRange(params.text)
   const startTime = timeRange?.startTime ?? parseCalendarCreateStartTime(params.text)
   const title = extractCalendarCreateTitle(params.text)
+  const color = inferCalendarEventColor(title)
+
+  if (timeRange?.needsClarification) {
+    return {
+      action: 'ask_clarifying_question',
+      reply: 'I found an end time before the start time. Should this be an overnight event?',
+    }
+  }
 
   if (!startTime) {
     return {
@@ -1766,11 +1832,12 @@ function parseCalendarCreateIntent(params: {
       localDate: date.localDate,
       timezone: params.timezone,
       datePeriod: date.period,
-      durationMinutes: parseCalendarCreateDurationMinutes(params.text),
+      durationMinutes: parseCalendarCreateExplicitDurationMinutes(params.text) ?? 60,
     }
   }
 
-  const durationMinutes = timeRange?.durationMinutes ?? parseCalendarCreateDurationMinutes(params.text)
+  const durationMinutes =
+    timeRange?.durationMinutes ?? parseCalendarCreateExplicitDurationMinutes(params.text) ?? 60
   const startAt = zonedDateTimeToUtcIso(date.localDate, startTime, params.timezone)
 
   return {
@@ -1779,12 +1846,19 @@ function parseCalendarCreateIntent(params: {
       title,
       startAt,
       endAt: timeRange
-        ? zonedDateTimeToUtcIso(date.localDate, timeRange.endTime, params.timezone)
+        ? getCalendarRangeEndAt({
+            localDate: date.localDate,
+            endTime: timeRange.endTime,
+            timezone: params.timezone,
+            crossesMidnight: timeRange.crossesMidnight,
+          })
         : addMinutesToIso(startAt, durationMinutes),
       timezone: params.timezone,
       description: null,
       datePeriod: date.period,
       durationMinutes,
+      colorCategory: color.category,
+      colorId: color.colorId,
     },
   }
 }
@@ -2071,6 +2145,7 @@ async function resolveCalendarCreateRequestReply(params: {
   console.log('calendar_create_draft_created', {
     durationMinutes: intent.draft.durationMinutes,
     datePeriod: intent.draft.datePeriod,
+    colorCategory: intent.draft.colorCategory,
   })
 
   return formatCalendarCreateDraftReply(intent.draft)
@@ -2097,9 +2172,13 @@ async function resolveCalendarCreateEditReply(params: {
     {
       localDate: getLocalDateString(new Date(pendingCalendarEvent.start_at), pendingCalendarEvent.timezone),
       period: 'existing date',
-    }
+  }
   const timeRange = parseCalendarCreateTimeRange(params.text)
   const startTime = timeRange?.startTime ?? parseCalendarCreateStartTime(params.text)
+
+  if (timeRange?.needsClarification) {
+    return 'I found an end time before the start time. Should this be an overnight event?'
+  }
 
   if (!startTime) {
     return 'what time should I move it to?'
@@ -2111,8 +2190,14 @@ async function resolveCalendarCreateEditReply(params: {
   )
   const startAt = zonedDateTimeToUtcIso(date.localDate, startTime, pendingCalendarEvent.timezone)
   const endAt = timeRange
-    ? zonedDateTimeToUtcIso(date.localDate, timeRange.endTime, pendingCalendarEvent.timezone)
+    ? getCalendarRangeEndAt({
+        localDate: date.localDate,
+        endTime: timeRange.endTime,
+        timezone: pendingCalendarEvent.timezone,
+        crossesMidnight: timeRange.crossesMidnight,
+      })
     : addMinutesToIso(startAt, existingDurationMinutes)
+  const color = inferCalendarEventColor(pendingCalendarEvent.title)
 
   await updatePendingCalendarEventDraft({
     supabase: params.supabase,
@@ -2125,6 +2210,7 @@ async function resolveCalendarCreateEditReply(params: {
   console.log('calendar_create_draft_updated', {
     datePeriod: date.period,
     durationMinutes: timeRange?.durationMinutes ?? existingDurationMinutes,
+    colorCategory: color.category,
   })
 
   return formatCalendarDraftChangedReply({
@@ -2154,6 +2240,10 @@ async function resolveCalendarCreateTimeClarificationReply(params: {
   const timeRange = parseCalendarCreateTimeRange(params.text)
   const startTime = timeRange?.startTime ?? parseCalendarCreateStartTime(params.text)
 
+  if (timeRange?.needsClarification) {
+    return 'I found an end time before the start time. Should this be an overnight event?'
+  }
+
   if (!startTime) {
     return null
   }
@@ -2165,8 +2255,14 @@ async function resolveCalendarCreateTimeClarificationReply(params: {
   )
   const startAt = zonedDateTimeToUtcIso(localDate, startTime, pendingCalendarTime.timezone)
   const endAt = timeRange
-    ? zonedDateTimeToUtcIso(localDate, timeRange.endTime, pendingCalendarTime.timezone)
+    ? getCalendarRangeEndAt({
+        localDate,
+        endTime: timeRange.endTime,
+        timezone: pendingCalendarTime.timezone,
+        crossesMidnight: timeRange.crossesMidnight,
+      })
     : addMinutesToIso(startAt, existingDurationMinutes)
+  const color = inferCalendarEventColor(pendingCalendarTime.title)
 
   const { data, error } = await params.supabase
     .from('pending_calendar_events')
@@ -2192,6 +2288,7 @@ async function resolveCalendarCreateTimeClarificationReply(params: {
   console.log('calendar_create_draft_created', {
     durationMinutes: timeRange?.durationMinutes ?? existingDurationMinutes,
     datePeriod: 'pending_date',
+    colorCategory: color.category,
   })
 
   return formatCalendarCreateDraftReply({
@@ -2202,6 +2299,8 @@ async function resolveCalendarCreateTimeClarificationReply(params: {
     description: pendingCalendarTime.description,
     datePeriod: 'pending_date',
     durationMinutes: timeRange?.durationMinutes ?? existingDurationMinutes,
+    colorCategory: color.category,
+    colorId: color.colorId,
   })
 }
 
@@ -2233,6 +2332,7 @@ async function resolveCalendarCreateConfirmationReply(params: {
 
   console.log('calendar_create_confirmation_received')
   console.log('calendar_create_started')
+  const color = inferCalendarEventColor(pendingCalendarEvent.title)
 
   try {
     await createGoogleCalendarEvent({
@@ -2241,6 +2341,7 @@ async function resolveCalendarCreateConfirmationReply(params: {
       end: pendingCalendarEvent.end_at,
       timezone: pendingCalendarEvent.timezone,
       description: pendingCalendarEvent.description,
+      colorId: color.colorId,
     })
 
     await updatePendingCalendarEventStatus({
@@ -2249,7 +2350,9 @@ async function resolveCalendarCreateConfirmationReply(params: {
       status: 'confirmed',
     })
 
-    console.log('calendar_create_success')
+    console.log('calendar_create_success', {
+      colorCategory: color.category,
+    })
 
     return formatCalendarCreatedReply(pendingCalendarEvent)
   } catch (error) {
