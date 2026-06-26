@@ -25,6 +25,7 @@ import {
   detectFinanceCandidate,
   formatExpenseLoggedReply,
   isValidExpenseLog,
+  NotionExpenseLogError,
   parseExpenseLogWithLLM,
 } from '@/lib/finance-logging'
 import { generateDailyProactiveCheckins, getOrCreateProactivePreferences } from '@/lib/proactive-checkins'
@@ -79,6 +80,14 @@ function getTelegramMessageTypes(message: TelegramUpdate['message']): string[] {
 type ChatMessage = {
   role: 'user' | 'assistant'
   content: string
+}
+
+function logFinanceInfo(event: string, fields: Record<string, unknown> = {}): void {
+  console.log(event, fields)
+}
+
+function logFinanceError(event: string, fields: Record<string, unknown> = {}): void {
+  console.error(event, fields)
 }
 
 type FindOrCreateUserAccountParams = {
@@ -2059,8 +2068,12 @@ async function fetchOpenAIChatCompletionWithFallback(params: {
   return response
 }
 
-async function callLLM(params: { chatMessages: ChatMessage[]; systemPrompt: string }): Promise<string> {
-  const { chatMessages, systemPrompt } = params
+async function callLLM(params: {
+  chatMessages: ChatMessage[]
+  systemPrompt: string
+  maxCompletionTokens?: number
+}): Promise<string> {
+  const { chatMessages, systemPrompt, maxCompletionTokens = 300 } = params
   const baseUrl = process.env.OPENAI_BASE_URL
   const apiKey = process.env.OPENAI_API_KEY
   const model = process.env.OPENAI_MODEL
@@ -2076,7 +2089,7 @@ async function callLLM(params: { chatMessages: ChatMessage[]; systemPrompt: stri
     model,
     fallbackModel,
     body: {
-      max_completion_tokens: 300,
+      max_completion_tokens: maxCompletionTokens,
       messages: [
         {
           role: 'system',
@@ -2767,26 +2780,69 @@ Reply naturally as Bergi using the recent conversation context.`
     }
 
     if (isPlainTextMessage && detectFinanceCandidate(userText)) {
+      logFinanceInfo('finance_candidate_detected', {
+        messageLength: userText.length,
+      })
+
+      const parseStartedAt = Date.now()
+      logFinanceInfo('finance_parse_started')
+      let expenseLog: Awaited<ReturnType<typeof parseExpenseLogWithLLM>>
+
       try {
-        const expenseLog = await parseExpenseLogWithLLM({
+        expenseLog = await parseExpenseLogWithLLM({
           text: userText,
           localDate: getLocalDateString(new Date(), 'Asia/Singapore'),
           callLLM,
         })
+        logFinanceInfo('finance_parse_success', {
+          durationMs: Date.now() - parseStartedAt,
+          isExpense: expenseLog.is_expense,
+          hasExpenseTitle: expenseLog.expense.length > 0,
+          hasPositiveAmount: Number.isFinite(expenseLog.amount) && expenseLog.amount > 0,
+        })
+      } catch (error) {
+        logFinanceError('finance_parse_failed', {
+          durationMs: Date.now() - parseStartedAt,
+          errorName: error instanceof Error ? error.name : 'unknown_error',
+        })
 
-        if (!isValidExpenseLog(expenseLog)) {
-          const financeClarificationReply = "I couldn't find a valid amount to log."
+        const financeParseErrorReply = "I couldn't understand that expense clearly enough to log it."
 
-          if (isLocalTestMode) {
-            console.log('Local test finance clarification reply generated')
-          } else {
-            await sendTelegramMessage(chatId, financeClarificationReply)
-          }
-
-          await saveMessage({ supabase, userId, role: 'assistant', content: financeClarificationReply })
-          return new Response('OK', { status: 200 })
+        if (isLocalTestMode) {
+          console.log('Local test finance parse error reply generated')
+        } else {
+          await sendTelegramMessage(chatId, financeParseErrorReply)
         }
 
+        await saveMessage({ supabase, userId, role: 'assistant', content: financeParseErrorReply })
+        logFinanceInfo('finance_reply_sent', { outcome: 'parse_failed' })
+        return new Response('OK', { status: 200 })
+      }
+
+      if (!isValidExpenseLog(expenseLog)) {
+        logFinanceInfo('finance_validation_failed', {
+          isExpense: expenseLog.is_expense,
+          hasExpenseTitle: expenseLog.expense.length > 0,
+          hasPositiveAmount: Number.isFinite(expenseLog.amount) && expenseLog.amount > 0,
+        })
+
+        const financeClarificationReply = "I couldn't find a valid amount to log."
+
+        if (isLocalTestMode) {
+          console.log('Local test finance clarification reply generated')
+        } else {
+          await sendTelegramMessage(chatId, financeClarificationReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: financeClarificationReply })
+        logFinanceInfo('finance_reply_sent', { outcome: 'validation_failed' })
+        return new Response('OK', { status: 200 })
+      }
+
+      const notionStartedAt = Date.now()
+      logFinanceInfo('notion_create_started')
+
+      try {
         await createNotionExpenseLog({
           expense: expenseLog.expense,
           date: expenseLog.date,
@@ -2794,19 +2850,23 @@ Reply naturally as Bergi using the recent conversation context.`
           category: expenseLog.category,
           comment: expenseLog.comment ?? userText,
         })
+        logFinanceInfo('notion_create_success', {
+          durationMs: Date.now() - notionStartedAt,
+        })
+      } catch (error) {
+        const notionError =
+          error instanceof NotionExpenseLogError
+            ? error
+            : new NotionExpenseLogError({ category: 'notion_unknown_error' })
 
-        const financeReply = formatExpenseLoggedReply(expenseLog)
+        logFinanceError('notion_create_failed', {
+          durationMs: Date.now() - notionStartedAt,
+          status: notionError.status,
+          notionCode: notionError.notionCode,
+          category: notionError.category,
+        })
 
-        if (isLocalTestMode) {
-          console.log('Local test finance reply generated')
-        } else {
-          await sendTelegramMessage(chatId, financeReply)
-        }
-
-        await saveMessage({ supabase, userId, role: 'assistant', content: financeReply })
-        return new Response('OK', { status: 200 })
-      } catch {
-        const financeToolErrorReply = 'I tried logging that, but my finance tool is not reachable right now.'
+        const financeToolErrorReply = 'I found the expense, but I couldn’t save it to Notion right now.'
 
         if (isLocalTestMode) {
           console.log('Local test finance tool error reply generated')
@@ -2815,8 +2875,26 @@ Reply naturally as Bergi using the recent conversation context.`
         }
 
         await saveMessage({ supabase, userId, role: 'assistant', content: financeToolErrorReply })
+        logFinanceInfo('finance_reply_sent', { outcome: 'notion_failed' })
         return new Response('OK', { status: 200 })
       }
+
+      const financeReply = formatExpenseLoggedReply(expenseLog)
+
+      if (isLocalTestMode) {
+        console.log('Local test finance reply generated')
+      } else {
+        await sendTelegramMessage(chatId, financeReply)
+      }
+
+      try {
+        await saveMessage({ supabase, userId, role: 'assistant', content: financeReply })
+      } catch (error) {
+        console.error('Failed to save finance assistant reply:', error)
+      }
+
+      logFinanceInfo('finance_reply_sent', { outcome: 'logged' })
+      return new Response('OK', { status: 200 })
     }
 
     const profile = await getUserProfile({ supabase, userId })

@@ -29,7 +29,11 @@ export type ParsedExpenseLog = {
 type CallFinanceParserParams = {
   text: string
   localDate: string
-  callLLM: (params: { systemPrompt: string; chatMessages: Array<{ role: 'user'; content: string }> }) => Promise<string>
+  callLLM: (params: {
+    systemPrompt: string
+    chatMessages: Array<{ role: 'user'; content: string }>
+    maxCompletionTokens?: number
+  }) => Promise<string>
 }
 
 type CreateNotionExpenseLogInput = {
@@ -38,6 +42,29 @@ type CreateNotionExpenseLogInput = {
   amount: number
   category: FinanceCategory
   comment?: string | null
+}
+
+export type NotionExpenseLogErrorCategory =
+  | 'missing_env'
+  | 'notion_unauthorized'
+  | 'notion_forbidden_or_not_shared'
+  | 'notion_database_not_found'
+  | 'notion_validation_error'
+  | 'notion_timeout'
+  | 'notion_unknown_error'
+
+export class NotionExpenseLogError extends Error {
+  category: NotionExpenseLogErrorCategory
+  status?: number
+  notionCode?: string
+
+  constructor(params: { category: NotionExpenseLogErrorCategory; status?: number; notionCode?: string }) {
+    super(params.category)
+    this.name = 'NotionExpenseLogError'
+    this.category = params.category
+    this.status = params.status
+    this.notionCode = params.notionCode
+  }
 }
 
 const FINANCE_KEYWORDS = [
@@ -168,6 +195,40 @@ export function isValidExpenseLog(expenseLog: ParsedExpenseLog): boolean {
   )
 }
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError'
+}
+
+function getNotionErrorCategory(status: number, notionCode?: string): NotionExpenseLogErrorCategory {
+  if (status === 401) {
+    return 'notion_unauthorized'
+  }
+
+  if (status === 403) {
+    return 'notion_forbidden_or_not_shared'
+  }
+
+  if (status === 404 || notionCode === 'object_not_found') {
+    return 'notion_database_not_found'
+  }
+
+  if (status === 400 || notionCode === 'validation_error') {
+    return 'notion_validation_error'
+  }
+
+  return 'notion_unknown_error'
+}
+
+async function parseNotionErrorCode(response: Response): Promise<string | undefined> {
+  try {
+    const data = (await response.json()) as { code?: unknown }
+
+    return typeof data.code === 'string' ? data.code : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export async function parseExpenseLogWithLLM(params: CallFinanceParserParams): Promise<ParsedExpenseLog> {
   const allowedCategories = FINANCE_CATEGORIES.join(', ')
   const raw = await params.callLLM({
@@ -201,6 +262,7 @@ Rules:
         content: params.text,
       },
     ],
+    maxCompletionTokens: 120,
   })
 
   return validateParsedExpenseLog(parseExpenseJson(raw), params.localDate)
@@ -211,65 +273,89 @@ export async function createNotionExpenseLog(input: CreateNotionExpenseLogInput)
   const databaseId = process.env.NOTION_EXPENSES_DATABASE_ID
 
   if (!notionToken || !databaseId) {
-    throw new Error('Missing Notion finance environment variables')
+    throw new NotionExpenseLogError({ category: 'missing_env' })
   }
 
-  const response = await fetch('https://api.notion.com/v1/pages', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${notionToken}`,
-      'Content-Type': 'application/json',
-      'Notion-Version': '2022-06-28',
-    },
-    body: JSON.stringify({
-      parent: {
-        database_id: databaseId,
-      },
-      properties: {
-        Expense: {
-          title: [
-            {
-              text: {
-                content: input.expense,
-              },
-            },
-          ],
-        },
-        Date: {
-          date: {
-            start: input.date,
-          },
-        },
-        Amount: {
-          number: input.amount,
-        },
-        Category: {
-          select: {
-            name: input.category,
-          },
-        },
-        Comment: {
-          rich_text: input.comment
-            ? [
-                {
-                  text: {
-                    content: input.comment,
-                  },
-                },
-              ]
-            : [],
-        },
-        Source: {
-          select: {
-            name: 'Bergi',
-          },
-        },
-      },
-    }),
-  })
+  const abortController = new AbortController()
+  const timeout = setTimeout(() => abortController.abort(), 1800)
 
-  if (!response.ok) {
-    throw new Error(`Notion expense log request failed: ${response.status}`)
+  try {
+    const response = await fetch('https://api.notion.com/v1/pages', {
+      method: 'POST',
+      signal: abortController.signal,
+      headers: {
+        Authorization: `Bearer ${notionToken}`,
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28',
+      },
+      body: JSON.stringify({
+        parent: {
+          database_id: databaseId,
+        },
+        properties: {
+          Expense: {
+            title: [
+              {
+                text: {
+                  content: input.expense,
+                },
+              },
+            ],
+          },
+          Date: {
+            date: {
+              start: input.date,
+            },
+          },
+          Amount: {
+            number: input.amount,
+          },
+          Category: {
+            select: {
+              name: input.category,
+            },
+          },
+          Comment: {
+            rich_text: input.comment
+              ? [
+                  {
+                    text: {
+                      content: input.comment,
+                    },
+                  },
+                ]
+              : [],
+          },
+          Source: {
+            select: {
+              name: 'Bergi',
+            },
+          },
+        },
+      }),
+    })
+
+    if (!response.ok) {
+      const notionCode = await parseNotionErrorCode(response)
+
+      throw new NotionExpenseLogError({
+        category: getNotionErrorCategory(response.status, notionCode),
+        status: response.status,
+        notionCode,
+      })
+    }
+  } catch (error) {
+    if (error instanceof NotionExpenseLogError) {
+      throw error
+    }
+
+    if (isAbortError(error)) {
+      throw new NotionExpenseLogError({ category: 'notion_timeout' })
+    }
+
+    throw new NotionExpenseLogError({ category: 'notion_unknown_error' })
+  } finally {
+    clearTimeout(timeout)
   }
 }
 
