@@ -24,6 +24,16 @@ export type CalendarQueryIntent = {
   weekdayLabel?: string
 }
 
+export type CalendarPlanningPeriod = 'today' | 'tomorrow' | 'evening' | 'tomorrow_evening' | 'next_week' | 'unsupported'
+export type CalendarPlanningKind = 'plan_day' | 'work_focus' | 'fit_activity' | 'free_time' | 'packed_check' | 'create_request' | 'clarify'
+
+export type CalendarPlanningIntent = {
+  period: CalendarPlanningPeriod
+  kind: CalendarPlanningKind
+  activity?: string
+  requestedTime?: string
+}
+
 export type CalendarEvent = {
   title: string
   start: string
@@ -43,6 +53,8 @@ const WEEKDAY_MATCHES: Array<{ index: 0 | 1 | 2 | 3 | 4 | 5 | 6; label: string; 
 
 const CALENDAR_CLARIFICATION_REPLY =
   'I can check your calendar, but which time range do you mean — today, tomorrow, this week, or next Monday?'
+const CALENDAR_PLANNING_CLARIFICATION_REPLY =
+  'I can help plan around your calendar, but which time range do you mean — today, tomorrow, this evening, or next week?'
 
 export type CalendarReadErrorCategory =
   | 'missing_env'
@@ -218,6 +230,132 @@ export function detectCalendarQueryIntent(text: string): CalendarQueryIntent | n
 
 export function getCalendarClarificationReply(): string {
   return CALENDAR_CLARIFICATION_REPLY
+}
+
+export function detectCalendarPlanningIntent(text: string): CalendarPlanningIntent | null {
+  const normalized = normalizeCalendarText(text)
+  const hasCalendarTimeRange = /\b(today|tdy|tomorrow|tmr|tonight|evening|next\s+week)\b/.test(normalized)
+  const period = detectCalendarPlanningPeriod(normalized)
+  const requestedTime = detectCalendarPlanningRequestedTime(normalized)
+  const activity = detectCalendarPlanningActivity(normalized)
+  const asksCreate =
+    /\b(add|create|schedule|put|block)\b/.test(normalized) &&
+    hasCalendarTimeRange &&
+    /\b(calendar|event|gym|workout|exercise|meeting|class|call|appointment|bergi|work|study)\b/.test(normalized)
+
+  if (asksCreate) {
+    return {
+      period,
+      kind: 'create_request',
+      activity,
+      requestedTime,
+    }
+  }
+
+  if (/\bhelp\s+me\s+plan\b/.test(normalized) && hasCalendarTimeRange) {
+    return { period, kind: period === 'unsupported' ? 'clarify' : 'plan_day', activity }
+  }
+
+  if (/\bwhat\s+should\s+i\s+focus\s+on\b/.test(normalized) && hasCalendarTimeRange) {
+    return { period, kind: period === 'unsupported' ? 'clarify' : 'work_focus', activity }
+  }
+
+  if (/\bwhen\s+should\s+i\s+work\s+on\b/.test(normalized) && hasCalendarTimeRange) {
+    return { period, kind: period === 'unsupported' ? 'clarify' : 'work_focus', activity }
+  }
+
+  if (/\bwhen\s+am\s+i\s+free\b/.test(normalized) && hasCalendarTimeRange) {
+    return { period, kind: period === 'unsupported' ? 'clarify' : 'free_time', activity }
+  }
+
+  if (
+    (/\bdo\s+i\s+have\s+time\s+to\b/.test(normalized) ||
+      /\bcan\s+i\s+fit\b/.test(normalized) ||
+      /\bcan\s+i\s+squeeze\s+in\b/.test(normalized)) &&
+    hasCalendarTimeRange
+  ) {
+    return { period, kind: period === 'unsupported' ? 'clarify' : 'fit_activity', activity }
+  }
+
+  if (/\bnext\s+week\b/.test(normalized) && /\b(too\s+packed|packed|too\s+busy|busy|manageable)\b/.test(normalized)) {
+    return { period: 'next_week', kind: 'packed_check', activity }
+  }
+
+  if (/\b(help\s+me\s+plan|when\s+am\s+i\s+free|when\s+should\s+i\s+work|do\s+i\s+have\s+time|can\s+i\s+fit)\b/.test(normalized)) {
+    return { period: 'unsupported', kind: 'clarify', activity }
+  }
+
+  return null
+}
+
+export function getCalendarPlanningClarificationReply(): string {
+  return CALENDAR_PLANNING_CLARIFICATION_REPLY
+}
+
+function detectCalendarPlanningPeriod(normalized: string): CalendarPlanningPeriod {
+  if (/\bnext\s+week\b/.test(normalized)) {
+    return 'next_week'
+  }
+
+  if (/\b(tomorrow|tmr)\b/.test(normalized) && /\b(tonight|evening)\b/.test(normalized)) {
+    return 'tomorrow_evening'
+  }
+
+  if (/\b(tomorrow|tmr)\b/.test(normalized)) {
+    return 'tomorrow'
+  }
+
+  if (/\b(tonight|evening)\b/.test(normalized)) {
+    return 'evening'
+  }
+
+  if (/\b(today|tdy)\b/.test(normalized)) {
+    return 'today'
+  }
+
+  return 'unsupported'
+}
+
+function detectCalendarPlanningRequestedTime(normalized: string): string | undefined {
+  const match = normalized.match(/\b([01]?\d|2[0-3])(?::([0-5]\d))?\s*(am|pm)?\b/)
+
+  if (!match) {
+    return undefined
+  }
+
+  const hour = Number(match[1])
+  const minute = match[2] ?? '00'
+  const meridiem = match[3]
+
+  if (meridiem === 'pm' && hour < 12) {
+    return `${String(hour + 12).padStart(2, '0')}:${minute}`
+  }
+
+  if (meridiem === 'am' && hour === 12) {
+    return `00:${minute}`
+  }
+
+  return `${String(hour).padStart(2, '0')}:${minute}`
+}
+
+function detectCalendarPlanningActivity(normalized: string): string | undefined {
+  if (/\bbergi\b/.test(normalized)) {
+    return 'Bergi'
+  }
+
+  if (/\b(gym|workout|exercise|run|yoga)\b/.test(normalized)) {
+    return 'exercise'
+  }
+
+  if (/\b(study|class|assignment)\b/.test(normalized)) {
+    return 'study'
+  }
+
+  if (/\b(work|deep work|focus)\b/.test(normalized)) {
+    return 'deep work'
+  }
+
+  return undefined
 }
 
 function base64UrlEncode(value: string | Buffer): string {

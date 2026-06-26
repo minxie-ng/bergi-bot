@@ -23,9 +23,12 @@ import {
 import {
   CalendarReadError,
   type CalendarEvent,
+  type CalendarPlanningIntent,
   type CalendarQueryIntent,
+  detectCalendarPlanningIntent,
   detectCalendarQueryIntent,
   getCalendarClarificationReply,
+  getCalendarPlanningClarificationReply,
   getCalendarReadEnvValidationMetadata,
   queryGoogleCalendarEvents,
 } from '@/lib/calendar-read'
@@ -1435,6 +1438,397 @@ async function resolveCalendarQueryReply(params: {
     intent: params.intent,
     timezone,
     label: range.label,
+  })
+}
+
+type CalendarPlanningRange = {
+  label: string
+  timeMin: string
+  timeMax: string
+  maxResults: number
+  localDates: string[]
+  windowStartTime: string
+  windowEndTime: string
+}
+
+type CalendarBusyBlock = {
+  startMs: number
+  endMs: number
+}
+
+type CalendarFreeWindow = {
+  startMs: number
+  endMs: number
+}
+
+function getCalendarPlanningDateRange(params: {
+  intent: CalendarPlanningIntent
+  timezone: string
+}): CalendarPlanningRange {
+  const localDate = getLocalDateString(new Date(), params.timezone)
+
+  if (params.intent.period === 'next_week') {
+    const [year, month, day] = localDate.split('-').map(Number)
+    const dayOfWeek = new Date(Date.UTC(year, month - 1, day)).getUTCDay()
+    const daysSinceMonday = (dayOfWeek + 6) % 7
+    const weekStart = addDaysToLocalDate(localDate, -daysSinceMonday + 7)
+    const localDates = Array.from({ length: 7 }, (_, index) => addDaysToLocalDate(weekStart, index))
+
+    return {
+      label: 'next week',
+      timeMin: zonedDateTimeToUtcIso(weekStart, '00:00', params.timezone),
+      timeMax: zonedDateTimeToUtcIso(addDaysToLocalDate(weekStart, 7), '00:00', params.timezone),
+      maxResults: 50,
+      localDates,
+      windowStartTime: '08:00',
+      windowEndTime: '22:00',
+    }
+  }
+
+  if (params.intent.period === 'tomorrow' || params.intent.period === 'tomorrow_evening') {
+    const tomorrow = addDaysToLocalDate(localDate, 1)
+
+    return {
+      label: params.intent.period === 'tomorrow_evening' ? 'tomorrow evening' : 'tomorrow',
+      timeMin: zonedDateTimeToUtcIso(tomorrow, '00:00', params.timezone),
+      timeMax: zonedDateTimeToUtcIso(addDaysToLocalDate(tomorrow, 1), '00:00', params.timezone),
+      maxResults: 20,
+      localDates: [tomorrow],
+      windowStartTime: params.intent.period === 'tomorrow_evening' ? '18:00' : '08:00',
+      windowEndTime: params.intent.period === 'tomorrow_evening' ? '22:00' : '22:00',
+    }
+  }
+
+  if (params.intent.period === 'evening') {
+    return {
+      label: 'this evening',
+      timeMin: zonedDateTimeToUtcIso(localDate, '18:00', params.timezone),
+      timeMax: zonedDateTimeToUtcIso(addDaysToLocalDate(localDate, 1), '00:00', params.timezone),
+      maxResults: 10,
+      localDates: [localDate],
+      windowStartTime: '18:00',
+      windowEndTime: '22:00',
+    }
+  }
+
+  return {
+    label: 'today',
+    timeMin: zonedDateTimeToUtcIso(localDate, '00:00', params.timezone),
+    timeMax: zonedDateTimeToUtcIso(addDaysToLocalDate(localDate, 1), '00:00', params.timezone),
+    maxResults: 20,
+    localDates: [localDate],
+    windowStartTime: '08:00',
+    windowEndTime: '22:00',
+  }
+}
+
+function getCalendarPlanningWindowMs(params: {
+  localDate: string
+  startTime: string
+  endTime: string
+  timezone: string
+}): { startMs: number; endMs: number } {
+  return {
+    startMs: Date.parse(zonedDateTimeToUtcIso(params.localDate, params.startTime, params.timezone)),
+    endMs: Date.parse(zonedDateTimeToUtcIso(params.localDate, params.endTime, params.timezone)),
+  }
+}
+
+function getCalendarPlanningBusyBlocks(params: {
+  events: CalendarEvent[]
+  localDate: string
+  windowStartTime: string
+  windowEndTime: string
+  timezone: string
+}): CalendarBusyBlock[] {
+  const window = getCalendarPlanningWindowMs({
+    localDate: params.localDate,
+    startTime: params.windowStartTime,
+    endTime: params.windowEndTime,
+    timezone: params.timezone,
+  })
+
+  return params.events
+    .filter((event) => !event.isAllDay && event.end !== null)
+    .map((event) => ({
+      startMs: Date.parse(event.start),
+      endMs: Date.parse(event.end ?? event.start),
+    }))
+    .filter((block) => Number.isFinite(block.startMs) && Number.isFinite(block.endMs) && block.endMs > block.startMs)
+    .map((block) => ({
+      startMs: Math.max(block.startMs, window.startMs),
+      endMs: Math.min(block.endMs, window.endMs),
+    }))
+    .filter((block) => block.endMs > block.startMs)
+    .sort((a, b) => a.startMs - b.startMs)
+}
+
+function mergeCalendarBusyBlocks(blocks: CalendarBusyBlock[]): CalendarBusyBlock[] {
+  const merged: CalendarBusyBlock[] = []
+
+  for (const block of blocks) {
+    const previous = merged[merged.length - 1]
+
+    if (!previous || block.startMs > previous.endMs) {
+      merged.push({ ...block })
+    } else {
+      previous.endMs = Math.max(previous.endMs, block.endMs)
+    }
+  }
+
+  return merged
+}
+
+function getCalendarPlanningFreeWindows(params: {
+  events: CalendarEvent[]
+  localDate: string
+  windowStartTime: string
+  windowEndTime: string
+  timezone: string
+}): CalendarFreeWindow[] {
+  const planningWindow = getCalendarPlanningWindowMs({
+    localDate: params.localDate,
+    startTime: params.windowStartTime,
+    endTime: params.windowEndTime,
+    timezone: params.timezone,
+  })
+  const busyBlocks = mergeCalendarBusyBlocks(getCalendarPlanningBusyBlocks(params))
+  const freeWindows: CalendarFreeWindow[] = []
+  let cursorMs = planningWindow.startMs
+
+  for (const block of busyBlocks) {
+    if (block.startMs > cursorMs) {
+      freeWindows.push({ startMs: cursorMs, endMs: block.startMs })
+    }
+
+    cursorMs = Math.max(cursorMs, block.endMs)
+  }
+
+  if (cursorMs < planningWindow.endMs) {
+    freeWindows.push({ startMs: cursorMs, endMs: planningWindow.endMs })
+  }
+
+  return freeWindows.filter((window) => window.endMs - window.startMs >= 30 * 60 * 1000)
+}
+
+function getBestCalendarFreeWindow(windows: CalendarFreeWindow[]): CalendarFreeWindow | null {
+  return windows.reduce<CalendarFreeWindow | null>((best, window) => {
+    if (!best || window.endMs - window.startMs > best.endMs - best.startMs) {
+      return window
+    }
+
+    return best
+  }, null)
+}
+
+function formatCalendarPlanningTime(valueMs: number, timezone: string): string {
+  return new Intl.DateTimeFormat('en-SG', {
+    timeZone: timezone,
+    hour: 'numeric',
+    minute: '2-digit',
+    hourCycle: 'h12',
+  })
+    .format(new Date(valueMs))
+    .replace(/\s+/g, '')
+    .toLowerCase()
+}
+
+function formatCalendarPlanningWindow(window: CalendarFreeWindow, timezone: string): string {
+  return `${formatCalendarPlanningTime(window.startMs, timezone)}-${formatCalendarPlanningTime(window.endMs, timezone)}`
+}
+
+function getCalendarPlanningDayCounts(events: CalendarEvent[], timezone: string): Map<string, number> {
+  const dayCounts = new Map<string, number>()
+
+  for (const event of events) {
+    const localDate = getCalendarEventLocalDate(event, timezone)
+    dayCounts.set(localDate, (dayCounts.get(localDate) ?? 0) + 1)
+  }
+
+  return dayCounts
+}
+
+function doesRequestedPlanningTimeLookFree(params: {
+  intent: CalendarPlanningIntent
+  range: CalendarPlanningRange
+  events: CalendarEvent[]
+  timezone: string
+}): boolean | null {
+  if (!params.intent.requestedTime || params.range.localDates.length !== 1) {
+    return null
+  }
+
+  const requestedStartMs = Date.parse(
+    zonedDateTimeToUtcIso(params.range.localDates[0], params.intent.requestedTime, params.timezone)
+  )
+  const requestedEndMs = requestedStartMs + 60 * 60 * 1000
+  const busyBlocks = getCalendarPlanningBusyBlocks({
+    events: params.events,
+    localDate: params.range.localDates[0],
+    windowStartTime: params.range.windowStartTime,
+    windowEndTime: params.range.windowEndTime,
+    timezone: params.timezone,
+  })
+
+  return !busyBlocks.some((block) => requestedStartMs < block.endMs && requestedEndMs > block.startMs)
+}
+
+function formatCalendarPlanningReply(params: {
+  events: CalendarEvent[]
+  intent: CalendarPlanningIntent
+  timezone: string
+  range: CalendarPlanningRange
+}): string {
+  const { events, intent, timezone, range } = params
+  const allDayCount = events.filter((event) => event.isAllDay).length
+  const concreteEvents = events.filter((event) => !event.isAllDay)
+  const allDayLine = allDayCount > 0 ? `\n\nalso note: you have ${allDayCount} all-day item${allDayCount === 1 ? '' : 's'}.` : ''
+
+  if (intent.kind === 'create_request') {
+    const requestedFree = doesRequestedPlanningTimeLookFree({ intent, range, events, timezone })
+    const timeText =
+      intent.requestedTime && range.localDates.length === 1
+        ? `${formatCalendarPlanningTime(
+            Date.parse(zonedDateTimeToUtcIso(range.localDates[0], intent.requestedTime, timezone)),
+            timezone
+          )} ${range.label}`
+        : range.label
+    const possibilityText =
+      requestedFree === null
+        ? 'I can suggest a time first.'
+        : `${timeText} looks ${requestedFree ? 'possible' : 'busy'} based on your calendar.`
+
+    return `I can help plan it, but I can’t add calendar events yet. ${possibilityText}`
+  }
+
+  if (intent.period === 'next_week' || intent.kind === 'packed_check') {
+    const judgment = getCalendarBusyJudgment(events.length)
+    const dayCounts = getCalendarPlanningDayCounts(events, timezone)
+    const busierDays = [...dayCounts.entries()]
+      .sort(([dateA, countA], [dateB, countB]) => countB - countA || dateA.localeCompare(dateB))
+      .slice(0, 4)
+      .map(([localDate, count]) => `- ${formatCalendarBusyDayLabel(localDate, timezone)}: ${count}`)
+      .join('\n')
+
+    if (events.length === 0) {
+      return 'next week looks clear. Good week for deeper work or bigger plans.'
+    }
+
+    return `next week looks ${judgment === 'moderate' ? 'moderately busy' : judgment} — you have ${events.length} event${
+      events.length === 1 ? '' : 's'
+    }.
+
+busier days:
+${busierDays}${allDayLine}`
+  }
+
+  const dailyWindows = range.localDates.flatMap((localDate) =>
+    getCalendarPlanningFreeWindows({
+      events,
+      localDate,
+      windowStartTime: range.windowStartTime,
+      windowEndTime: range.windowEndTime,
+      timezone,
+    }).map((window) => ({ localDate, window }))
+  )
+  const bestWindow = getBestCalendarFreeWindow(dailyWindows.map(({ window }) => window))
+  const bestWindowText = bestWindow ? formatCalendarPlanningWindow(bestWindow, timezone) : null
+  const eventCountText = `you have ${events.length} calendar event${events.length === 1 ? '' : 's'}`
+
+  if (intent.kind === 'fit_activity') {
+    const fitWindow = dailyWindows.find(({ window }) => window.endMs - window.startMs >= 45 * 60 * 1000)?.window
+    const activity = intent.activity ?? 'that'
+
+    if (fitWindow) {
+      return `${range.label} looks free ${formatCalendarPlanningWindow(
+        fitWindow,
+        timezone
+      )}, so yes — a 45-60 min ${activity} should fit.${allDayLine}`
+    }
+
+    return `${range.label} looks tight for ${activity}; I don’t see a clean 45-60 min window in your calendar.${allDayLine}`
+  }
+
+  if (intent.kind === 'free_time') {
+    if (dailyWindows.length === 0) {
+      return `I don’t see a clean free window ${range.label}.${allDayLine}`
+    }
+
+    const windowLines = dailyWindows
+      .slice(0, 3)
+      .map(({ window }) => `- ${formatCalendarPlanningWindow(window, timezone)}`)
+      .join('\n')
+
+    return `your clearest windows ${range.label} are:
+${windowLines}${allDayLine}`
+  }
+
+  if (intent.kind === 'work_focus') {
+    if (bestWindowText) {
+      const activity = intent.activity ?? 'focused work'
+
+      return `best slot looks like ${bestWindowText} ${range.label} for ${activity}. ${eventCountText}, so use the cleanest block for the hardest thing.${allDayLine}`
+    }
+
+    return `${range.label} looks fairly packed, so keep the focus list short and use smaller admin tasks between events.${allDayLine}`
+  }
+
+  if (bestWindow && bestWindowText) {
+    const firstEventHour = concreteEvents
+      .map((event) => Date.parse(event.start))
+      .filter((value) => Number.isFinite(value))
+      .sort((a, b) => a - b)[0]
+    const openText =
+      firstEventHour && bestWindow.startMs < firstEventHour
+        ? `${range.label} looks pretty open before ${formatCalendarPlanningTime(firstEventHour, timezone)}.`
+        : `${range.label} has a cleanest block around ${bestWindowText}.`
+
+    return `${openText}
+
+suggested plan:
+- morning: deep work / Bergi build
+- afternoon: lighter admin
+- evening: keep flexible
+
+${eventCountText}, so protect your cleanest block.${allDayLine}`
+  }
+
+  return `${range.label} looks packed. Keep the plan light and use short gaps for admin.${allDayLine}`
+}
+
+async function resolveCalendarPlanningReply(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+  intent: CalendarPlanningIntent
+}): Promise<string> {
+  if (params.intent.kind === 'clarify' || params.intent.period === 'unsupported') {
+    return getCalendarPlanningClarificationReply()
+  }
+
+  const timezone = await getDailyRecapTimezone(params)
+  const range = getCalendarPlanningDateRange({ intent: params.intent, timezone })
+
+  console.log('calendar_planning_started', {
+    period: params.intent.period,
+    kind: params.intent.kind,
+  })
+
+  const events = await queryGoogleCalendarEvents({
+    timeMin: range.timeMin,
+    timeMax: range.timeMax,
+    maxResults: range.maxResults,
+  })
+
+  console.log('calendar_planning_success', {
+    count: events.length,
+  })
+
+  return formatCalendarPlanningReply({
+    events,
+    intent: params.intent,
+    timezone,
+    range,
   })
 }
 
@@ -3222,6 +3616,50 @@ Reply naturally as Bergi using the recent conversation context.`
         }
 
         await saveMessage({ supabase, userId, role: 'assistant', content: clarifyingQuestion })
+        return new Response('OK', { status: 200 })
+      }
+    }
+
+    if (financeText !== null) {
+      const calendarPlanningIntent = detectCalendarPlanningIntent(financeText)
+
+      if (calendarPlanningIntent !== null) {
+        console.log('calendar_planning_detected', {
+          period: calendarPlanningIntent.period,
+          kind: calendarPlanningIntent.kind,
+        })
+
+        let calendarPlanningReply: string
+
+        try {
+          calendarPlanningReply = await resolveCalendarPlanningReply({
+            supabase,
+            userId,
+            chatId,
+            intent: calendarPlanningIntent,
+          })
+        } catch (error) {
+          const calendarError =
+            error instanceof CalendarReadError
+              ? error
+              : new CalendarReadError({ category: 'google_unknown_error' })
+
+          console.error('calendar_planning_failed', {
+            category: calendarError.category,
+          })
+          calendarPlanningReply =
+            calendarError.category === 'missing_env'
+              ? 'I can read your calendar once the Google Calendar connection is set up.'
+              : 'I couldn’t read your calendar right now.'
+        }
+
+        if (isLocalTestMode) {
+          console.log('Local test calendar planning reply generated')
+        } else {
+          await sendTelegramMessage(chatId, calendarPlanningReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: calendarPlanningReply })
         return new Response('OK', { status: 200 })
       }
     }
