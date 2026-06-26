@@ -181,25 +181,28 @@ Known environment variables currently used:
 
 Never commit real secrets.
 
-## 9. Google Calendar read-only integration
+## 9. Google Calendar integration
 
 Active path:
 
-Telegram -> Bergi Core -> calendar intent detector -> Google Calendar API `events.list`
+Telegram -> Bergi Core -> calendar intent detector -> Google Calendar API
 
 Current status:
 
 - Google Calendar read-only schedule querying is working.
 - The current personal Bergi Core uses a Google service account for auth.
-- Calendar is read-only only.
+- Calendar event creation is available only through an explicit draft-and-confirm flow.
 - Calendar reads use Google Calendar API `events.list`.
-- No Google Calendar create, update, delete, accept, decline, or modify actions exist.
+- Calendar writes use Google Calendar API `events.insert`.
+- Bergi never creates an event from the first user message alone.
+- No Google Calendar update, delete, accept, decline, or modify actions exist.
 
 Auth approach:
 
-- Server-side Google service account with Calendar read-only scope.
+- Server-side Google service account with Google Calendar Events scope.
 - The target Google Calendar must be shared with the service account email.
 - `GOOGLE_CALENDAR_ID` should point to the shared calendar ID, often the calendar owner's email address for a primary calendar.
+- For event creation, the calendar sharing permission for the service account must be upgraded to "Make changes to events"; read-only sharing is not enough.
 
 Required environment variables:
 
@@ -239,7 +242,28 @@ Calendar Router V2 supports:
 
 Calendar-ish unsupported or ambiguous queries are blocked from falling through to normal LLM chat. Bergi asks for a time-range clarification instead of saying it cannot access Calendar or answering from memory.
 
-Calendar integration is read-only. Bergi does not create, update, delete, accept, decline, or modify calendar events. Calendar V3/event creation is intentionally not built yet.
+Calendar planning suggestions remain read-only and answer from Google Calendar results only.
+
+Calendar V3 event creation supports:
+
+- `add gym tomorrow 7pm`
+- `schedule German practice next Monday evening`
+- `block 2 hours for Bergi this Saturday morning`
+- `add lunch with Zach tomorrow at 12`
+- `create calendar event for internship review next Friday 3pm`
+- `block time to work on Bergi tomorrow morning`
+
+Calendar event creation safety:
+
+- First matching message creates only a pending draft in `pending_calendar_events`.
+- Bergi replies with a clear draft and asks for confirmation.
+- Only short confirmation replies such as `yes`, `confirm`, `add it`, or `looks good` create the event.
+- Cancellation replies such as `no` or `cancel` clear the pending draft without creating an event.
+- Pending calendar drafts are scoped to `user_id`, Telegram chat ID, and platform.
+- Pending calendar drafts expire after 20 minutes.
+- Missing or ambiguous date/time asks a clarification instead of creating a draft.
+- Event creation uses `events.insert` only after confirmation.
+- No update/delete Calendar actions exist.
 
 ## 10. Cron jobs
 
@@ -280,8 +304,7 @@ Safe logs should use metadata only, such as candidate detection, status category
 - No multi-currency conversion yet.
 - No charts or dashboard yet.
 - No full Life Thread Engine yet.
-- Calendar operator is read-only only.
-- Calendar V3/event creation is intentionally not built yet.
+- Calendar event creation only supports confirmed create; no update/delete/reschedule yet.
 - No Gmail operator integration yet.
 - n8n is not active for finance anymore.
 - `app/api/telegram/route.ts` is partially modularized but still large and may need more refactor later.
@@ -291,7 +314,7 @@ Safe logs should use metadata only, such as candidate detection, status category
 - Final finance audit.
 - Current architecture prompt/context file for future agents.
 - Gmail read-only operator layer.
-- Calendar write actions only after explicit confirmation and a separate safety design.
+- Calendar event update/delete/reschedule only after explicit confirmation and a separate safety design.
 - Notion note sync if needed.
 - Better memory correction/forget path later.
 - Scheduled daily/weekly summaries later.

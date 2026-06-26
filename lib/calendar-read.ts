@@ -2,7 +2,7 @@ import { createSign } from 'node:crypto'
 
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token'
 const GOOGLE_CALENDAR_API_BASE_URL = 'https://www.googleapis.com/calendar/v3'
-const GOOGLE_CALENDAR_READONLY_SCOPE = 'https://www.googleapis.com/auth/calendar.readonly'
+const GOOGLE_CALENDAR_EVENTS_SCOPE = 'https://www.googleapis.com/auth/calendar.events'
 
 export type CalendarQueryPeriod =
   | 'today'
@@ -41,6 +41,14 @@ export type CalendarEvent = {
   isAllDay: boolean
 }
 
+export type CalendarCreateEventInput = {
+  title: string
+  start: string
+  end: string
+  timezone: string
+  description?: string | null
+}
+
 const WEEKDAY_MATCHES: Array<{ index: 0 | 1 | 2 | 3 | 4 | 5 | 6; label: string; pattern: RegExp }> = [
   { index: 1, label: 'next Monday', pattern: /\bnext\s+mon(?:day)?\b/ },
   { index: 2, label: 'next Tuesday', pattern: /\bnext\s+tue(?:s|sday)?\b/ },
@@ -64,6 +72,7 @@ export type CalendarReadErrorCategory =
   | 'calendar_api_disabled'
   | 'calendar_not_found_or_not_shared'
   | 'calendar_permission_denied'
+  | 'calendar_write_permission_denied'
   | 'google_auth_error'
   | 'google_calendar_api_error'
   | 'google_unknown_error'
@@ -493,7 +502,7 @@ async function getGoogleCalendarAccessToken(): Promise<string> {
   const claim = base64UrlEncode(
     JSON.stringify({
       iss: serviceAccountEmail,
-      scope: GOOGLE_CALENDAR_READONLY_SCOPE,
+      scope: GOOGLE_CALENDAR_EVENTS_SCOPE,
       aud: GOOGLE_TOKEN_URL,
       exp: expiresAt,
       iat: issuedAt,
@@ -583,6 +592,14 @@ function normalizeGoogleCalendarEvent(event: GoogleCalendarEvent): CalendarEvent
   }
 }
 
+function getCalendarCreateErrorCategory(details: SafeGoogleErrorDetails): CalendarReadErrorCategory {
+  if (details.status === 401 || details.status === 403) {
+    return 'calendar_write_permission_denied'
+  }
+
+  return getCalendarApiErrorCategory(details)
+}
+
 export async function queryGoogleCalendarEvents(params: {
   timeMin: string
   timeMax?: string
@@ -636,6 +653,63 @@ export async function queryGoogleCalendarEvents(params: {
     return (data.items ?? [])
       .map((event) => normalizeGoogleCalendarEvent(event))
       .filter((event): event is CalendarEvent => event !== null)
+  } catch (error) {
+    if (error instanceof CalendarReadError) {
+      throw error
+    }
+
+    if (isAbortError(error)) {
+      throw new CalendarReadError({ category: 'google_calendar_api_error' })
+    }
+
+    throw new CalendarReadError({ category: 'google_unknown_error' })
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+export async function createGoogleCalendarEvent(params: CalendarCreateEventInput): Promise<void> {
+  const calendarId = process.env.GOOGLE_CALENDAR_ID
+
+  if (!calendarId) {
+    throw new CalendarReadError({ category: 'missing_env' })
+  }
+
+  const accessToken = await getGoogleCalendarAccessToken()
+  const abortController = new AbortController()
+  const timeout = setTimeout(() => abortController.abort(), 1800)
+
+  try {
+    const response = await fetch(`${GOOGLE_CALENDAR_API_BASE_URL}/calendars/${encodeURIComponent(calendarId)}/events`, {
+      method: 'POST',
+      signal: abortController.signal,
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        summary: params.title,
+        description: params.description ?? undefined,
+        start: {
+          dateTime: params.start,
+          timeZone: params.timezone,
+        },
+        end: {
+          dateTime: params.end,
+          timeZone: params.timezone,
+        },
+      }),
+    })
+
+    if (!response.ok) {
+      const details = await getSafeGoogleErrorDetailsFromResponse(response)
+
+      throw new CalendarReadError({
+        category: getCalendarCreateErrorCategory(details),
+        status: details.status,
+        reason: details.reason,
+      })
+    }
   } catch (error) {
     if (error instanceof CalendarReadError) {
       throw error
