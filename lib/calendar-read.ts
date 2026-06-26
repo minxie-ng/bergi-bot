@@ -20,6 +20,8 @@ export type CalendarEvent = {
 export type CalendarReadErrorCategory =
   | 'missing_env'
   | 'invalid_private_key'
+  | 'malformed_private_key_after_normalization'
+  | 'google_auth_rejected_private_key'
   | 'calendar_api_disabled'
   | 'calendar_not_found_or_not_shared'
   | 'calendar_permission_denied'
@@ -63,6 +65,9 @@ type CalendarReadEnvValidationMetadata = {
   privateKeyIncludesBeginPrivateKey: boolean
   privateKeyIncludesEscapedNewline: boolean
   privateKeyIncludesRealNewline: boolean
+  normalizedPrivateKeyIncludesBeginPrivateKey: boolean
+  normalizedPrivateKeyIncludesRealNewline: boolean
+  normalizedPrivateKeyLineCount: number
   hasCalendarId: boolean
 }
 
@@ -76,15 +81,18 @@ let cachedAccessToken: { token: string; expiresAtMs: number } | null = null
 export function getCalendarReadEnvValidationMetadata(): CalendarReadEnvValidationMetadata {
   const serviceAccountEmail = process.env.GOOGLE_CALENDAR_SERVICE_ACCOUNT_EMAIL
   const privateKey = process.env.GOOGLE_CALENDAR_PRIVATE_KEY
-  const normalizedPrivateKey = typeof privateKey === 'string' ? normalizePrivateKey(privateKey) : undefined
+  const normalizedPrivateKey = typeof privateKey === 'string' ? normalizeGooglePrivateKey(privateKey) : undefined
   const calendarId = process.env.GOOGLE_CALENDAR_ID
 
   return {
     hasServiceAccountEmail: Boolean(serviceAccountEmail),
     hasPrivateKey: Boolean(privateKey),
-    privateKeyIncludesBeginPrivateKey: Boolean(normalizedPrivateKey?.includes('BEGIN PRIVATE KEY')),
+    privateKeyIncludesBeginPrivateKey: Boolean(privateKey?.includes('BEGIN PRIVATE KEY')),
     privateKeyIncludesEscapedNewline: Boolean(privateKey?.includes('\\n')),
     privateKeyIncludesRealNewline: Boolean(privateKey?.includes('\n')),
+    normalizedPrivateKeyIncludesBeginPrivateKey: Boolean(normalizedPrivateKey?.includes('BEGIN PRIVATE KEY')),
+    normalizedPrivateKeyIncludesRealNewline: Boolean(normalizedPrivateKey?.includes('\n')),
+    normalizedPrivateKeyLineCount: normalizedPrivateKey ? normalizedPrivateKey.split('\n').length : 0,
     hasCalendarId: Boolean(calendarId),
   }
 }
@@ -146,14 +154,14 @@ function base64UrlEncode(value: string | Buffer): string {
   return Buffer.from(value).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
 }
 
-function normalizePrivateKey(value: string): string {
-  const trimmed = value.trim()
+export function normalizeGooglePrivateKey(rawKey: string): string {
+  const trimmed = rawKey.trim()
   const unquoted =
     (trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))
       ? trimmed.slice(1, -1)
       : trimmed
 
-  return unquoted.replace(/\\n/g, '\n')
+  return unquoted.replace(/\\n/g, '\n').trim()
 }
 
 function isAbortError(error: unknown): boolean {
@@ -208,7 +216,11 @@ function getSafeGoogleErrorDetails(data: unknown, fallbackStatus?: number): Safe
 }
 
 function getAuthErrorCategory(details: SafeGoogleErrorDetails): CalendarReadErrorCategory {
-  if (details.reason === 'invalid_grant' || details.reason === 'invalid_client' || details.status !== undefined) {
+  if (details.reason === 'invalid_grant' || details.reason === 'invalid_client') {
+    return 'google_auth_rejected_private_key'
+  }
+
+  if (details.status !== undefined) {
     return 'google_auth_error'
   }
 
@@ -257,10 +269,10 @@ async function getGoogleCalendarAccessToken(): Promise<string> {
     throw new CalendarReadError({ category: 'missing_env' })
   }
 
-  const normalizedPrivateKey = normalizePrivateKey(privateKey)
+  const normalizedPrivateKey = normalizeGooglePrivateKey(privateKey)
 
   if (!normalizedPrivateKey.includes('BEGIN PRIVATE KEY')) {
-    throw new CalendarReadError({ category: 'invalid_private_key' })
+    throw new CalendarReadError({ category: 'malformed_private_key_after_normalization' })
   }
 
   if (cachedAccessToken && cachedAccessToken.expiresAtMs > Date.now() + 60_000) {
@@ -290,7 +302,7 @@ async function getGoogleCalendarAccessToken(): Promise<string> {
   try {
     signature = base64UrlEncode(signer.sign(normalizedPrivateKey))
   } catch {
-    throw new CalendarReadError({ category: 'invalid_private_key' })
+    throw new CalendarReadError({ category: 'malformed_private_key_after_normalization' })
   }
 
   const assertion = `${unsignedJwt}.${signature}`
