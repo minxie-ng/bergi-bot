@@ -2409,6 +2409,7 @@ export async function POST(request: Request) {
 
     let userMessageToSave: string
     let userMessageForLLM: string
+    let transcribedVoiceText: string | null = null
 
     if (voice !== undefined) {
       if (voice.duration !== undefined && voice.duration > 40) {
@@ -2439,6 +2440,7 @@ export async function POST(request: Request) {
       const filePath = await getTelegramFilePath(voice.file_id)
       const audioBuffer = await downloadTelegramFile(filePath)
       const transcript = await transcribeAudio(audioBuffer)
+      transcribedVoiceText = transcript
 
       userMessageToSave = `[voice transcript] ${transcript}`
       userMessageForLLM = formatVoiceTranscriptForLLM(transcript)
@@ -2477,6 +2479,8 @@ Reply naturally as Bergi using the recent conversation context.`
     }
 
     const isPlainTextMessage = userText !== undefined && voice === undefined && selectedPhoto === null
+    const financeText = selectedPhoto === null ? userText ?? transcribedVoiceText : null
+    const financeSource = transcribedVoiceText !== null ? 'voice' : 'text'
 
     if (isPlainTextMessage && isThoughtCaptureCommand(userText)) {
       const thoughtCaptureReply = await resolveThoughtCaptureReply({ supabase, userId })
@@ -2814,8 +2818,8 @@ Reply naturally as Bergi using the recent conversation context.`
       }
     }
 
-    if (isPlainTextMessage) {
-      const correctionAmount = parseFinanceAmountCorrection(userText)
+    if (financeText !== null) {
+      const correctionAmount = parseFinanceAmountCorrection(financeText)
 
       if (correctionAmount !== null) {
         const pendingFinanceConfirmation = await getLatestPendingFinanceConfirmation({ supabase, userId })
@@ -2941,12 +2945,19 @@ Reply naturally as Bergi using the recent conversation context.`
       }
     }
 
-    if (isPlainTextMessage && detectFinanceCandidate(userText)) {
+    if (financeText !== null && detectFinanceCandidate(financeText)) {
+      if (financeSource === 'voice') {
+        logFinanceInfo('voice_transcription_finance_candidate_detected', {
+          messageLength: financeText.length,
+        })
+      }
+
       logFinanceInfo('finance_candidate_detected', {
-        messageLength: userText.length,
+        source: financeSource,
+        messageLength: financeText.length,
       })
 
-      const financeIntent = classifyFinanceIntent(userText)
+      const financeIntent = classifyFinanceIntent(financeText)
 
       const shouldTryExpenseLog = financeIntent.intent === 'expense_log'
 
@@ -2980,7 +2991,7 @@ Reply naturally as Bergi using the recent conversation context.`
 
         try {
           expenseLog = await parseExpenseLogWithLLM({
-            text: userText,
+            text: financeText,
             localDate: getLocalDateString(new Date(), 'Asia/Singapore'),
             callLLM,
           })
@@ -3009,7 +3020,7 @@ Reply naturally as Bergi using the recent conversation context.`
           return new Response('OK', { status: 200 })
         }
 
-        const financeValidation = validateExpenseLogForNotion(userText, expenseLog)
+        const financeValidation = validateExpenseLogForNotion(financeText, expenseLog)
 
         if (!financeValidation.ok) {
           logFinanceInfo(financeValidation.logEvent, {
@@ -3039,7 +3050,7 @@ Reply naturally as Bergi using the recent conversation context.`
             date: expenseLog.date,
             amount: expenseLog.amount,
             category: expenseLog.category,
-            comment: expenseLog.comment ?? userText,
+            comment: expenseLog.comment ?? financeText,
           })
           logFinanceInfo('notion_create_success', {
             durationMs: Date.now() - notionStartedAt,
@@ -3070,6 +3081,9 @@ Reply naturally as Bergi using the recent conversation context.`
 
           await saveMessage({ supabase, userId, role: 'assistant', content: financeToolErrorReply })
           logFinanceInfo('finance_reply_sent', { outcome: 'notion_failed' })
+          if (financeSource === 'voice') {
+            logFinanceInfo('voice_finance_failed', { reason: notionError.category })
+          }
           return new Response('OK', { status: 200 })
         }
 
@@ -3088,6 +3102,9 @@ Reply naturally as Bergi using the recent conversation context.`
         }
 
         logFinanceInfo('finance_reply_sent', { outcome: 'logged' })
+        if (financeSource === 'voice') {
+          logFinanceInfo('voice_finance_logged')
+        }
         return new Response('OK', { status: 200 })
       }
     }
