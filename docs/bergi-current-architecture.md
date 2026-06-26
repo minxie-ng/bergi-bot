@@ -4,7 +4,7 @@
 
 Bergi is a Telegram-first AI companion and personal operator. The product direction is not to compete only on raw chat quality, but to build continuity: memory, proactive follow-up, reminders, personal workflows, and useful context that carries across days.
 
-Bergi Core owns personality, memory, reminders, proactive check-ins, finance routing, calendar read-only queries, and decision logic. Supabase is the source of truth for Bergi internal state. Notion is currently used as the finance storage layer for expenses. Google Calendar is currently used read-only for schedule queries.
+Bergi Core owns personality, memory, reminders, proactive check-ins, finance routing, calendar read/planning/create routing, and decision logic. Supabase is the source of truth for Bergi internal state. Notion is currently used as the finance storage layer for expenses. Google Calendar is currently used for schedule reads and confirmed event creation.
 
 n8n is not active for finance logging anymore. The earlier Bergi Core -> n8n -> Notion finance prototype was removed. n8n may still be useful later for external automations such as Calendar, Gmail, Notion sync, or other tool workflows, but finance currently runs directly in Bergi Core.
 
@@ -29,7 +29,9 @@ n8n is not active for finance logging anymore. The earlier Bergi Core -> n8n -> 
 - Spoken-number voice finance support
 - Finance validation and edge-case handling
 - Finance query/read support from Notion
-- Google Calendar read-only schedule queries
+- Google Calendar schedule queries
+- Google Calendar read-only planning suggestions
+- Google Calendar confirmed event creation
 
 ## 3. Core architecture flow
 
@@ -41,9 +43,12 @@ High-level Telegram flow:
 4. Bergi saves the user message or derived transcript/context.
 5. Bergi routes by deterministic intent before normal LLM chat:
    - Slash command
+   - Pending calendar confirmation/change/cancel/clarification
+   - Pending reminder clarification/cancel
+   - Calendar create intent
    - Reminder management or creation
    - Finance query or logging
-   - Calendar schedule query
+   - Calendar schedule query or planning
    - Thought capture
    - Daily recap
    - Memory recall
@@ -72,6 +77,14 @@ Known tables and purpose:
 - Proactive reply progress events.
 - `thread_label`, currently used for rough topic grouping such as internship progress, Bergi product building, German learning, and general reflection.
 - A DB-level idempotency guard: a unique partial index on non-null `source_message_id`.
+
+Reminder pending clarification:
+
+- If a reminder request has a date but no explicit time, Bergi asks for a time instead of defaulting to midnight.
+- Pending missing-time reminders are stored in `reminders` with an awaiting status until the follow-up arrives.
+- Time-only replies such as `3pm`, `3.42 pm`, `15:42`, and `1542` complete the pending reminder.
+- Bergi sends a reminder success reply only after the Supabase row is successfully inserted or updated into an active pending reminder.
+- `list reminders` reads the same active pending reminders that the sender cron uses.
 
 Proactive system:
 
@@ -189,12 +202,18 @@ Telegram -> Bergi Core -> calendar intent detector -> Google Calendar API
 
 Current status:
 
-- Google Calendar read-only schedule querying is working.
+- Google Calendar read/query is working.
+- Calendar Router V2 is working.
+- Calendar read-only planning suggestions are working.
+- Calendar V3 event creation is working through explicit confirmation.
 - The current personal Bergi Core uses a Google service account for auth.
-- Calendar event creation is available only through an explicit draft-and-confirm flow.
 - Calendar reads use Google Calendar API `events.list`.
 - Calendar writes use Google Calendar API `events.insert`.
-- Bergi never creates an event from the first user message alone.
+- Bergi never creates an event from the first user message alone; it creates a pending draft first.
+- Pending calendar draft edit/cancel works.
+- Calendar confirmation loads the latest active stored pending draft, not stale in-memory data.
+- End-time and duration parsing works for common create requests.
+- Calendar event colour mapping works based on Min's personal calendar categories.
 - No Google Calendar update, delete, accept, decline, or modify actions exist.
 
 Auth approach:
@@ -202,7 +221,9 @@ Auth approach:
 - Server-side Google service account with Google Calendar Events scope.
 - The target Google Calendar must be shared with the service account email.
 - `GOOGLE_CALENDAR_ID` should point to the shared calendar ID, often the calendar owner's email address for a primary calendar.
-- For event creation, the calendar sharing permission for the service account must be upgraded to "Make changes to events"; read-only sharing is not enough.
+- For event creation, the calendar sharing permission for the service account must be "Make changes to events".
+- For read-only access only, "See all event details" is enough.
+- The service account approach is for the current personal MVP. A product launch or multi-user version should use OAuth later.
 
 Required environment variables:
 
@@ -210,7 +231,9 @@ Required environment variables:
 - `GOOGLE_CALENDAR_PRIVATE_KEY`
 - `GOOGLE_CALENDAR_ID`
 
-Supported query examples:
+### Calendar read/query
+
+Supported query examples and periods:
 
 - `what do i have today?`
 - `what's my schedule today?`
@@ -242,28 +265,96 @@ Calendar Router V2 supports:
 
 Calendar-ish unsupported or ambiguous queries are blocked from falling through to normal LLM chat. Bergi asks for a time-range clarification instead of saying it cannot access Calendar or answering from memory.
 
-Calendar planning suggestions remain read-only and answer from Google Calendar results only.
+### Calendar planning
+
+Calendar planning suggestions remain read-only and answer from Google Calendar results only. Planning does not create events.
+
+Supported examples:
+
+- `when am i free tomorrow?`
+- `help me plan tomorrow`
+- `do i have time to exercise tomorrow evening?`
+
+### Calendar creation
 
 Calendar V3 event creation supports:
 
 - `add gym tomorrow 7pm`
-- `schedule German practice next Monday evening`
+- `add lunch with Zach Sunday 12pm to 1:30pm`
+- `add meeting tomorrow 2-4pm`
+- `add gym tomorrow 7pm to 8:30pm`
 - `block 2 hours for Bergi this Saturday morning`
-- `add lunch with Zach tomorrow at 12`
-- `create calendar event for internship review next Friday 3pm`
-- `block time to work on Bergi tomorrow morning`
+- `add work shift tomorrow 10am-6pm`
+- `add IS class tomorrow 9-12pm`
 
 Calendar event creation safety:
 
-- First matching message creates only a pending draft in `pending_calendar_events`.
+- First matching message creates only a pending draft.
 - Bergi replies with a clear draft and asks for confirmation.
-- Only short confirmation replies such as `yes`, `confirm`, `add it`, or `looks good` create the event.
+- Only short confirmation replies such as `yes`, `yea`, `confirm`, `add it`, or `looks good` create the event.
+- The user can edit the pending draft before confirmation.
 - Cancellation replies such as `no` or `cancel` clear the pending draft without creating an event.
-- Pending calendar drafts are scoped to `user_id`, Telegram chat ID, and platform.
-- Pending calendar drafts expire after 20 minutes.
 - Missing or ambiguous date/time asks a clarification instead of creating a draft.
 - Event creation uses `events.insert` only after confirmation.
+- The success reply is sent only after Google Calendar `events.insert` succeeds.
+- Confirmation inserts the stored `start_at` and `end_at` from the latest pending draft.
+- No event should be created from the first message alone.
 - No update/delete Calendar actions exist.
+
+Supported time parsing:
+
+- Explicit ranges such as `2-4pm`, `10am-6pm`, and `9-12pm`.
+- `to` ranges such as `7pm to 8:30pm` and `from 8pm to 10pm`.
+- Explicit durations such as `block 2 hours for Bergi this Saturday morning`.
+- A default one-hour duration only when no end time or duration is provided.
+- If an end time appears earlier than the start time and it is not clearly overnight, Bergi asks for clarification.
+
+### Pending calendar events table
+
+`pending_calendar_events` exists in Supabase and stores calendar event drafts before confirmation.
+
+The table is used to prevent immediate unsafe event creation:
+
+- Pending drafts are scoped to `user_id`, Telegram chat ID, and platform.
+- Pending drafts expire after 20 minutes.
+- Confirmation loads only the latest active pending event for the user/chat.
+- When a draft is confirmed or cancelled, it is closed so old pending rows are not reused.
+- Draft edit and missing-time completion update the stored pending row before asking for confirmation again.
+
+### Calendar colour mapping
+
+Google Calendar uses `colorId`, not raw colour names. The mapping is configurable in `lib/calendar-colors.ts`.
+
+Current user mapping:
+
+- Blue = class schedule / assignment.
+- Green = CCA-related, SMUX trekking, Product Club.
+- Red = work / internship.
+- Yellow = admin stuff, deadlines, interviews.
+- Purple = others / fun / personal.
+
+Current initial Google Calendar `colorId` guesses:
+
+- Blue -> `9`.
+- Green -> `10`.
+- Red -> `11`.
+- Yellow -> `5`.
+- Purple -> `3`.
+
+These colour guesses may need tuning if Google Calendar's UI colours do not match Min's visual calendar perfectly.
+
+### Routing priority
+
+Current Telegram routing priority:
+
+1. Pending calendar confirmation/change/cancel/clarification.
+2. Pending reminder clarification/cancel.
+3. Calendar create intent.
+4. Reminder create/list/cancel.
+5. Finance logging/query.
+6. Calendar read/query/planning.
+7. Thought/memory/daily recap.
+8. Normal LLM chat.
 
 ## 10. Cron jobs
 
@@ -296,6 +387,12 @@ Logs should not include:
 
 Safe logs should use metadata only, such as candidate detection, status category, duration, count, transcript length, or safe error category.
 
+Action success messages must be tied to real tool/database success:
+
+- Calendar success messages happen only after Google Calendar API `events.insert` succeeds.
+- Reminder success messages happen only after the Supabase reminder insert/update succeeds.
+- Finance success messages happen only after the backing write succeeds, currently Notion for expense logging and Supabase where that path applies.
+
 ## 12. Current known limitations
 
 - Finance supports SGD only for now.
@@ -322,6 +419,16 @@ Safe logs should use metadata only, such as candidate detection, status category
 
 ## 14. Important recent commits
 
+- `2a3397b` Fix calendar confirmation stale draft.
+- `0f502e5` Improve calendar event details.
+- `57c3606` Fix calendar and reminder routing edge cases.
+- `e7a6453` Fix pending calendar and reminder flows.
+- `3d33cf5` Add pending calendar events table.
+- `9f7c62b` Add calendar event creation confirmation.
+- `3755798` Add calendar planning suggestions.
+- `c6e04b1` Document calendar router v2.
+- `a04f148` Improve calendar query routing.
+- `6ff83c8` Add calendar read-only queries.
 - `54a9e3e` Remove private webhook payload logging.
 - `82782fa` Harden note idempotency.
 - `255efaf` Extract memory recap helpers.
