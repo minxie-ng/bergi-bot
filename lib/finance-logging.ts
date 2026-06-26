@@ -227,12 +227,78 @@ const EVERYDAY_EXPENSE_KEYWORDS = [
 ]
 const EXPENSE_VERB_PATTERN =
   /\b(spent|spend|paid|pay|bought|buy|renewal|subscription|subscribe|treat|treated)\b/gi
+const SPOKEN_NUMBER_VALUES: Record<string, number> = {
+  one: 1,
+  two: 2,
+  three: 3,
+  four: 4,
+  five: 5,
+  six: 6,
+  seven: 7,
+  eight: 8,
+  nine: 9,
+  ten: 10,
+  eleven: 11,
+  twelve: 12,
+  thirteen: 13,
+  fourteen: 14,
+  fifteen: 15,
+  sixteen: 16,
+  seventeen: 17,
+  eighteen: 18,
+  nineteen: 19,
+  twenty: 20,
+  thirty: 30,
+  forty: 40,
+  fifty: 50,
+  sixty: 60,
+  seventy: 70,
+  eighty: 80,
+  ninety: 90,
+}
 
 const NOTION_VERSION = '2022-06-28'
 let notionDatabaseSchemaCache: NotionDatabaseSchema | null = null
 
+function parseSpokenNumber(value: string): number | null {
+  const parts = value.toLowerCase().trim().split(/\s+/)
+
+  if (parts.length === 1) {
+    return SPOKEN_NUMBER_VALUES[parts[0]] ?? null
+  }
+
+  if (parts.length === 2) {
+    const tens = SPOKEN_NUMBER_VALUES[parts[0]]
+    const ones = SPOKEN_NUMBER_VALUES[parts[1]]
+
+    if (tens !== undefined && tens >= 20 && ones !== undefined && ones > 0 && ones < 10) {
+      return tens + ones
+    }
+  }
+
+  return null
+}
+
+function normalizeSpokenCurrencyAmounts(text: string): string {
+  const numberWords = Object.keys(SPOKEN_NUMBER_VALUES).join('|')
+  const spokenAmountPattern = new RegExp(
+    `\\b((?:${numberWords})(?:\\s+(?:${numberWords}))?)\\s+(dollars?|bucks?)\\b`,
+    'gi'
+  )
+
+  return text.replace(spokenAmountPattern, (match, amountWords: string, currencyWord: string) => {
+    const amount = parseSpokenNumber(amountWords)
+
+    if (amount === null) {
+      return match
+    }
+
+    return `${amount} ${currencyWord}`
+  })
+}
+
 function normalizeFinanceInputText(text: string): string {
-  return text
+  return normalizeSpokenCurrencyAmounts(text)
     .replace(/(\d)(?=(?:for|on)\b)/gi, '$1 ')
     .replace(/\s+/g, ' ')
     .trim()
@@ -317,6 +383,8 @@ function getPrimaryExpenseAmount(text: string): number | null {
 function extractFallbackExpenseTitle(text: string): string {
   return normalizeFinanceInputText(text)
     .replace(/(?:\b(?:sgd|s\$|\$)\s*)?\b\d+(?:[.,]\d{1,2})?\b/gi, ' ')
+    .replace(/\b(dollars?|bucks?|sgd)\b/gi, ' ')
+    .replace(/\b(i|i'm|im|me|my)\b/gi, ' ')
     .replace(/\b(today|yesterday|tonight|this morning|this afternoon|this evening)\b/gi, ' ')
     .replace(EXPENSE_VERB_PATTERN, ' ')
     .replace(/^\s*(on|for)\s+/i, '')

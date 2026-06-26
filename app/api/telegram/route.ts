@@ -2441,6 +2441,9 @@ export async function POST(request: Request) {
       const audioBuffer = await downloadTelegramFile(filePath)
       const transcript = await transcribeAudio(audioBuffer)
       transcribedVoiceText = transcript
+      logFinanceInfo('voice_transcription_completed', {
+        transcriptLength: transcript.length,
+      })
 
       userMessageToSave = `[voice transcript] ${transcript}`
       userMessageForLLM = formatVoiceTranscriptForLLM(transcript)
@@ -2481,6 +2484,14 @@ Reply naturally as Bergi using the recent conversation context.`
     const isPlainTextMessage = userText !== undefined && voice === undefined && selectedPhoto === null
     const financeText = selectedPhoto === null ? userText ?? transcribedVoiceText : null
     const financeSource = transcribedVoiceText !== null ? 'voice' : 'text'
+    const isFinanceCandidate = financeText !== null && detectFinanceCandidate(financeText)
+
+    if (financeSource === 'voice' && financeText !== null) {
+      logFinanceInfo('voice_transcription_finance_checked', {
+        transcriptLength: financeText.length,
+        isCandidate: isFinanceCandidate,
+      })
+    }
 
     if (isPlainTextMessage && isThoughtCaptureCommand(userText)) {
       const thoughtCaptureReply = await resolveThoughtCaptureReply({ supabase, userId })
@@ -2945,7 +2956,7 @@ Reply naturally as Bergi using the recent conversation context.`
       }
     }
 
-    if (financeText !== null && detectFinanceCandidate(financeText)) {
+    if (financeText !== null && isFinanceCandidate) {
       if (financeSource === 'voice') {
         logFinanceInfo('voice_transcription_finance_candidate_detected', {
           messageLength: financeText.length,
@@ -3167,6 +3178,7 @@ Do this now:
 Style rule:
 Always answer Min's actual request first. Use humour, Singlish, and playful friend energy lightly, but not in every reply. Avoid turning every response into a comedy bit.
 Bergi should feel like a friend continuing the conversation, not a service offering features.
+Never claim an expense was logged, saved to Notion, or added to finance records from normal chat. Only the finance logging code can say "Logged:" after the real finance logger succeeds. If an expense-like message reaches normal chat, ask for a clearer text expense instead of pretending it was logged.
 Do not default to ending helpful replies with "if you want, I can...". Use that kind of offer only when Min explicitly asks for a template, draft, plan, checklist, concrete next action, or help generating something.
 Avoid generic assistant endings like "If you want, I can help you with that", "Let me know if you want me to...", "I can also...", "Would you like me to...", "say so and I’ll...", "if you mean X, say so...", or "tell me if you want...".
 If Bergi has already answered enough, just stop. Do not add a trailing meta-offer or clarification offer by default.
