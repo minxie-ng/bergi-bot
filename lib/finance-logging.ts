@@ -55,6 +55,27 @@ export type FinanceValidationResult =
       logEvent: 'finance_validation_failed' | 'finance_ambiguous'
     }
 
+export type FinanceQueryPeriod = 'today' | 'week' | 'month' | 'year' | 'recent'
+
+export type FinanceQueryIntent = {
+  period: FinanceQueryPeriod
+  category?: FinanceCategory
+  kind: 'total' | 'list' | 'summary'
+}
+
+export type FinanceExpenseQueryEntry = {
+  title: string
+  amount: number
+  date: string | null
+  category: string | null
+}
+
+export type FinanceExpenseQueryResult = {
+  entries: FinanceExpenseQueryEntry[]
+  total: number
+  categoryTotals: Array<{ category: string; total: number; count: number }>
+}
+
 export type PendingSuspiciousExpenseConfirmation = {
   expense: string
   originalAmount: number
@@ -76,6 +97,14 @@ type CreateNotionExpenseLogInput = {
   amount: number
   category: FinanceCategory
   comment?: string | null
+}
+
+type QueryNotionExpensesInput = {
+  startIso?: string
+  endIso?: string
+  category?: FinanceCategory
+  recentLimit?: number
+  maxPages?: number
 }
 
 type NotionOption = {
@@ -106,6 +135,16 @@ type NotionExpensePropertySelection = {
   }
   comment?: string
   source?: {
+    name: string
+    type: 'select' | 'status'
+  }
+}
+
+type NotionExpenseQueryPropertySelection = {
+  title: string
+  amount: string
+  date: string
+  category?: {
     name: string
     type: 'select' | 'status'
   }
@@ -227,6 +266,29 @@ const EVERYDAY_EXPENSE_KEYWORDS = [
 ]
 const EXPENSE_VERB_PATTERN =
   /\b(spent|spend|paid|pay|bought|buy|renewal|subscription|subscribe|treat|treated)\b/gi
+const FINANCE_QUERY_KEYWORDS = [
+  'how much did i spend',
+  'what did i spend',
+  'show my expenses',
+  'summarise',
+  'summarize',
+  'spending',
+  'recent expenses',
+  'expenses today',
+  'expenses this',
+]
+const CATEGORY_QUERY_KEYWORDS: Array<{ category: FinanceCategory; keywords: string[] }> = [
+  { category: 'Food', keywords: ['food', 'lunch', 'dinner', 'breakfast', 'meal', 'coffee', 'kopi', 'milk tea'] },
+  { category: 'Transport', keywords: ['transport', 'grab', 'mrt', 'bus', 'taxi', 'ride'] },
+  { category: 'Groceries', keywords: ['groceries', 'grocery'] },
+  { category: 'Drinks', keywords: ['drinks', 'drink', 'coffee', 'kopi', 'milk tea'] },
+  { category: 'Subscription', keywords: ['subscription', 'subscriptions', 'spotify', 'netflix'] },
+  { category: 'Clothes', keywords: ['clothes', 'clothing', 'uniqlo', 'socks'] },
+  { category: 'Travel', keywords: ['travel', 'flight', 'hotel'] },
+  { category: 'Entertainment', keywords: ['entertainment', 'movie', 'movies'] },
+  { category: 'Sport', keywords: ['sport', 'gym'] },
+  { category: 'Home', keywords: ['home'] },
+]
 const SPOKEN_NUMBER_VALUES: Record<string, number> = {
   one: 1,
   two: 2,
@@ -370,6 +432,48 @@ function hasEverydayExpenseKeyword(text: string): boolean {
   return EVERYDAY_EXPENSE_KEYWORDS.some((keyword) => new RegExp(`\\b${keyword.replace(/\s+/g, '\\s+')}\\b`, 'i').test(text))
 }
 
+function detectFinanceQueryCategory(text: string): FinanceCategory | undefined {
+  const categoryMatch = CATEGORY_QUERY_KEYWORDS.find(({ keywords }) => hasAnyKeyword(text, keywords))
+
+  return categoryMatch?.category
+}
+
+function detectFinanceQueryPeriod(text: string): FinanceQueryPeriod | null {
+  if (/\b(recent|latest)\b/.test(text)) {
+    return 'recent'
+  }
+
+  if (/\btoday\b/.test(text)) {
+    return 'today'
+  }
+
+  if (/\bthis\s+week\b/.test(text)) {
+    return 'week'
+  }
+
+  if (/\bthis\s+month\b|\bmonth'?s\b/.test(text)) {
+    return 'month'
+  }
+
+  if (/\bthis\s+year\b|\byear\b/.test(text)) {
+    return 'year'
+  }
+
+  return null
+}
+
+function detectFinanceQueryKind(text: string): FinanceQueryIntent['kind'] {
+  if (/\b(show|what|recent|latest)\b/.test(text)) {
+    return 'list'
+  }
+
+  if (/\b(summarise|summarize|summary|spending)\b/.test(text)) {
+    return 'summary'
+  }
+
+  return 'total'
+}
+
 function getPrimaryExpenseAmount(text: string): number | null {
   const amounts = extractAmountValues(text)
 
@@ -405,6 +509,23 @@ export function detectFinanceCandidate(text: string): boolean {
     hasItemAmountPattern(normalized) ||
     hasEverydayExpenseKeyword(normalized)
   )
+}
+
+export function detectFinanceQueryIntent(text: string): FinanceQueryIntent | null {
+  const normalized = normalizeFinanceText(text)
+  const period = detectFinanceQueryPeriod(normalized)
+  const hasQueryPhrase = FINANCE_QUERY_KEYWORDS.some((keyword) => normalized.includes(keyword))
+  const asksSpendQuestion = /\b(how much|what|show|summari[sz]e)\b/.test(normalized) && /\b(spend|spent|expenses?|spending)\b/.test(normalized)
+
+  if (!period || (!hasQueryPhrase && !asksSpendQuestion)) {
+    return null
+  }
+
+  return {
+    period,
+    category: detectFinanceQueryCategory(normalized),
+    kind: detectFinanceQueryKind(normalized),
+  }
 }
 
 export function parseFinanceAmountCorrection(text: string): number | null {
@@ -807,6 +928,31 @@ function getNotionExpensePropertySelection(schema: NotionDatabaseSchema, input: 
   return selection
 }
 
+function getNotionExpenseQueryPropertySelection(schema: NotionDatabaseSchema): NotionExpenseQueryPropertySelection {
+  const title = findTitlePropertyName(schema)
+  const amount = findNumberPropertyName(schema)
+  const date = getPropertyType(schema, 'Date') === 'date' ? 'Date' : undefined
+
+  if (!title || !amount || !date) {
+    throw new NotionExpenseLogError({ category: 'notion_schema_mismatch' })
+  }
+
+  const categoryType = getPropertyType(schema, 'Category')
+
+  return {
+    title,
+    amount,
+    date,
+    category:
+      categoryType === 'select' || categoryType === 'status'
+        ? {
+            name: 'Category',
+            type: categoryType,
+          }
+        : undefined,
+  }
+}
+
 function logNotionDatabaseSchemaLoaded(schema: NotionDatabaseSchema): void {
   console.log('notion_database_schema_loaded', {
     properties: getNotionDatabasePropertyMetadata(schema),
@@ -974,6 +1120,162 @@ function buildNotionExpenseProperties(
   return properties
 }
 
+function getTitlePropertyValue(value: unknown): string {
+  if (
+    typeof value === 'object' &&
+    value !== null &&
+    'title' in value &&
+    Array.isArray((value as { title?: unknown }).title)
+  ) {
+    const titleParts = (value as { title: Array<{ plain_text?: unknown }> }).title
+
+    return titleParts
+      .map((part) => (typeof part.plain_text === 'string' ? part.plain_text : ''))
+      .join('')
+      .trim()
+  }
+
+  return ''
+}
+
+function getNumberPropertyValue(value: unknown): number | null {
+  if (
+    typeof value === 'object' &&
+    value !== null &&
+    'number' in value &&
+    typeof (value as { number?: unknown }).number === 'number'
+  ) {
+    return (value as { number: number }).number
+  }
+
+  return null
+}
+
+function getDatePropertyValue(value: unknown): string | null {
+  if (
+    typeof value === 'object' &&
+    value !== null &&
+    'date' in value &&
+    typeof (value as { date?: { start?: unknown } | null }).date?.start === 'string'
+  ) {
+    return (value as { date: { start: string } }).date.start
+  }
+
+  return null
+}
+
+function getCategoryPropertyValue(value: unknown): string | null {
+  if (typeof value !== 'object' || value === null) {
+    return null
+  }
+
+  const property = value as { select?: { name?: unknown } | null; status?: { name?: unknown } | null }
+  const name = property.select?.name ?? property.status?.name
+
+  return typeof name === 'string' && name.trim() ? name : null
+}
+
+function normalizeNotionExpensePage(
+  page: unknown,
+  selection: NotionExpenseQueryPropertySelection
+): FinanceExpenseQueryEntry | null {
+  if (typeof page !== 'object' || page === null || !('properties' in page)) {
+    return null
+  }
+
+  const properties = (page as { properties?: Record<string, unknown> }).properties
+
+  if (!properties) {
+    return null
+  }
+
+  const amount = getNumberPropertyValue(properties[selection.amount])
+
+  if (amount === null || !Number.isFinite(amount)) {
+    return null
+  }
+
+  return {
+    title: getTitlePropertyValue(properties[selection.title]) || 'expense',
+    amount,
+    date: getDatePropertyValue(properties[selection.date]),
+    category: selection.category ? getCategoryPropertyValue(properties[selection.category.name]) : null,
+  }
+}
+
+function buildNotionExpenseQueryFilter(
+  selection: NotionExpenseQueryPropertySelection,
+  input: QueryNotionExpensesInput
+): Record<string, unknown> | undefined {
+  const filters: Array<Record<string, unknown>> = []
+
+  if (input.startIso) {
+    filters.push({
+      property: selection.date,
+      date: {
+        on_or_after: input.startIso,
+      },
+    })
+  }
+
+  if (input.endIso) {
+    filters.push({
+      property: selection.date,
+      date: {
+        before: input.endIso,
+      },
+    })
+  }
+
+  if (input.category && selection.category) {
+    filters.push({
+      property: selection.category.name,
+      [selection.category.type]: {
+        equals: input.category,
+      },
+    })
+  }
+
+  if (filters.length === 0) {
+    return undefined
+  }
+
+  if (filters.length === 1) {
+    return filters[0]
+  }
+
+  return {
+    and: filters,
+  }
+}
+
+function summarizeExpenseQueryEntries(entries: FinanceExpenseQueryEntry[]): FinanceExpenseQueryResult {
+  const categorySummary = new Map<string, { total: number; count: number }>()
+  const total = entries.reduce((sum, entry) => {
+    const category = entry.category ?? 'Others'
+    const existing = categorySummary.get(category) ?? { total: 0, count: 0 }
+
+    categorySummary.set(category, {
+      total: existing.total + entry.amount,
+      count: existing.count + 1,
+    })
+
+    return sum + entry.amount
+  }, 0)
+
+  return {
+    entries,
+    total,
+    categoryTotals: Array.from(categorySummary.entries())
+      .map(([category, summary]) => ({
+        category,
+        total: summary.total,
+        count: summary.count,
+      }))
+      .sort((a, b) => b.total - a.total),
+  }
+}
+
 export async function parseExpenseLogWithLLM(params: CallFinanceParserParams): Promise<ParsedExpenseLog> {
   const allowedCategories = FINANCE_CATEGORIES.join(', ')
   const textForParsing = prepareFinanceTextForParsing(params.text)
@@ -1075,6 +1377,95 @@ export async function createNotionExpenseLog(input: CreateNotionExpenseLogInput)
   } finally {
     clearTimeout(timeout)
   }
+}
+
+export async function queryNotionExpenses(input: QueryNotionExpensesInput): Promise<FinanceExpenseQueryResult> {
+  const notionToken = process.env.NOTION_TOKEN
+  const rawDatabaseId = process.env.NOTION_EXPENSES_DATABASE_ID
+
+  if (!notionToken || !rawDatabaseId) {
+    throw new NotionExpenseLogError({ category: 'missing_env' })
+  }
+
+  const databaseId = normalizeNotionDatabaseId(rawDatabaseId)
+  const schema = await retrieveNotionDatabaseSchema({
+    notionToken,
+    databaseId,
+  })
+  const selection = getNotionExpenseQueryPropertySelection(schema)
+  const filter = buildNotionExpenseQueryFilter(selection, input)
+  const maxPages = input.maxPages ?? 5
+  const entries: FinanceExpenseQueryEntry[] = []
+  let startCursor: string | undefined
+
+  for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
+    const abortController = new AbortController()
+    const timeout = setTimeout(() => abortController.abort(), 1800)
+
+    try {
+      const response = await fetch(`https://api.notion.com/v1/databases/${databaseId}/query`, {
+        method: 'POST',
+        signal: abortController.signal,
+        headers: getNotionHeaders(notionToken),
+        body: JSON.stringify({
+          page_size: Math.min(input.recentLimit ?? 100, 100),
+          start_cursor: startCursor,
+          filter,
+          sorts: [
+            {
+              property: selection.date,
+              direction: 'descending',
+            },
+          ],
+        }),
+      })
+
+      if (!response.ok) {
+        const notionCode = await parseNotionErrorCode(response)
+
+        throw new NotionExpenseLogError({
+          category: getNotionErrorCategory(response.status, notionCode),
+          status: response.status,
+          notionCode,
+        })
+      }
+
+      const data = (await response.json()) as {
+        results?: unknown[]
+        has_more?: unknown
+        next_cursor?: unknown
+      }
+      const pageEntries = (data.results ?? [])
+        .map((page) => normalizeNotionExpensePage(page, selection))
+        .filter((entry): entry is FinanceExpenseQueryEntry => entry !== null)
+
+      entries.push(...pageEntries)
+
+      if (input.recentLimit && entries.length >= input.recentLimit) {
+        return summarizeExpenseQueryEntries(entries.slice(0, input.recentLimit))
+      }
+
+      if (data.has_more !== true || typeof data.next_cursor !== 'string') {
+        return summarizeExpenseQueryEntries(entries)
+      }
+
+      startCursor = data.next_cursor
+    } catch (error) {
+      if (error instanceof NotionExpenseLogError) {
+        throw error
+      }
+
+      if (isAbortError(error)) {
+        throw new NotionExpenseLogError({ category: 'notion_timeout' })
+      }
+
+      throw new NotionExpenseLogError({ category: 'notion_unknown_error' })
+    } finally {
+      clearTimeout(timeout)
+    }
+  }
+
+  return summarizeExpenseQueryEntries(entries)
 }
 
 export function formatExpenseLoggedReply(expenseLog: ParsedExpenseLog): string {

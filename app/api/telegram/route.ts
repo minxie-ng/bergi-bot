@@ -24,12 +24,16 @@ import {
   classifyFinanceIntent,
   createNotionExpenseLog,
   detectFinanceCandidate,
+  detectFinanceQueryIntent,
   formatFinanceCorrectionForParser,
   formatExpenseLoggedReply,
+  type FinanceExpenseQueryResult,
+  type FinanceQueryIntent,
   NotionExpenseLogError,
   parseFinanceAmountCorrection,
   parseExpenseLogWithLLM,
   parsePendingSuspiciousExpenseConfirmation,
+  queryNotionExpenses,
   validateExpenseLogForNotion,
 } from '@/lib/finance-logging'
 import { generateDailyProactiveCheckins, getOrCreateProactivePreferences } from '@/lib/proactive-checkins'
@@ -997,6 +1001,149 @@ ${formatDailyRecapNotesForPrompt(notes)}`,
   })
 
   return formatForTelegramPlainText(rawRecap)
+}
+
+function addMonthsToLocalDate(localDate: string, months: number): string {
+  const [year, month, day] = localDate.split('-').map(Number)
+  const date = new Date(Date.UTC(year, month - 1 + months, day))
+
+  return date.toISOString().slice(0, 10)
+}
+
+function getFinanceQueryDateRange(params: {
+  intent: FinanceQueryIntent
+  timezone: string
+}): { startIso?: string; endIso?: string; label: string; recentLimit?: number } {
+  const localDate = getLocalDateString(new Date(), params.timezone)
+
+  if (params.intent.period === 'recent') {
+    return {
+      label: 'recent',
+      recentLimit: 10,
+    }
+  }
+
+  if (params.intent.period === 'today') {
+    return {
+      label: 'today',
+      startIso: zonedDateTimeToUtcIso(localDate, '00:00', params.timezone),
+      endIso: zonedDateTimeToUtcIso(addDaysToLocalDate(localDate, 1), '00:00', params.timezone),
+    }
+  }
+
+  if (params.intent.period === 'week') {
+    const [year, month, day] = localDate.split('-').map(Number)
+    const dayOfWeek = new Date(Date.UTC(year, month - 1, day)).getUTCDay()
+    const daysSinceMonday = (dayOfWeek + 6) % 7
+    const weekStart = addDaysToLocalDate(localDate, -daysSinceMonday)
+
+    return {
+      label: 'this week',
+      startIso: zonedDateTimeToUtcIso(weekStart, '00:00', params.timezone),
+      endIso: zonedDateTimeToUtcIso(addDaysToLocalDate(weekStart, 7), '00:00', params.timezone),
+    }
+  }
+
+  if (params.intent.period === 'month') {
+    const monthStart = `${localDate.slice(0, 7)}-01`
+
+    return {
+      label: 'this month',
+      startIso: zonedDateTimeToUtcIso(monthStart, '00:00', params.timezone),
+      endIso: zonedDateTimeToUtcIso(addMonthsToLocalDate(monthStart, 1), '00:00', params.timezone),
+    }
+  }
+
+  const yearStart = `${localDate.slice(0, 4)}-01-01`
+  const nextYearStart = `${Number(localDate.slice(0, 4)) + 1}-01-01`
+
+  return {
+    label: 'this year',
+    startIso: zonedDateTimeToUtcIso(yearStart, '00:00', params.timezone),
+    endIso: zonedDateTimeToUtcIso(nextYearStart, '00:00', params.timezone),
+  }
+}
+
+function formatSgdAmount(amount: number): string {
+  return `SGD ${amount.toFixed(2)}`
+}
+
+function formatFinanceQueryCategory(category: string): string {
+  return category.toLowerCase()
+}
+
+function formatFinanceQueryReply(params: {
+  result: FinanceExpenseQueryResult
+  intent: FinanceQueryIntent
+  rangeLabel: string
+}): string {
+  const { result, intent, rangeLabel } = params
+
+  if (result.entries.length === 0) {
+    return rangeLabel === 'recent'
+      ? "I don’t see any recent expenses logged yet."
+      : `I don’t see any expenses logged for ${rangeLabel} yet.`
+  }
+
+  if (intent.category) {
+    return `${rangeLabel}’s ${formatFinanceQueryCategory(intent.category)} spending is ${formatSgdAmount(
+      result.total
+    )} across ${result.entries.length} ${result.entries.length === 1 ? 'entry' : 'entries'}.`
+  }
+
+  if (intent.kind === 'list' || intent.period === 'today' || intent.period === 'recent') {
+    const entryLines = result.entries
+      .slice(0, 8)
+      .map((entry) => `- ${entry.title} — ${formatSgdAmount(entry.amount)}`)
+      .join('\n')
+    const moreLine = result.entries.length > 8 ? `\n\nand ${result.entries.length - 8} more.` : ''
+
+    return `${rangeLabel === 'recent' ? 'recently' : rangeLabel}, you spent ${formatSgdAmount(result.total)}:
+
+${entryLines}${moreLine}`
+  }
+
+  const categoryLines = result.categoryTotals
+    .slice(0, 5)
+    .map((category) => `- ${formatFinanceQueryCategory(category.category)}: ${formatSgdAmount(category.total)}`)
+    .join('\n')
+
+  return `so far ${rangeLabel}, you spent ${formatSgdAmount(result.total)}.
+
+biggest categories:
+${categoryLines}`
+}
+
+async function resolveFinanceQueryReply(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+  intent: FinanceQueryIntent
+}): Promise<string> {
+  const timezone = await getDailyRecapTimezone(params)
+  const range = getFinanceQueryDateRange({ intent: params.intent, timezone })
+
+  logFinanceInfo('finance_query_started', {
+    period: params.intent.period,
+    hasCategory: params.intent.category !== undefined,
+  })
+
+  const result = await queryNotionExpenses({
+    startIso: range.startIso,
+    endIso: range.endIso,
+    category: params.intent.category,
+    recentLimit: range.recentLimit,
+  })
+
+  logFinanceInfo('finance_query_success', {
+    count: result.entries.length,
+  })
+
+  return formatFinanceQueryReply({
+    result,
+    intent: params.intent,
+    rangeLabel: range.label,
+  })
 }
 
 function parseReminderCancelNumber(text: string): number | null {
@@ -2826,6 +2973,47 @@ Reply naturally as Bergi using the recent conversation context.`
           await saveMessage({ supabase, userId, role: 'assistant', content: clarifyingQuestion })
           return new Response('OK', { status: 200 })
         }
+      }
+    }
+
+    if (financeText !== null) {
+      const financeQueryIntent = detectFinanceQueryIntent(financeText)
+
+      if (financeQueryIntent !== null) {
+        logFinanceInfo('finance_query_detected', {
+          period: financeQueryIntent.period,
+          hasCategory: financeQueryIntent.category !== undefined,
+        })
+
+        let financeQueryReply: string
+
+        try {
+          financeQueryReply = await resolveFinanceQueryReply({
+            supabase,
+            userId,
+            chatId,
+            intent: financeQueryIntent,
+          })
+        } catch (error) {
+          const notionError =
+            error instanceof NotionExpenseLogError
+              ? error
+              : new NotionExpenseLogError({ category: 'notion_unknown_error' })
+
+          logFinanceError('finance_query_failed', {
+            category: notionError.category,
+          })
+          financeQueryReply = 'I couldn’t read your Notion expenses right now.'
+        }
+
+        if (isLocalTestMode) {
+          console.log('Local test finance query reply generated')
+        } else {
+          await sendTelegramMessage(chatId, financeQueryReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: financeQueryReply })
+        return new Response('OK', { status: 200 })
       }
     }
 
