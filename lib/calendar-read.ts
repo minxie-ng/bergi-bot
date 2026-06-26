@@ -62,6 +62,7 @@ type CalendarReadEnvValidationMetadata = {
   hasPrivateKey: boolean
   privateKeyIncludesBeginPrivateKey: boolean
   privateKeyIncludesEscapedNewline: boolean
+  privateKeyIncludesRealNewline: boolean
   hasCalendarId: boolean
 }
 
@@ -75,13 +76,15 @@ let cachedAccessToken: { token: string; expiresAtMs: number } | null = null
 export function getCalendarReadEnvValidationMetadata(): CalendarReadEnvValidationMetadata {
   const serviceAccountEmail = process.env.GOOGLE_CALENDAR_SERVICE_ACCOUNT_EMAIL
   const privateKey = process.env.GOOGLE_CALENDAR_PRIVATE_KEY
+  const normalizedPrivateKey = typeof privateKey === 'string' ? normalizePrivateKey(privateKey) : undefined
   const calendarId = process.env.GOOGLE_CALENDAR_ID
 
   return {
     hasServiceAccountEmail: Boolean(serviceAccountEmail),
     hasPrivateKey: Boolean(privateKey),
-    privateKeyIncludesBeginPrivateKey: Boolean(privateKey?.includes('BEGIN PRIVATE KEY')),
+    privateKeyIncludesBeginPrivateKey: Boolean(normalizedPrivateKey?.includes('BEGIN PRIVATE KEY')),
     privateKeyIncludesEscapedNewline: Boolean(privateKey?.includes('\\n')),
+    privateKeyIncludesRealNewline: Boolean(privateKey?.includes('\n')),
     hasCalendarId: Boolean(calendarId),
   }
 }
@@ -144,7 +147,13 @@ function base64UrlEncode(value: string | Buffer): string {
 }
 
 function normalizePrivateKey(value: string): string {
-  return value.replace(/\\n/g, '\n')
+  const trimmed = value.trim()
+  const unquoted =
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))
+      ? trimmed.slice(1, -1)
+      : trimmed
+
+  return unquoted.replace(/\\n/g, '\n')
 }
 
 function isAbortError(error: unknown): boolean {
@@ -248,7 +257,9 @@ async function getGoogleCalendarAccessToken(): Promise<string> {
     throw new CalendarReadError({ category: 'missing_env' })
   }
 
-  if (!privateKey.includes('BEGIN PRIVATE KEY')) {
+  const normalizedPrivateKey = normalizePrivateKey(privateKey)
+
+  if (!normalizedPrivateKey.includes('BEGIN PRIVATE KEY')) {
     throw new CalendarReadError({ category: 'invalid_private_key' })
   }
 
@@ -277,7 +288,7 @@ async function getGoogleCalendarAccessToken(): Promise<string> {
   let signature: string
 
   try {
-    signature = base64UrlEncode(signer.sign(normalizePrivateKey(privateKey)))
+    signature = base64UrlEncode(signer.sign(normalizedPrivateKey))
   } catch {
     throw new CalendarReadError({ category: 'invalid_private_key' })
   }
