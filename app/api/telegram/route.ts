@@ -196,6 +196,8 @@ type PendingCalendarEventRow = {
   timezone: string
   description: string | null
   expires_at: string
+  created_at: string
+  updated_at: string
 }
 
 type PendingCalendarTimeRow = PendingCalendarEventRow
@@ -1523,7 +1525,7 @@ function isLikelyCalendarCreateRequest(text: string): boolean {
 }
 
 function isCalendarCreateConfirmation(text: string): boolean {
-  return /^(yes|yep|yeah|confirm|confirmed|add it|looks good|ok|okay|sure|go ahead|do it)$/i.test(text.trim())
+  return /^(yes|yea|yep|yeah|confirm|confirmed|add it|looks good|ok|okay|sure|go ahead|do it)$/i.test(text.trim())
 }
 
 function isCalendarCreateCancellation(text: string): boolean {
@@ -1531,7 +1533,7 @@ function isCalendarCreateCancellation(text: string): boolean {
 }
 
 function isCalendarDraftEditRequest(text: string): boolean {
-  return /^(change|move|update|make)(?:\s+it)?\s+to\b/i.test(text.trim())
+  return /(?:^|\b)(?:change|move|update|make)(?:\s+it)?\s+to\b/i.test(text.trim())
 }
 
 function getWeekdayIndexFromText(value: string): 0 | 1 | 2 | 3 | 4 | 5 | 6 | null {
@@ -1775,6 +1777,8 @@ function getCalendarRangeEndAt(params: {
 
 function titleCaseCalendarTitle(title: string): string {
   return title
+    .replace(/[–—-]+\s*$/g, '')
+    .replace(/\s+[–—-]\s+/g, ' ')
     .split(/\s+/)
     .filter(Boolean)
     .map((word) => (word.length <= 3 && word.toLowerCase() !== 'gym' ? word : word[0].toUpperCase() + word.slice(1)))
@@ -1786,9 +1790,11 @@ function extractCalendarCreateTitle(text: string): string {
     .replace(/[’']/g, "'")
     .replace(/\b(create\s+calendar\s+event\s+for|create\s+event\s+for|put\s+on\s+(?:my\s+)?calendar|add|schedule|block\s+time\s+to|block\s+\d+(?:\.\d+)?\s*(?:hours?|hrs?|h)\s+for|block)\b/gi, ' ')
     .replace(/\b(today|tdy|tomorrow|tmr|this\s+(?:mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)|next\s+(?:mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b/gi, ' ')
+    .replace(/\b(?:from\s+)?(?:[01]?\d|2[0-3])(?:(?::|\.)[0-5]\d)?\s*(?:am|pm)?\s*(?:-|to)\s*(?:[01]?\d|2[0-3])(?:(?::|\.)[0-5]\d)?\s*(?:am|pm)?\b/gi, ' ')
     .replace(/\b(?:at\s*)?(?:[01]?\d|2[0-3])(?:(?::|\.)[0-5]\d)?\s*(?:am|pm)?\b/gi, ' ')
     .replace(/\b(morning|afternoon|evening|tonight)\b/gi, ' ')
     .replace(/\b(for|to|on|at)\b/gi, ' ')
+    .replace(/[–—-]+\s*$/g, '')
     .replace(/\s+/g, ' ')
     .trim()
 
@@ -1894,7 +1900,25 @@ Confirm?`
 }
 
 function formatCalendarCreatedReply(draft: PendingCalendarEventRow): string {
-  return `added: ${draft.title} — ${formatCalendarPlanningTime(Date.parse(draft.start_at), draft.timezone)}.`
+  return `added: ${draft.title} — ${formatCalendarDraftTimeRange({
+    startAt: draft.start_at,
+    endAt: draft.end_at,
+    timezone: draft.timezone,
+  })}.`
+}
+
+function getCalendarPendingSafeMetadata(draft: PendingCalendarEventRow): {
+  pendingAgeSeconds: number
+  durationMinutes: number
+  hasStartTime: boolean
+  hasEndTime: boolean
+} {
+  return {
+    pendingAgeSeconds: Math.max(0, Math.round((Date.now() - Date.parse(draft.created_at)) / 1000)),
+    durationMinutes: Math.max(0, Math.round((Date.parse(draft.end_at) - Date.parse(draft.start_at)) / 60000)),
+    hasStartTime: !Number.isNaN(Date.parse(draft.start_at)),
+    hasEndTime: !Number.isNaN(Date.parse(draft.end_at)),
+  }
 }
 
 async function savePendingCalendarEvent(params: {
@@ -1942,12 +1966,13 @@ async function getLatestPendingCalendarEvent(params: {
 }): Promise<PendingCalendarEventRow | null> {
   const { data, error } = await params.supabase
     .from('pending_calendar_events')
-    .select('id, title, start_at, end_at, timezone, description, expires_at')
+    .select('id, title, start_at, end_at, timezone, description, expires_at, created_at, updated_at')
     .eq('user_id', params.userId)
     .eq('platform', 'telegram')
     .eq('telegram_chat_id', params.chatId)
     .eq('status', 'pending')
     .gt('expires_at', new Date().toISOString())
+    .order('updated_at', { ascending: false })
     .order('created_at', { ascending: false })
     .limit(1)
     .maybeSingle()
@@ -1980,8 +2005,8 @@ async function updatePendingCalendarEventDraft(params: {
   startAt: string
   endAt: string
   timezone: string
-}): Promise<void> {
-  const { error } = await params.supabase
+}): Promise<PendingCalendarEventRow> {
+  const { data, error } = await params.supabase
     .from('pending_calendar_events')
     .update({
       start_at: params.startAt,
@@ -1993,10 +2018,18 @@ async function updatePendingCalendarEventDraft(params: {
     })
     .eq('id', params.id)
     .eq('status', 'pending')
+    .select('id, title, start_at, end_at, timezone, description, expires_at, created_at, updated_at')
+    .maybeSingle()
 
   if (error) {
     throw error
   }
+
+  if (!data) {
+    throw new Error('Pending calendar event was not updated')
+  }
+
+  return data
 }
 
 async function savePendingCalendarTimeClarification(params: {
@@ -2050,7 +2083,7 @@ async function getLatestPendingCalendarTime(params: {
 }): Promise<PendingCalendarTimeRow | null> {
   const { data, error } = await params.supabase
     .from('pending_calendar_events')
-    .select('id, title, start_at, end_at, timezone, description, expires_at')
+    .select('id, title, start_at, end_at, timezone, description, expires_at, created_at, updated_at')
     .eq('user_id', params.userId)
     .eq('platform', 'telegram')
     .eq('telegram_chat_id', params.chatId)
@@ -2199,7 +2232,7 @@ async function resolveCalendarCreateEditReply(params: {
     : addMinutesToIso(startAt, existingDurationMinutes)
   const color = inferCalendarEventColor(pendingCalendarEvent.title)
 
-  await updatePendingCalendarEventDraft({
+  const updatedPendingCalendarEvent = await updatePendingCalendarEventDraft({
     supabase: params.supabase,
     id: pendingCalendarEvent.id,
     startAt,
@@ -2207,17 +2240,12 @@ async function resolveCalendarCreateEditReply(params: {
     timezone: pendingCalendarEvent.timezone,
   })
 
-  console.log('calendar_create_draft_updated', {
-    datePeriod: date.period,
-    durationMinutes: timeRange?.durationMinutes ?? existingDurationMinutes,
+  console.log('calendar_pending_updated', {
+    ...getCalendarPendingSafeMetadata(updatedPendingCalendarEvent),
     colorCategory: color.category,
   })
 
-  return formatCalendarDraftChangedReply({
-    ...pendingCalendarEvent,
-    start_at: startAt,
-    end_at: endAt,
-  })
+  return formatCalendarDraftChangedReply(updatedPendingCalendarEvent)
 }
 
 async function resolveCalendarCreateTimeClarificationReply(params: {
@@ -2275,7 +2303,7 @@ async function resolveCalendarCreateTimeClarificationReply(params: {
     })
     .eq('id', pendingCalendarTime.id)
     .eq('status', 'awaiting_time')
-    .select('id')
+    .select('id, title, start_at, end_at, timezone, description, expires_at, created_at, updated_at')
     .maybeSingle()
 
   if (error || !data) {
@@ -2285,20 +2313,19 @@ async function resolveCalendarCreateTimeClarificationReply(params: {
     return 'I couldn’t update that calendar draft right now.'
   }
 
-  console.log('calendar_create_draft_created', {
-    durationMinutes: timeRange?.durationMinutes ?? existingDurationMinutes,
-    datePeriod: 'pending_date',
+  console.log('calendar_pending_updated', {
+    ...getCalendarPendingSafeMetadata(data),
     colorCategory: color.category,
   })
 
   return formatCalendarCreateDraftReply({
-    title: pendingCalendarTime.title,
-    startAt,
-    endAt,
-    timezone: pendingCalendarTime.timezone,
-    description: pendingCalendarTime.description,
+    title: data.title,
+    startAt: data.start_at,
+    endAt: data.end_at,
+    timezone: data.timezone,
+    description: data.description,
     datePeriod: 'pending_date',
-    durationMinutes: timeRange?.durationMinutes ?? existingDurationMinutes,
+    durationMinutes: getCalendarPendingSafeMetadata(data).durationMinutes,
     colorCategory: color.category,
     colorId: color.colorId,
   })
@@ -2320,6 +2347,9 @@ async function resolveCalendarCreateConfirmationReply(params: {
     return null
   }
 
+  const pendingMetadata = getCalendarPendingSafeMetadata(pendingCalendarEvent)
+  console.log('calendar_pending_loaded_for_confirmation', pendingMetadata)
+
   if (isCalendarCreateCancellation(params.text)) {
     await updatePendingCalendarEventStatus({
       supabase: params.supabase,
@@ -2331,8 +2361,11 @@ async function resolveCalendarCreateConfirmationReply(params: {
   }
 
   console.log('calendar_create_confirmation_received')
-  console.log('calendar_create_started')
   const color = inferCalendarEventColor(pendingCalendarEvent.title)
+  console.log('calendar_create_started', {
+    ...pendingMetadata,
+    colorCategory: color.category,
+  })
 
   try {
     await createGoogleCalendarEvent({
@@ -2351,6 +2384,7 @@ async function resolveCalendarCreateConfirmationReply(params: {
     })
 
     console.log('calendar_create_success', {
+      ...getCalendarPendingSafeMetadata(pendingCalendarEvent),
       colorCategory: color.category,
     })
 
