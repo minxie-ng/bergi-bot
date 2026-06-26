@@ -187,6 +187,14 @@ Active path:
 
 Telegram -> Bergi Core -> calendar intent detector -> Google Calendar API `events.list`
 
+Current status:
+
+- Google Calendar read-only schedule querying is working.
+- The current personal Bergi Core uses a Google service account for auth.
+- Calendar is read-only only.
+- Calendar reads use Google Calendar API `events.list`.
+- No Google Calendar create, update, delete, accept, decline, or modify actions exist.
+
 Auth approach:
 
 - Server-side Google service account with Calendar read-only scope.
@@ -206,10 +214,32 @@ Supported query examples:
 - `what do i have tomorrow?`
 - `anything this evening?`
 - `what do i have this week?`
+- `what do i have next week?`
 - `summarise my week`
 - `what's next on my calendar?`
+- `what do i have next Monday?`
+- `what do i have next fri?`
+- `what do i have today or tomorrow?`
+- `what do i hv tdy or tmr?`
+- `am i busy next week?`
+- `how busy am i next week?`
 
-Calendar integration is read-only. Bergi does not create, update, delete, accept, decline, or modify calendar events.
+Calendar Router V2 supports:
+
+- Today.
+- Tomorrow.
+- This evening.
+- This week.
+- Next week.
+- Next event.
+- Next Monday through next Sunday.
+- Short weekday forms such as `next mon` and `next fri`.
+- Combined today/tomorrow queries such as `today or tomorrow`, `tdy or tmr`, and `tmr or tdy`.
+- Busy/free style next-week summaries that count events, group by day, and may estimate scheduled duration when event start/end times exist.
+
+Calendar-ish unsupported or ambiguous queries are blocked from falling through to normal LLM chat. Bergi asks for a time-range clarification instead of saying it cannot access Calendar or answering from memory.
+
+Calendar integration is read-only. Bergi does not create, update, delete, accept, decline, or modify calendar events. Calendar V3/event creation is intentionally not built yet.
 
 ## 10. Cron jobs
 
@@ -251,6 +281,7 @@ Safe logs should use metadata only, such as candidate detection, status category
 - No charts or dashboard yet.
 - No full Life Thread Engine yet.
 - Calendar operator is read-only only.
+- Calendar V3/event creation is intentionally not built yet.
 - No Gmail operator integration yet.
 - n8n is not active for finance anymore.
 - `app/api/telegram/route.ts` is partially modularized but still large and may need more refactor later.
