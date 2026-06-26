@@ -4,10 +4,24 @@ const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token'
 const GOOGLE_CALENDAR_API_BASE_URL = 'https://www.googleapis.com/calendar/v3'
 const GOOGLE_CALENDAR_READONLY_SCOPE = 'https://www.googleapis.com/auth/calendar.readonly'
 
-export type CalendarQueryPeriod = 'today' | 'tomorrow' | 'evening' | 'week' | 'next'
+export type CalendarQueryPeriod =
+  | 'today'
+  | 'tomorrow'
+  | 'evening'
+  | 'week'
+  | 'next_week'
+  | 'today_tomorrow'
+  | 'next_weekday'
+  | 'next'
+  | 'unsupported'
+
+export type CalendarQueryMode = 'events' | 'busy' | 'clarify'
 
 export type CalendarQueryIntent = {
   period: CalendarQueryPeriod
+  mode: CalendarQueryMode
+  weekday?: 0 | 1 | 2 | 3 | 4 | 5 | 6
+  weekdayLabel?: string
 }
 
 export type CalendarEvent = {
@@ -16,6 +30,19 @@ export type CalendarEvent = {
   end: string | null
   isAllDay: boolean
 }
+
+const WEEKDAY_MATCHES: Array<{ index: 0 | 1 | 2 | 3 | 4 | 5 | 6; label: string; pattern: RegExp }> = [
+  { index: 1, label: 'next Monday', pattern: /\bnext\s+mon(?:day)?\b/ },
+  { index: 2, label: 'next Tuesday', pattern: /\bnext\s+tue(?:s|sday)?\b/ },
+  { index: 3, label: 'next Wednesday', pattern: /\bnext\s+wed(?:nesday)?\b/ },
+  { index: 4, label: 'next Thursday', pattern: /\bnext\s+thu(?:r|rs|rsday)?\b/ },
+  { index: 5, label: 'next Friday', pattern: /\bnext\s+fri(?:day)?\b/ },
+  { index: 6, label: 'next Saturday', pattern: /\bnext\s+sat(?:urday)?\b/ },
+  { index: 0, label: 'next Sunday', pattern: /\bnext\s+sun(?:day)?\b/ },
+]
+
+const CALENDAR_CLARIFICATION_REPLY =
+  'I can check your calendar, but which time range do you mean — today, tomorrow, this week, or next Monday?'
 
 export type CalendarReadErrorCategory =
   | 'missing_env'
@@ -107,47 +134,90 @@ function normalizeCalendarText(text: string): string {
 
 export function detectCalendarQueryIntent(text: string): CalendarQueryIntent | null {
   const normalized = normalizeCalendarText(text)
+  const hasCalendarWord = /\b(calendar|schedule|agenda|events?|plans?)\b/.test(normalized)
+  const hasCalendarTimeRange =
+    /\b(?:today|tdy|tomorrow|tmr|tonight|evening|this\s+week|next\s+week)\b/.test(normalized) ||
+    WEEKDAY_MATCHES.some(({ pattern }) => pattern.test(normalized))
+  const hasCalendarQuestion =
+    /\bwhat\s+do\s+i\s+(?:have|hv)\b/.test(normalized) ||
+    /\b(?:do\s+i\s+have|have)\s+anything\b/.test(normalized) ||
+    (/\banything\b/.test(normalized) && hasCalendarTimeRange) ||
+    /\b(?:am\s+i|will\s+i\s+be)\s+busy\b/.test(normalized) ||
+    /\bhow\s+busy\b/.test(normalized) ||
+    /\b(?:free|busy)\b/.test(normalized)
+  const isCalendarish = hasCalendarWord || hasCalendarQuestion
+  const mode: CalendarQueryMode = /\b(busy|free|clear|packed)\b|\bhow\s+busy\b/.test(normalized) ? 'busy' : 'events'
 
-  if (/\bnext\s+(calendar\s+)?event\b/.test(normalized) || /\bwhat'?s\s+next\s+on\s+my\s+calendar\b/.test(normalized)) {
-    return { period: 'next' }
+  if (!isCalendarish) {
+    return null
   }
 
-  if (/\bsummari[sz]e\s+my\s+week\b/.test(normalized) || /\bwhat\s+do\s+i\s+have\s+this\s+week\b/.test(normalized)) {
-    return { period: 'week' }
-  }
+  const weekdayMatch = WEEKDAY_MATCHES.find(({ pattern }) => pattern.test(normalized))
 
-  if (/\b(this\s+)?evening\b/.test(normalized) && /\b(anything|schedule|calendar|have|event|do i have)\b/.test(normalized)) {
-    return { period: 'evening' }
-  }
-
-  if (/\btomorrow\b/.test(normalized) && /\b(what\s+do\s+i\s+have|schedule|calendar|anything|events?)\b/.test(normalized)) {
-    return { period: 'tomorrow' }
+  if (weekdayMatch) {
+    return {
+      period: 'next_weekday',
+      mode,
+      weekday: weekdayMatch.index,
+      weekdayLabel: weekdayMatch.label,
+    }
   }
 
   if (
-    /\btoday\b/.test(normalized) &&
-    /\b(what\s+do\s+i\s+have|what'?s\s+my\s+schedule|schedule|calendar|anything|events?)\b/.test(normalized)
+    /\b(?:today|tdy)\s+or\s+(?:tomorrow|tmr)\b/.test(normalized) ||
+    /\b(?:tomorrow|tmr)\s+or\s+(?:today|tdy)\b/.test(normalized)
   ) {
-    return { period: 'today' }
+    return { period: 'today_tomorrow', mode }
+  }
+
+  if (/\bnext\s+week\b/.test(normalized)) {
+    return { period: 'next_week', mode }
+  }
+
+  if (/\bnext\s+(calendar\s+)?event\b/.test(normalized) || /\bwhat'?s\s+next\s+on\s+my\s+calendar\b/.test(normalized)) {
+    return { period: 'next', mode: 'events' }
+  }
+
+  if (/\bsummari[sz]e\s+my\s+week\b/.test(normalized) || /\bwhat\s+do\s+i\s+have\s+this\s+week\b/.test(normalized)) {
+    return { period: 'week', mode }
+  }
+
+  if (/\b(this\s+)?evening\b/.test(normalized) && /\b(anything|schedule|calendar|have|event|do i have)\b/.test(normalized)) {
+    return { period: 'evening', mode }
+  }
+
+  if (/\b(?:tomorrow|tmr)\b/.test(normalized) && /\b(what\s+do\s+i\s+(?:have|hv)|schedule|calendar|anything|events?|busy|free)\b/.test(normalized)) {
+    return { period: 'tomorrow', mode }
+  }
+
+  if (
+    /\b(?:today|tdy)\b/.test(normalized) &&
+    /\b(what\s+do\s+i\s+(?:have|hv)|what'?s\s+my\s+schedule|schedule|calendar|anything|events?|busy|free)\b/.test(normalized)
+  ) {
+    return { period: 'today', mode }
   }
 
   if (/\b(schedule|calendar)\b/.test(normalized) && /\b(today|tomorrow|this week|evening)\b/.test(normalized)) {
     if (/\btomorrow\b/.test(normalized)) {
-      return { period: 'tomorrow' }
+      return { period: 'tomorrow', mode }
     }
 
     if (/\bthis\s+week\b/.test(normalized)) {
-      return { period: 'week' }
+      return { period: 'week', mode }
     }
 
     if (/\bevening\b/.test(normalized)) {
-      return { period: 'evening' }
+      return { period: 'evening', mode }
     }
 
-    return { period: 'today' }
+    return { period: 'today', mode }
   }
 
-  return null
+  return { period: 'unsupported', mode: 'clarify' }
+}
+
+export function getCalendarClarificationReply(): string {
+  return CALENDAR_CLARIFICATION_REPLY
 }
 
 function base64UrlEncode(value: string | Buffer): string {

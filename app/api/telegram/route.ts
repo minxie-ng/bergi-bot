@@ -25,6 +25,7 @@ import {
   type CalendarEvent,
   type CalendarQueryIntent,
   detectCalendarQueryIntent,
+  getCalendarClarificationReply,
   getCalendarReadEnvValidationMetadata,
   queryGoogleCalendarEvents,
 } from '@/lib/calendar-read'
@@ -1181,6 +1182,40 @@ function getCalendarQueryDateRange(params: {
     }
   }
 
+  if (params.intent.period === 'today_tomorrow') {
+    return {
+      label: 'today and tomorrow',
+      timeMin: zonedDateTimeToUtcIso(localDate, '00:00', params.timezone),
+      timeMax: zonedDateTimeToUtcIso(addDaysToLocalDate(localDate, 2), '00:00', params.timezone),
+      maxResults: 20,
+    }
+  }
+
+  if (params.intent.period === 'next_weekday') {
+    const weekday = params.intent.weekday
+
+    if (weekday === undefined) {
+      return {
+        label: 'next Monday',
+        timeMin: zonedDateTimeToUtcIso(localDate, '00:00', params.timezone),
+        timeMax: zonedDateTimeToUtcIso(addDaysToLocalDate(localDate, 1), '00:00', params.timezone),
+        maxResults: 10,
+      }
+    }
+
+    const [year, month, day] = localDate.split('-').map(Number)
+    const todayDayOfWeek = new Date(Date.UTC(year, month - 1, day)).getUTCDay()
+    const daysUntilWeekday = (weekday - todayDayOfWeek + 7) % 7 || 7
+    const targetDate = addDaysToLocalDate(localDate, daysUntilWeekday)
+
+    return {
+      label: params.intent.weekdayLabel ?? 'next day',
+      timeMin: zonedDateTimeToUtcIso(targetDate, '00:00', params.timezone),
+      timeMax: zonedDateTimeToUtcIso(addDaysToLocalDate(targetDate, 1), '00:00', params.timezone),
+      maxResults: 10,
+    }
+  }
+
   if (params.intent.period === 'evening') {
     return {
       label: 'this evening',
@@ -1190,17 +1225,17 @@ function getCalendarQueryDateRange(params: {
     }
   }
 
-  if (params.intent.period === 'week') {
+  if (params.intent.period === 'week' || params.intent.period === 'next_week') {
     const [year, month, day] = localDate.split('-').map(Number)
     const dayOfWeek = new Date(Date.UTC(year, month - 1, day)).getUTCDay()
     const daysSinceMonday = (dayOfWeek + 6) % 7
-    const weekStart = addDaysToLocalDate(localDate, -daysSinceMonday)
+    const weekStart = addDaysToLocalDate(localDate, -daysSinceMonday + (params.intent.period === 'next_week' ? 7 : 0))
 
     return {
-      label: 'this week',
+      label: params.intent.period === 'next_week' ? 'next week' : 'this week',
       timeMin: zonedDateTimeToUtcIso(weekStart, '00:00', params.timezone),
       timeMax: zonedDateTimeToUtcIso(addDaysToLocalDate(weekStart, 7), '00:00', params.timezone),
-      maxResults: 20,
+      maxResults: 50,
     }
   }
 
@@ -1210,6 +1245,107 @@ function getCalendarQueryDateRange(params: {
     timeMax: zonedDateTimeToUtcIso(addDaysToLocalDate(localDate, 1), '00:00', params.timezone),
     maxResults: 10,
   }
+}
+
+function getCalendarEventLocalDate(event: CalendarEvent, timezone: string): string {
+  return getLocalDateString(new Date(event.start), timezone)
+}
+
+function formatCalendarBusyDayLabel(localDate: string, timezone: string): string {
+  const date = new Date(zonedDateTimeToUtcIso(localDate, '12:00', timezone))
+
+  return new Intl.DateTimeFormat('en-SG', {
+    timeZone: timezone,
+    weekday: 'short',
+  }).format(date)
+}
+
+function getCalendarEventDurationMs(event: CalendarEvent): number {
+  if (event.isAllDay || event.end === null) {
+    return 0
+  }
+
+  const startMs = Date.parse(event.start)
+  const endMs = Date.parse(event.end)
+
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+    return 0
+  }
+
+  return endMs - startMs
+}
+
+function formatScheduledDuration(durationMs: number): string | null {
+  if (durationMs <= 0) {
+    return null
+  }
+
+  const totalMinutes = Math.round(durationMs / 60000)
+  const hours = Math.floor(totalMinutes / 60)
+  const minutes = totalMinutes % 60
+
+  if (hours === 0) {
+    return `${minutes}m`
+  }
+
+  if (minutes === 0) {
+    return `${hours}h`
+  }
+
+  return `${hours}h ${minutes}m`
+}
+
+function getCalendarBusyJudgment(eventCount: number): 'clear' | 'light' | 'moderate' | 'packed' {
+  if (eventCount === 0) {
+    return 'clear'
+  }
+
+  if (eventCount <= 3) {
+    return 'light'
+  }
+
+  if (eventCount <= 8) {
+    return 'moderate'
+  }
+
+  return 'packed'
+}
+
+function formatCalendarBusyReply(params: {
+  events: CalendarEvent[]
+  timezone: string
+  label: string
+}): string {
+  const { events, timezone, label } = params
+  const judgment = getCalendarBusyJudgment(events.length)
+
+  if (events.length === 0) {
+    return `${label} looks clear.`
+  }
+
+  const dayCounts = new Map<string, number>()
+  let scheduledDurationMs = 0
+
+  for (const event of events) {
+    const eventLocalDate = getCalendarEventLocalDate(event, timezone)
+    dayCounts.set(eventLocalDate, (dayCounts.get(eventLocalDate) ?? 0) + 1)
+    scheduledDurationMs += getCalendarEventDurationMs(event)
+  }
+
+  const busierDayLines = [...dayCounts.entries()]
+    .sort(([dateA, countA], [dateB, countB]) => countB - countA || dateA.localeCompare(dateB))
+    .slice(0, 5)
+    .map(([localDate, count]) => `- ${formatCalendarBusyDayLabel(localDate, timezone)}: ${count}`)
+    .join('\n')
+  const duration = formatScheduledDuration(scheduledDurationMs)
+  const durationLine = duration ? `\n\nabout ${duration} scheduled.` : ''
+
+  return `${label} looks ${judgment === 'moderate' ? 'moderately busy' : judgment} — you have ${events.length} ${
+    events.length === 1 ? 'event' : 'events'
+  }.${durationLine}
+
+busier days:
+${busierDayLines}`
 }
 
 function formatCalendarEventTime(event: CalendarEvent, timezone: string): string {
@@ -1238,7 +1374,7 @@ function formatCalendarQueryReply(params: {
       return 'I don’t see any upcoming calendar events.'
     }
 
-    return `your calendar looks clear ${label}.`
+    return `${label} looks clear.`
   }
 
   if (intent.period === 'next') {
@@ -1264,6 +1400,10 @@ async function resolveCalendarQueryReply(params: {
   chatId: number
   intent: CalendarQueryIntent
 }): Promise<string> {
+  if (params.intent.mode === 'clarify' || params.intent.period === 'unsupported') {
+    return getCalendarClarificationReply()
+  }
+
   const timezone = await getDailyRecapTimezone(params)
   const range = getCalendarQueryDateRange({ intent: params.intent, timezone })
 
@@ -1281,6 +1421,14 @@ async function resolveCalendarQueryReply(params: {
   console.log('calendar_query_success', {
     count: events.length,
   })
+
+  if (params.intent.mode === 'busy') {
+    return formatCalendarBusyReply({
+      events,
+      timezone,
+      label: range.label,
+    })
+  }
 
   return formatCalendarQueryReply({
     events,
@@ -3126,6 +3274,7 @@ Reply naturally as Bergi using the recent conversation context.`
       if (calendarQueryIntent !== null) {
         console.log('calendar_query_detected', {
           period: calendarQueryIntent.period,
+          mode: calendarQueryIntent.mode,
         })
 
         let calendarQueryReply: string
