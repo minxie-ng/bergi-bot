@@ -210,12 +210,36 @@ const FOREIGN_CURRENCY_KEYWORDS = [
 ]
 const FOREIGN_CURRENCY_SYMBOLS = ['€', '£', '¥']
 const SUSPICIOUS_HIGH_AMOUNT = 10000
+const SUSPICIOUS_EVERYDAY_AMOUNT = 100
+const EVERYDAY_EXPENSE_KEYWORDS = [
+  'lunch',
+  'dinner',
+  'breakfast',
+  'chicken rice',
+  'coffee',
+  'milk tea',
+  'kopi',
+  'grab',
+  'mrt',
+  'tea',
+  'food',
+  'drink',
+]
+const EXPENSE_VERB_PATTERN =
+  /\b(spent|spend|paid|pay|bought|buy|renewal|subscription|subscribe|treat|treated)\b/gi
 
 const NOTION_VERSION = '2022-06-28'
 let notionDatabaseSchemaCache: NotionDatabaseSchema | null = null
 
-function normalizeFinanceText(text: string): string {
+function normalizeFinanceInputText(text: string): string {
   return text
+    .replace(/(\d)(?=(?:for|on)\b)/gi, '$1 ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function normalizeFinanceText(text: string): string {
+  return normalizeFinanceInputText(text)
     .toLowerCase()
     .replace(/[’']/g, '')
     .replace(/\s+/g, ' ')
@@ -240,8 +264,15 @@ function hasAmountItemPattern(text: string): boolean {
   )
 }
 
+function hasItemAmountPattern(text: string): boolean {
+  return /^[a-z][a-z0-9\s-]{2,}\s+(?:sgd|s\$|\$)?\s*\d+(?:[.,]\d{1,2})?$/i.test(text)
+}
+
 function extractAmountValues(text: string): number[] {
-  const matches = text.matchAll(/(?:\b(?:sgd|s\$|\$|rmb|cny|yuan|usd|eur|gbp|jpy|aud|myr)\s*)?\b\d+(?:[.,]\d{1,2})?\b/gi)
+  const normalized = normalizeFinanceInputText(text)
+  const matches = normalized.matchAll(
+    /(?:\b(?:sgd|s\$|\$|rmb|cny|yuan|usd|eur|gbp|jpy|aud|myr)\s*)?\b\d+(?:[.,]\d{1,2})?\b/gi
+  )
 
   return Array.from(matches)
     .map((match) => Number(match[0].replace(/[^\d.,]/g, '').replace(/,/g, '')))
@@ -269,6 +300,30 @@ function isFinanceQuery(text: string): boolean {
   return /^(what|how|why|when|where|can|could|should|do|does|did|is|are)\b/i.test(text)
 }
 
+function hasEverydayExpenseKeyword(text: string): boolean {
+  return EVERYDAY_EXPENSE_KEYWORDS.some((keyword) => new RegExp(`\\b${keyword.replace(/\s+/g, '\\s+')}\\b`, 'i').test(text))
+}
+
+function getPrimaryExpenseAmount(text: string): number | null {
+  const amounts = extractAmountValues(text)
+
+  if (amounts.length !== 1) {
+    return null
+  }
+
+  return amounts[0]
+}
+
+function extractFallbackExpenseTitle(text: string): string {
+  return normalizeFinanceInputText(text)
+    .replace(/(?:\b(?:sgd|s\$|\$)\s*)?\b\d+(?:[.,]\d{1,2})?\b/gi, ' ')
+    .replace(/\b(today|yesterday|tonight|this morning|this afternoon|this evening)\b/gi, ' ')
+    .replace(EXPENSE_VERB_PATTERN, ' ')
+    .replace(/^\s*(on|for)\s+/i, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
 export function detectFinanceCandidate(text: string): boolean {
   const normalized = normalizeFinanceText(text)
 
@@ -276,7 +331,12 @@ export function detectFinanceCandidate(text: string): boolean {
     return false
   }
 
-  return hasFinanceKeyword(normalized) || hasAmountItemPattern(normalized)
+  return (
+    hasFinanceKeyword(normalized) ||
+    hasAmountItemPattern(normalized) ||
+    hasItemAmountPattern(normalized) ||
+    hasEverydayExpenseKeyword(normalized)
+  )
 }
 
 export function parseFinanceAmountCorrection(text: string): number | null {
@@ -376,6 +436,10 @@ export function formatFinanceCorrectionForParser(params: {
   return `${params.correctionAmount.toFixed(2)} on ${params.pendingConfirmation.expense}`
 }
 
+export function prepareFinanceTextForParsing(text: string): string {
+  return normalizeFinanceInputText(text)
+}
+
 function cleanJsonResponse(raw: string): string {
   const cleaned = raw
     .trim()
@@ -440,6 +504,44 @@ export function validateParsedExpenseLog(raw: Partial<ParsedExpenseLog>, fallbac
   }
 }
 
+function applyDeterministicAmount(text: string, expenseLog: ParsedExpenseLog): ParsedExpenseLog {
+  const amount = getPrimaryExpenseAmount(text)
+
+  if (amount === null) {
+    return expenseLog
+  }
+
+  return {
+    ...expenseLog,
+    amount,
+  }
+}
+
+function applyDeterministicExpenseFallback(text: string, expenseLog: ParsedExpenseLog): ParsedExpenseLog {
+  const amount = getPrimaryExpenseAmount(text)
+  const fallbackExpense = extractFallbackExpenseTitle(text)
+
+  if (amount === null || fallbackExpense.length === 0 || (expenseLog.is_expense && expenseLog.expense.length > 0)) {
+    return expenseLog
+  }
+
+  return {
+    ...expenseLog,
+    is_expense: true,
+    expense: fallbackExpense,
+    amount,
+    category: expenseLog.category,
+  }
+}
+
+function getSuspiciousAmountCorrectionSuggestion(amount: number): string {
+  if (Number.isInteger(amount) && amount >= 10000) {
+    return (Math.floor(amount / 100) / 100).toFixed(2)
+  }
+
+  return (amount / 100).toFixed(2)
+}
+
 export function isValidExpenseLog(expenseLog: ParsedExpenseLog): boolean {
   return (
     expenseLog.is_expense === true &&
@@ -480,11 +582,14 @@ export function validateExpenseLogForNotion(text: string, expenseLog: ParsedExpe
     }
   }
 
-  if (expenseLog.amount >= SUSPICIOUS_HIGH_AMOUNT) {
+  if (
+    expenseLog.amount >= SUSPICIOUS_HIGH_AMOUNT ||
+    (expenseLog.amount >= SUSPICIOUS_EVERYDAY_AMOUNT && hasEverydayExpenseKeyword(normalized))
+  ) {
     return {
       ok: false,
       reason: 'suspicious_high_amount',
-      reply: `${expenseLog.amount.toFixed(0)} on ${expenseLog.expense} sounds unusually high — did you mean ${(expenseLog.amount / 100).toFixed(2)} or should I really log ${expenseLog.amount.toFixed(0)}?`,
+      reply: `${expenseLog.amount.toFixed(0)} on ${expenseLog.expense} sounds unusually high — did you mean ${getSuspiciousAmountCorrectionSuggestion(expenseLog.amount)} or should I really log ${expenseLog.amount.toFixed(0)}?`,
       logEvent: 'finance_ambiguous',
     }
   }
@@ -803,6 +908,7 @@ function buildNotionExpenseProperties(
 
 export async function parseExpenseLogWithLLM(params: CallFinanceParserParams): Promise<ParsedExpenseLog> {
   const allowedCategories = FINANCE_CATEGORIES.join(', ')
+  const textForParsing = prepareFinanceTextForParsing(params.text)
   const raw = await params.callLLM({
     systemPrompt: `You parse short Telegram finance logs for Bergi.
 
@@ -824,6 +930,8 @@ Rules:
 - Allowed categories: ${allowedCategories}.
 - Use exactly one allowed category name.
 - Use "Others" if unsure.
+- Interpret plain integers as their actual amount, never as cents. For example 10 is 10.00, 1000 is 1000.00, and 99999 is 99999.00.
+- The user may write amount-first expenses like "10 for lunch", "10 lunch", or "12.90 uniqlo socks".
 - Only parse clear SGD expense logs. Do not auto-convert or assume foreign currency is SGD.
 - Do not merge multiple expenses into one row. If the message has multiple expenses, return is_expense false.
 - Do not treat debts, loans, transfers, reimbursements, savings, budgets, income, or salary as expenses.
@@ -833,13 +941,16 @@ Rules:
     chatMessages: [
       {
         role: 'user',
-        content: params.text,
+        content: textForParsing,
       },
     ],
     maxCompletionTokens: 120,
   })
 
-  return validateParsedExpenseLog(parseExpenseJson(raw), params.localDate)
+  return applyDeterministicExpenseFallback(
+    textForParsing,
+    applyDeterministicAmount(textForParsing, validateParsedExpenseLog(parseExpenseJson(raw), params.localDate))
+  )
 }
 
 export async function createNotionExpenseLog(input: CreateNotionExpenseLogInput): Promise<void> {
