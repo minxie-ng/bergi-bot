@@ -24,9 +24,12 @@ import {
   classifyFinanceIntent,
   createNotionExpenseLog,
   detectFinanceCandidate,
+  formatFinanceCorrectionForParser,
   formatExpenseLoggedReply,
   NotionExpenseLogError,
+  parseFinanceAmountCorrection,
   parseExpenseLogWithLLM,
+  parsePendingSuspiciousExpenseConfirmation,
   validateExpenseLogForNotion,
 } from '@/lib/finance-logging'
 import { generateDailyProactiveCheckins, getOrCreateProactivePreferences } from '@/lib/proactive-checkins'
@@ -1410,6 +1413,37 @@ async function saveMessage(params: SaveMessageParams): Promise<string> {
   return String(data.id)
 }
 
+async function getLatestPendingFinanceConfirmation(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+}) {
+  const { supabase, userId } = params
+  const sinceIso = new Date(Date.now() - 30 * 60 * 1000).toISOString()
+  const { data, error } = await supabase
+    .from('messages')
+    .select('content')
+    .eq('user_id', userId)
+    .eq('platform', 'telegram')
+    .eq('role', 'assistant')
+    .gte('created_at', sinceIso)
+    .order('created_at', { ascending: false })
+    .limit(1)
+
+  if (error) {
+    throw error
+  }
+
+  const latestMessage = data?.[0]
+  const content = typeof latestMessage?.content === 'string' ? latestMessage.content : ''
+  const pendingConfirmation = parsePendingSuspiciousExpenseConfirmation(content)
+
+  if (pendingConfirmation) {
+    return pendingConfirmation
+  }
+
+  return null
+}
+
 function hasExplicitTimezoneOffset(value: string): boolean {
   return /(?:Z|[+-]\d{2}:\d{2})$/i.test(value)
 }
@@ -2775,6 +2809,133 @@ Reply naturally as Bergi using the recent conversation context.`
           }
 
           await saveMessage({ supabase, userId, role: 'assistant', content: clarifyingQuestion })
+          return new Response('OK', { status: 200 })
+        }
+      }
+    }
+
+    if (isPlainTextMessage) {
+      const correctionAmount = parseFinanceAmountCorrection(userText)
+
+      if (correctionAmount !== null) {
+        const pendingFinanceConfirmation = await getLatestPendingFinanceConfirmation({ supabase, userId })
+
+        if (pendingFinanceConfirmation !== null) {
+          logFinanceInfo('finance_confirmation_detected', {
+            hasPendingConfirmation: true,
+          })
+
+          const correctionText = formatFinanceCorrectionForParser({
+            correctionAmount,
+            pendingConfirmation: pendingFinanceConfirmation,
+          })
+          let expenseLog: Awaited<ReturnType<typeof parseExpenseLogWithLLM>>
+
+          try {
+            expenseLog = await parseExpenseLogWithLLM({
+              text: correctionText,
+              localDate: getLocalDateString(new Date(), 'Asia/Singapore'),
+              callLLM,
+            })
+          } catch (error) {
+            logFinanceError('finance_parse_failed', {
+              flow: 'confirmation',
+              errorName: error instanceof Error ? error.name : 'unknown_error',
+            })
+
+            const financeParseErrorReply = "I couldn't understand that expense clearly enough to log it."
+
+            if (isLocalTestMode) {
+              console.log('Local test finance confirmation parse error reply generated')
+            } else {
+              await sendTelegramMessage(chatId, financeParseErrorReply)
+            }
+
+            await saveMessage({ supabase, userId, role: 'assistant', content: financeParseErrorReply })
+            logFinanceInfo('finance_reply_sent', { outcome: 'confirmation_parse_failed' })
+            return new Response('OK', { status: 200 })
+          }
+
+          const financeValidation = validateExpenseLogForNotion(correctionText, expenseLog)
+
+          if (!financeValidation.ok) {
+            logFinanceInfo(financeValidation.logEvent, {
+              flow: 'confirmation',
+              reason: financeValidation.reason,
+              isExpense: expenseLog.is_expense,
+              hasExpenseTitle: expenseLog.expense.length > 0,
+              hasPositiveAmount: Number.isFinite(expenseLog.amount) && expenseLog.amount > 0,
+            })
+
+            if (isLocalTestMode) {
+              console.log('Local test finance confirmation validation reply generated')
+            } else {
+              await sendTelegramMessage(chatId, financeValidation.reply)
+            }
+
+            await saveMessage({ supabase, userId, role: 'assistant', content: financeValidation.reply })
+            logFinanceInfo('finance_reply_sent', { outcome: financeValidation.reason })
+            return new Response('OK', { status: 200 })
+          }
+
+          const notionStartedAt = Date.now()
+          logFinanceInfo('finance_confirmation_create_started')
+
+          try {
+            await createNotionExpenseLog({
+              expense: expenseLog.expense,
+              date: expenseLog.date,
+              amount: expenseLog.amount,
+              category: expenseLog.category,
+              comment: expenseLog.comment,
+            })
+            logFinanceInfo('finance_confirmation_create_success', {
+              durationMs: Date.now() - notionStartedAt,
+            })
+          } catch (error) {
+            const notionError =
+              error instanceof NotionExpenseLogError
+                ? error
+                : new NotionExpenseLogError({ category: 'notion_unknown_error' })
+
+            logFinanceError('finance_confirmation_create_failed', {
+              durationMs: Date.now() - notionStartedAt,
+              status: notionError.status,
+              notionCode: notionError.notionCode,
+              category: notionError.category,
+            })
+
+            const financeToolErrorReply =
+              notionError.category === 'notion_schema_mismatch'
+                ? 'I found the expense, but my Notion database fields don’t match what I expected yet.'
+                : 'I found the expense, but I couldn’t save it to Notion right now.'
+
+            if (isLocalTestMode) {
+              console.log('Local test finance confirmation tool error reply generated')
+            } else {
+              await sendTelegramMessage(chatId, financeToolErrorReply)
+            }
+
+            await saveMessage({ supabase, userId, role: 'assistant', content: financeToolErrorReply })
+            logFinanceInfo('finance_reply_sent', { outcome: 'confirmation_notion_failed' })
+            return new Response('OK', { status: 200 })
+          }
+
+          const financeReply = formatExpenseLoggedReply(expenseLog)
+
+          if (isLocalTestMode) {
+            console.log('Local test finance confirmation reply generated')
+          } else {
+            await sendTelegramMessage(chatId, financeReply)
+          }
+
+          try {
+            await saveMessage({ supabase, userId, role: 'assistant', content: financeReply })
+          } catch (error) {
+            console.error('Failed to save finance confirmation assistant reply:', error)
+          }
+
+          logFinanceInfo('finance_reply_sent', { outcome: 'confirmation_logged' })
           return new Response('OK', { status: 200 })
         }
       }

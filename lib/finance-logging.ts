@@ -55,6 +55,11 @@ export type FinanceValidationResult =
       logEvent: 'finance_validation_failed' | 'finance_ambiguous'
     }
 
+export type PendingSuspiciousExpenseConfirmation = {
+  expense: string
+  originalAmount: number
+}
+
 type CallFinanceParserParams = {
   text: string
   localDate: string
@@ -274,6 +279,19 @@ export function detectFinanceCandidate(text: string): boolean {
   return hasFinanceKeyword(normalized) || hasAmountItemPattern(normalized)
 }
 
+export function parseFinanceAmountCorrection(text: string): number | null {
+  const normalized = normalizeFinanceText(text)
+  const match = normalized.match(/^(?:sgd|s\$|\$)?\s*(\d+(?:[.,]\d{1,2})?)$/i)
+
+  if (!match) {
+    return null
+  }
+
+  const amount = Number(match[1].replace(',', '.'))
+
+  return Number.isFinite(amount) && amount > 0 ? amount : null
+}
+
 export function classifyFinanceIntent(text: string): FinanceIntentClassification {
   const normalized = normalizeFinanceText(text)
 
@@ -327,6 +345,35 @@ export function classifyFinanceIntent(text: string): FinanceIntentClassification
   return {
     intent: 'expense_log',
   }
+}
+
+export function parsePendingSuspiciousExpenseConfirmation(
+  content: string
+): PendingSuspiciousExpenseConfirmation | null {
+  const match = content.match(/^(\d+(?:\.\d{1,2})?) on (.+?) sounds unusually high\b/i)
+
+  if (!match) {
+    return null
+  }
+
+  const originalAmount = Number(match[1])
+  const expense = match[2].trim()
+
+  if (!Number.isFinite(originalAmount) || originalAmount <= 0 || expense.length === 0) {
+    return null
+  }
+
+  return {
+    expense,
+    originalAmount,
+  }
+}
+
+export function formatFinanceCorrectionForParser(params: {
+  correctionAmount: number
+  pendingConfirmation: PendingSuspiciousExpenseConfirmation
+}): string {
+  return `${params.correctionAmount.toFixed(2)} on ${params.pendingConfirmation.expense}`
 }
 
 function cleanJsonResponse(raw: string): string {
