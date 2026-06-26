@@ -374,8 +374,31 @@ function normalizeFinanceText(text: string): string {
     .trim()
 }
 
+function stripTimeExpressions(text: string): string {
+  return text
+    .replace(/\b(?:at\s*)?(?:[01]?\d|2[0-3])(?:(?::|\.)[0-5]\d)?\s*(?:am|pm)\b/gi, ' ')
+    .replace(/\b(?:[01]?\d|2[0-3])(?::|\.)[0-5]\d\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function isClearCalendarSchedulingRequest(text: string): boolean {
+  const normalized = normalizeFinanceText(text)
+  const hasCalendarVerb =
+    /\b(add|schedule|block)\b/.test(normalized) ||
+    /\bcreate\s+(?:calendar\s+)?event\b/.test(normalized) ||
+    /\bput\b.*\bcalendar\b/.test(normalized)
+  const hasDateOrCalendarWord =
+    /\b(calendar|event|today|tdy|tomorrow|tmr|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b/.test(
+      normalized
+    )
+  const hasTime = /\b(?:at\s*)?(?:[01]?\d|2[0-3])(?:(?::|\.)[0-5]\d)?\s*(?:am|pm)\b/.test(normalized)
+
+  return hasCalendarVerb && (hasDateOrCalendarWord || hasTime)
+}
+
 function hasAmount(text: string): boolean {
-  return /(?:\b(?:sgd|s\$|\$)\s*)?\b\d+(?:[.,]\d{1,2})?\b/.test(text)
+  return /(?:\b(?:sgd|s\$|\$)\s*)?\b\d+(?:[.,]\d{1,2})?\b/.test(stripTimeExpressions(text))
 }
 
 function hasFinanceKeyword(text: string): boolean {
@@ -387,17 +410,19 @@ function hasAnyKeyword(text: string, keywords: string[]): boolean {
 }
 
 function hasAmountItemPattern(text: string): boolean {
+  const withoutTimes = stripTimeExpressions(text)
+
   return /^(?:(?:today|yesterday|tonight|this morning|this afternoon|this evening)\s+)?(?:sgd|s\$|\$)?\s*\d+(?:[.,]\d{1,2})?\s+[a-z][a-z0-9\s-]{2,}$/i.test(
-    text
+    withoutTimes
   )
 }
 
 function hasItemAmountPattern(text: string): boolean {
-  return /^[a-z][a-z0-9\s-]{2,}\s+(?:sgd|s\$|\$)?\s*\d+(?:[.,]\d{1,2})?$/i.test(text)
+  return /^[a-z][a-z0-9\s-]{2,}\s+(?:sgd|s\$|\$)?\s*\d+(?:[.,]\d{1,2})?$/i.test(stripTimeExpressions(text))
 }
 
 function extractAmountValues(text: string): number[] {
-  const normalized = normalizeFinanceInputText(text)
+  const normalized = stripTimeExpressions(normalizeFinanceInputText(text))
   const matches = normalized.matchAll(
     /(?:\b(?:sgd|s\$|\$|rmb|cny|yuan|usd|eur|gbp|jpy|aud|myr)\s*)?\b\d+(?:[.,]\d{1,2})?\b/gi
   )
@@ -485,7 +510,7 @@ function getPrimaryExpenseAmount(text: string): number | null {
 }
 
 function extractFallbackExpenseTitle(text: string): string {
-  return normalizeFinanceInputText(text)
+  return stripTimeExpressions(normalizeFinanceInputText(text))
     .replace(/(?:\b(?:sgd|s\$|\$)\s*)?\b\d+(?:[.,]\d{1,2})?\b/gi, ' ')
     .replace(/\b(dollars?|bucks?|sgd)\b/gi, ' ')
     .replace(/\b(i|i'm|im|me|my)\b/gi, ' ')
@@ -498,6 +523,10 @@ function extractFallbackExpenseTitle(text: string): string {
 
 export function detectFinanceCandidate(text: string): boolean {
   const normalized = normalizeFinanceText(text)
+
+  if (isClearCalendarSchedulingRequest(normalized)) {
+    return false
+  }
 
   if (!hasAmount(normalized)) {
     return false
