@@ -26,6 +26,35 @@ export type ParsedExpenseLog = {
   comment: string | null
 }
 
+export type FinanceIntent = 'expense_log' | 'budget_note' | 'transfer_or_debt' | 'income' | 'query' | 'ambiguous'
+
+export type FinanceIntentClassification = {
+  intent: FinanceIntent
+  reason?: FinanceBlockReason
+  reply?: string
+}
+
+export type FinanceBlockReason =
+  | 'budget_note'
+  | 'transfer_or_debt'
+  | 'income'
+  | 'query'
+  | 'foreign_currency'
+  | 'multiple_expenses'
+  | 'suspicious_high_amount'
+  | 'invalid_expense'
+
+export type FinanceValidationResult =
+  | {
+      ok: true
+    }
+  | {
+      ok: false
+      reason: FinanceBlockReason
+      reply: string
+      logEvent: 'finance_validation_failed' | 'finance_ambiguous'
+    }
+
 type CallFinanceParserParams = {
   text: string
   localDate: string
@@ -116,12 +145,66 @@ const FINANCE_KEYWORDS = [
   'savings',
   'saving',
   'save',
+  'budget',
+  'owe',
+  'owed',
+  'lend',
+  'lent',
+  'borrow',
+  'borrowed',
+  'transfer',
+  'transferred',
+  'received',
+  'income',
+  'salary',
+  'reimburse',
+  'claim',
   'lt',
   'deposit',
-  'transfer',
   'top up',
   'topup',
 ]
+
+const BUDGET_KEYWORDS = ['budget']
+const INCOME_KEYWORDS = ['received', 'income', 'salary', 'paid me back']
+const TRANSFER_OR_DEBT_KEYWORDS = [
+  'owe',
+  'owed',
+  'lend',
+  'lent',
+  'borrow',
+  'borrowed',
+  'transfer',
+  'transferred',
+  'savings',
+  'saving',
+  'save',
+  'deposit',
+  'top up',
+  'topup',
+  'reimburse',
+  'claim',
+]
+const FOREIGN_CURRENCY_KEYWORDS = [
+  'rmb',
+  'cny',
+  'yuan',
+  'usd',
+  'eur',
+  'gbp',
+  'jpy',
+  'aud',
+  'myr',
+  'thb',
+  'idr',
+  'krw',
+  'hkd',
+  'twd',
+  'php',
+  'vnd',
+]
+const FOREIGN_CURRENCY_SYMBOLS = ['€', '£', '¥']
+const SUSPICIOUS_HIGH_AMOUNT = 10000
 
 const NOTION_VERSION = '2022-06-28'
 let notionDatabaseSchemaCache: NotionDatabaseSchema | null = null
@@ -142,10 +225,43 @@ function hasFinanceKeyword(text: string): boolean {
   return FINANCE_KEYWORDS.some((keyword) => new RegExp(`\\b${keyword.replace(/\s+/g, '\\s+')}\\b`, 'i').test(text))
 }
 
+function hasAnyKeyword(text: string, keywords: string[]): boolean {
+  return keywords.some((keyword) => new RegExp(`\\b${keyword.replace(/\s+/g, '\\s+')}\\b`, 'i').test(text))
+}
+
 function hasAmountItemPattern(text: string): boolean {
   return /^(?:(?:today|yesterday|tonight|this morning|this afternoon|this evening)\s+)?(?:sgd|s\$|\$)?\s*\d+(?:[.,]\d{1,2})?\s+[a-z][a-z0-9\s-]{2,}$/i.test(
     text
   )
+}
+
+function extractAmountValues(text: string): number[] {
+  const matches = text.matchAll(/(?:\b(?:sgd|s\$|\$|rmb|cny|yuan|usd|eur|gbp|jpy|aud|myr)\s*)?\b\d+(?:[.,]\d{1,2})?\b/gi)
+
+  return Array.from(matches)
+    .map((match) => Number(match[0].replace(/[^\d.,]/g, '').replace(/,/g, '')))
+    .filter((amount) => Number.isFinite(amount))
+}
+
+function hasForeignCurrency(text: string): boolean {
+  return (
+    hasAnyKeyword(text, FOREIGN_CURRENCY_KEYWORDS) ||
+    FOREIGN_CURRENCY_SYMBOLS.some((symbol) => text.includes(symbol))
+  )
+}
+
+function hasMultipleExpensePattern(text: string): boolean {
+  const amounts = extractAmountValues(text)
+
+  if (amounts.length < 2) {
+    return false
+  }
+
+  return /\b(and|plus|also|,\s*)\b/i.test(text) || /,\s*/.test(text)
+}
+
+function isFinanceQuery(text: string): boolean {
+  return /^(what|how|why|when|where|can|could|should|do|does|did|is|are)\b/i.test(text)
 }
 
 export function detectFinanceCandidate(text: string): boolean {
@@ -156,6 +272,61 @@ export function detectFinanceCandidate(text: string): boolean {
   }
 
   return hasFinanceKeyword(normalized) || hasAmountItemPattern(normalized)
+}
+
+export function classifyFinanceIntent(text: string): FinanceIntentClassification {
+  const normalized = normalizeFinanceText(text)
+
+  if (hasAnyKeyword(normalized, BUDGET_KEYWORDS)) {
+    return {
+      intent: 'budget_note',
+      reason: 'budget_note',
+      reply: 'I’m not tracking budgets yet, but I can log actual expenses.',
+    }
+  }
+
+  if (hasAnyKeyword(normalized, INCOME_KEYWORDS)) {
+    return {
+      intent: 'income',
+      reason: 'income',
+      reply: 'That looks like income, not an expense. I’m only logging expenses for now.',
+    }
+  }
+
+  if (hasAnyKeyword(normalized, TRANSFER_OR_DEBT_KEYWORDS)) {
+    return {
+      intent: 'transfer_or_debt',
+      reason: 'transfer_or_debt',
+      reply: 'That sounds like money owed, moved, or saved — I’m only logging actual expenses for now.',
+    }
+  }
+
+  if (hasForeignCurrency(normalized)) {
+    return {
+      intent: 'ambiguous',
+      reason: 'foreign_currency',
+      reply: 'I only support SGD expense logging for now, so I won’t log that automatically.',
+    }
+  }
+
+  if (hasMultipleExpensePattern(normalized)) {
+    return {
+      intent: 'ambiguous',
+      reason: 'multiple_expenses',
+      reply: 'I found multiple expenses there — send them one by one for now and I’ll log each properly.',
+    }
+  }
+
+  if (isFinanceQuery(normalized)) {
+    return {
+      intent: 'query',
+      reason: 'query',
+    }
+  }
+
+  return {
+    intent: 'expense_log',
+  }
 }
 
 function cleanJsonResponse(raw: string): string {
@@ -230,6 +401,50 @@ export function isValidExpenseLog(expenseLog: ParsedExpenseLog): boolean {
     expenseLog.amount > 0 &&
     isValidDateString(expenseLog.date)
   )
+}
+
+export function validateExpenseLogForNotion(text: string, expenseLog: ParsedExpenseLog): FinanceValidationResult {
+  const normalized = normalizeFinanceText(text)
+
+  if (!isValidExpenseLog(expenseLog)) {
+    return {
+      ok: false,
+      reason: 'invalid_expense',
+      reply: "I couldn't find a valid amount to log.",
+      logEvent: 'finance_validation_failed',
+    }
+  }
+
+  if (hasForeignCurrency(normalized)) {
+    return {
+      ok: false,
+      reason: 'foreign_currency',
+      reply: 'I only support SGD expense logging for now, so I won’t log that automatically.',
+      logEvent: 'finance_ambiguous',
+    }
+  }
+
+  if (hasMultipleExpensePattern(normalized)) {
+    return {
+      ok: false,
+      reason: 'multiple_expenses',
+      reply: 'I found multiple expenses there — send them one by one for now and I’ll log each properly.',
+      logEvent: 'finance_ambiguous',
+    }
+  }
+
+  if (expenseLog.amount >= SUSPICIOUS_HIGH_AMOUNT) {
+    return {
+      ok: false,
+      reason: 'suspicious_high_amount',
+      reply: `${expenseLog.amount.toFixed(0)} on ${expenseLog.expense} sounds unusually high — did you mean ${(expenseLog.amount / 100).toFixed(2)} or should I really log ${expenseLog.amount.toFixed(0)}?`,
+      logEvent: 'finance_ambiguous',
+    }
+  }
+
+  return {
+    ok: true,
+  }
 }
 
 function isAbortError(error: unknown): boolean {
@@ -562,8 +777,10 @@ Rules:
 - Allowed categories: ${allowedCategories}.
 - Use exactly one allowed category name.
 - Use "Others" if unsure.
-- Treat "savings with lt 50" and "put 100 into lt savings" as category "LT Savings".
-- If the message is not a finance log, return is_expense false with amount 0, expense "", category "Others".
+- Only parse clear SGD expense logs. Do not auto-convert or assume foreign currency is SGD.
+- Do not merge multiple expenses into one row. If the message has multiple expenses, return is_expense false.
+- Do not treat debts, loans, transfers, reimbursements, savings, budgets, income, or salary as expenses.
+- If the message is not a clear expense log, return is_expense false with amount 0, expense "", category "Others".
 - If there is no valid amount, return is_expense false with amount 0.
 - Do not add markdown or commentary.`,
     chatMessages: [
