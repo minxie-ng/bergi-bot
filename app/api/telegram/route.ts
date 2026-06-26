@@ -172,6 +172,13 @@ type AwaitingReminderRow = {
   reminder_text: string
 }
 
+type PendingReminderTimeRow = {
+  id: string
+  event_time: string
+  timezone: string
+  reminder_text: string
+}
+
 type ManagedReminderRow = {
   id: string
   reminder_text: string
@@ -1499,6 +1506,10 @@ function isCalendarCreateCancellation(text: string): boolean {
   return /^(no|nah|cancel|cancel it|don't add it|dont add it|stop|change|not now)$/i.test(text.trim())
 }
 
+function isCalendarDraftEditRequest(text: string): boolean {
+  return /^(change|move|update|make)(?:\s+it)?\s+to\b/i.test(text.trim())
+}
+
 function getWeekdayIndexFromText(value: string): 0 | 1 | 2 | 3 | 4 | 5 | 6 | null {
   if (/^sun/.test(value)) return 0
   if (/^mon/.test(value)) return 1
@@ -1528,12 +1539,35 @@ function parseCalendarCreateLocalDate(params: {
 
   const weekdayMatch = normalized.match(/\b(this|next)\s+(mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b/)
 
-  if (!weekdayMatch) {
+  if (weekdayMatch) {
+    const relation = weekdayMatch[1]
+    const weekday = getWeekdayIndexFromText(weekdayMatch[2])
+
+    if (weekday === null) {
+      return null
+    }
+
+    const [year, month, day] = today.split('-').map(Number)
+    const todayDayOfWeek = new Date(Date.UTC(year, month - 1, day)).getUTCDay()
+    let daysUntil = (weekday - todayDayOfWeek + 7) % 7
+
+    if (relation === 'next' && daysUntil === 0) {
+      daysUntil = 7
+    }
+
+    return {
+      localDate: addDaysToLocalDate(today, daysUntil),
+      period: `${relation} ${weekdayMatch[2]}`,
+    }
+  }
+
+  const bareWeekdayMatch = normalized.match(/\b(mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b/)
+
+  if (!bareWeekdayMatch) {
     return null
   }
 
-  const relation = weekdayMatch[1]
-  const weekday = getWeekdayIndexFromText(weekdayMatch[2])
+  const weekday = getWeekdayIndexFromText(bareWeekdayMatch[1])
 
   if (weekday === null) {
     return null
@@ -1543,13 +1577,13 @@ function parseCalendarCreateLocalDate(params: {
   const todayDayOfWeek = new Date(Date.UTC(year, month - 1, day)).getUTCDay()
   let daysUntil = (weekday - todayDayOfWeek + 7) % 7
 
-  if (relation === 'next' && daysUntil === 0) {
+  if (daysUntil === 0) {
     daysUntil = 7
   }
 
   return {
     localDate: addDaysToLocalDate(today, daysUntil),
-    period: `${relation} ${weekdayMatch[2]}`,
+    period: bareWeekdayMatch[1],
   }
 }
 
@@ -1607,6 +1641,63 @@ function parseCalendarCreateStartTime(text: string): string | null {
   return null
 }
 
+function resolveTimeParts(hourText: string, minuteText: string | undefined, meridiem?: string): string | null {
+  const hour = Number(hourText)
+  const minute = minuteText ? Number(minuteText) : 0
+
+  if (Number.isNaN(hour) || Number.isNaN(minute) || minute < 0 || minute > 59) {
+    return null
+  }
+
+  if (meridiem === 'pm' && hour >= 1 && hour <= 11) {
+    return `${String(hour + 12).padStart(2, '0')}:${String(minute).padStart(2, '0')}`
+  }
+
+  if (meridiem === 'am' && hour === 12) {
+    return `00:${String(minute).padStart(2, '0')}`
+  }
+
+  if (hour < 0 || hour > 23) {
+    return null
+  }
+
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`
+}
+
+function parseCalendarCreateTimeRange(text: string): { startTime: string; endTime: string; durationMinutes: number } | null {
+  const normalized = text.toLowerCase().replace(/[–—]/g, '-')
+  const rangeMatch = normalized.match(
+    /\b([01]?\d|2[0-3])(?::([0-5]\d))?\s*(am|pm)?\s*-\s*([01]?\d|2[0-3])(?::([0-5]\d))?\s*(am|pm)?\b/
+  )
+
+  if (!rangeMatch) {
+    return null
+  }
+
+  const inferredStartMeridiem = rangeMatch[3] ?? rangeMatch[6]
+  const startTime = resolveTimeParts(rangeMatch[1], rangeMatch[2], inferredStartMeridiem)
+  const endTime = resolveTimeParts(rangeMatch[4], rangeMatch[5], rangeMatch[6] ?? rangeMatch[3])
+
+  if (!startTime || !endTime) {
+    return null
+  }
+
+  const [startHour, startMinute] = startTime.split(':').map(Number)
+  const [endHour, endMinute] = endTime.split(':').map(Number)
+  const startTotal = startHour * 60 + startMinute
+  let endTotal = endHour * 60 + endMinute
+
+  if (endTotal <= startTotal) {
+    endTotal += 24 * 60
+  }
+
+  return {
+    startTime,
+    endTime,
+    durationMinutes: endTotal - startTotal,
+  }
+}
+
 function addMinutesToIso(iso: string, minutes: number): string {
   return new Date(Date.parse(iso) + minutes * 60 * 1000).toISOString()
 }
@@ -1650,7 +1741,8 @@ function parseCalendarCreateIntent(params: {
     }
   }
 
-  const startTime = parseCalendarCreateStartTime(params.text)
+  const timeRange = parseCalendarCreateTimeRange(params.text)
+  const startTime = timeRange?.startTime ?? parseCalendarCreateStartTime(params.text)
   const title = extractCalendarCreateTitle(params.text)
 
   if (!startTime) {
@@ -1660,7 +1752,7 @@ function parseCalendarCreateIntent(params: {
     }
   }
 
-  const durationMinutes = parseCalendarCreateDurationMinutes(params.text)
+  const durationMinutes = timeRange?.durationMinutes ?? parseCalendarCreateDurationMinutes(params.text)
   const startAt = zonedDateTimeToUtcIso(date.localDate, startTime, params.timezone)
 
   return {
@@ -1668,7 +1760,9 @@ function parseCalendarCreateIntent(params: {
     draft: {
       title,
       startAt,
-      endAt: addMinutesToIso(startAt, durationMinutes),
+      endAt: timeRange
+        ? zonedDateTimeToUtcIso(date.localDate, timeRange.endTime, params.timezone)
+        : addMinutesToIso(startAt, durationMinutes),
       timezone: params.timezone,
       description: null,
       datePeriod: date.period,
@@ -1788,6 +1882,46 @@ async function updatePendingCalendarEventStatus(params: {
   }
 }
 
+async function updatePendingCalendarEventDraft(params: {
+  supabase: ReturnType<typeof getSupabase>
+  id: string
+  startAt: string
+  endAt: string
+  timezone: string
+}): Promise<void> {
+  const { error } = await params.supabase
+    .from('pending_calendar_events')
+    .update({
+      start_at: params.startAt,
+      end_at: params.endAt,
+      timezone: params.timezone,
+      status: 'pending',
+      expires_at: new Date(Date.now() + 20 * 60 * 1000).toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', params.id)
+    .eq('status', 'pending')
+
+  if (error) {
+    throw error
+  }
+}
+
+function formatCalendarDraftChangedReply(draft: PendingCalendarEventRow): string {
+  const changedTime = formatCalendarDraftTimeRange({
+    startAt: draft.start_at,
+    endAt: draft.end_at,
+    timezone: draft.timezone,
+  })
+
+  return `Changed to ${changedTime}.
+
+${draft.title}
+${changedTime}
+
+Confirm?`
+}
+
 async function resolveCalendarCreateRequestReply(params: {
   supabase: ReturnType<typeof getSupabase>
   userId: string
@@ -1820,6 +1954,64 @@ async function resolveCalendarCreateRequestReply(params: {
   })
 
   return formatCalendarCreateDraftReply(intent.draft)
+}
+
+async function resolveCalendarCreateEditReply(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+  text: string
+}): Promise<string | null> {
+  if (!isCalendarDraftEditRequest(params.text)) {
+    return null
+  }
+
+  const pendingCalendarEvent = await getLatestPendingCalendarEvent(params)
+
+  if (!pendingCalendarEvent) {
+    return null
+  }
+
+  const date =
+    parseCalendarCreateLocalDate({ text: params.text, timezone: pendingCalendarEvent.timezone }) ??
+    {
+      localDate: getLocalDateString(new Date(pendingCalendarEvent.start_at), pendingCalendarEvent.timezone),
+      period: 'existing date',
+    }
+  const timeRange = parseCalendarCreateTimeRange(params.text)
+  const startTime = timeRange?.startTime ?? parseCalendarCreateStartTime(params.text)
+
+  if (!startTime) {
+    return 'what time should I move it to?'
+  }
+
+  const existingDurationMinutes = Math.max(
+    15,
+    Math.round((Date.parse(pendingCalendarEvent.end_at) - Date.parse(pendingCalendarEvent.start_at)) / 60000)
+  )
+  const startAt = zonedDateTimeToUtcIso(date.localDate, startTime, pendingCalendarEvent.timezone)
+  const endAt = timeRange
+    ? zonedDateTimeToUtcIso(date.localDate, timeRange.endTime, pendingCalendarEvent.timezone)
+    : addMinutesToIso(startAt, existingDurationMinutes)
+
+  await updatePendingCalendarEventDraft({
+    supabase: params.supabase,
+    id: pendingCalendarEvent.id,
+    startAt,
+    endAt,
+    timezone: pendingCalendarEvent.timezone,
+  })
+
+  console.log('calendar_create_draft_updated', {
+    datePeriod: date.period,
+    durationMinutes: timeRange?.durationMinutes ?? existingDurationMinutes,
+  })
+
+  return formatCalendarDraftChangedReply({
+    ...pendingCalendarEvent,
+    start_at: startAt,
+    end_at: endAt,
+  })
 }
 
 async function resolveCalendarCreateConfirmationReply(params: {
@@ -2995,6 +3187,211 @@ async function saveReminder(params: SaveReminderParams): Promise<void> {
   }
 }
 
+function parsePendingReminderDate(params: { text: string; timezone: string }): string | null {
+  const date = parseCalendarCreateLocalDate({ text: params.text, timezone: params.timezone })
+
+  return date?.localDate ?? null
+}
+
+function extractPendingReminderText(text: string): string {
+  const reminderText = text
+    .replace(/[’']/g, "'")
+    .replace(/\b(remind me|reminder|let me know|tell me)\b/gi, ' ')
+    .replace(/\b(today|tdy|tomorrow|tmr|tonight|this\s+(?:mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)|next\s+(?:mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?))\b/gi, ' ')
+    .replace(/\b(?:at\s*)?(?:[01]?\d|2[0-3])(?::[0-5]\d|\.[0-5]\d)?\s*(?:am|pm)?\b/gi, ' ')
+    .replace(/\b(to|about|for|on|at)\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  return reminderText || 'that'
+}
+
+async function savePendingReminderTimeClarification(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+  text: string
+  timezone: string
+  sourceMessageContent: string
+}): Promise<boolean> {
+  const localDate = parsePendingReminderDate({ text: params.text, timezone: params.timezone })
+
+  if (!localDate) {
+    return false
+  }
+
+  const reminderText = extractPendingReminderText(params.text)
+  const placeholderAt = zonedDateTimeToUtcIso(localDate, '00:00', params.timezone)
+  const nowIso = new Date().toISOString()
+
+  const { error: supersedeError } = await params.supabase
+    .from('reminders')
+    .update({ status: 'cancelled', updated_at: nowIso })
+    .eq('user_id', params.userId)
+    .eq('platform', 'telegram')
+    .eq('telegram_chat_id', params.chatId)
+    .eq('status', 'awaiting_reminder_time')
+
+  if (supersedeError) {
+    throw supersedeError
+  }
+
+  const { error } = await params.supabase.from('reminders').insert({
+    user_id: params.userId,
+    platform: 'telegram',
+    telegram_chat_id: params.chatId,
+    reminder_text: reminderText,
+    event_time: placeholderAt,
+    remind_at: placeholderAt,
+    timezone: params.timezone,
+    status: 'awaiting_reminder_time',
+    source_message_content: params.sourceMessageContent,
+  })
+
+  if (error) {
+    throw error
+  }
+
+  console.log('pending_reminder_created')
+  return true
+}
+
+async function getLatestPendingReminderTime(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+}): Promise<PendingReminderTimeRow | null> {
+  const sinceIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+  const { data, error } = await params.supabase
+    .from('reminders')
+    .select('id, event_time, timezone, reminder_text')
+    .eq('user_id', params.userId)
+    .eq('platform', 'telegram')
+    .eq('telegram_chat_id', params.chatId)
+    .eq('status', 'awaiting_reminder_time')
+    .gte('created_at', sinceIso)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+
+  if (error) {
+    throw error
+  }
+
+  return data as PendingReminderTimeRow | null
+}
+
+function parseReminderTimeOnly(text: string): string | null {
+  const normalized = text.toLowerCase().trim().replace(/\s+/g, ' ')
+  const meridiemMatch = normalized.match(/^(?:at\s+)?([1-9]|1[0-2])(?::|\.|\s)?([0-5]\d)?\s*(am|pm)$/)
+
+  if (meridiemMatch) {
+    return resolveTimeParts(meridiemMatch[1], meridiemMatch[2], meridiemMatch[3])
+  }
+
+  const compactMatch = normalized.match(/^([01]?\d|2[0-3])(?::|\.)([0-5]\d)$/)
+
+  if (compactMatch) {
+    return resolveTimeParts(compactMatch[1], compactMatch[2])
+  }
+
+  const militaryMatch = normalized.match(/^(\d{3,4})$/)
+
+  if (!militaryMatch) {
+    return null
+  }
+
+  const compact = militaryMatch[1].padStart(4, '0')
+  const hour = compact.slice(0, 2)
+  const minute = compact.slice(2, 4)
+
+  return resolveTimeParts(hour, minute)
+}
+
+async function cancelPendingReminderTime(params: {
+  supabase: ReturnType<typeof getSupabase>
+  id: string
+}): Promise<void> {
+  const { error } = await params.supabase
+    .from('reminders')
+    .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+    .eq('id', params.id)
+    .eq('status', 'awaiting_reminder_time')
+
+  if (error) {
+    throw error
+  }
+}
+
+async function resolvePendingReminderTimeReply(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+  text: string
+}): Promise<string | null> {
+  const pendingReminder = await getLatestPendingReminderTime(params)
+
+  if (!pendingReminder) {
+    return null
+  }
+
+  if (/^(cancel|cancel it|stop|never mind|nevermind)$/i.test(params.text.trim())) {
+    await cancelPendingReminderTime({ supabase: params.supabase, id: pendingReminder.id })
+    return "Okay, I won’t set that reminder."
+  }
+
+  const time = parseReminderTimeOnly(params.text)
+
+  if (!time) {
+    if (
+      detectFinanceCandidate(params.text) ||
+      isLikelyListRemindersRequest(params.text) ||
+      isLikelyNewReminderCommand(params.text)
+    ) {
+      return null
+    }
+
+    return `What time should I use for ${pendingReminder.reminder_text}?`
+  }
+
+  console.log('pending_reminder_completed')
+
+  const localDate = getLocalDateString(new Date(pendingReminder.event_time), pendingReminder.timezone)
+  const remindAt = zonedDateTimeToUtcIso(localDate, time, pendingReminder.timezone)
+
+  if (new Date(remindAt).getTime() <= Date.now()) {
+    return 'That reminder time has already passed. What future time should I use?'
+  }
+
+  console.log('pending_reminder_insert_started')
+
+  const { data, error } = await params.supabase
+    .from('reminders')
+    .update({
+      event_time: remindAt,
+      remind_at: remindAt,
+      status: 'pending',
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', pendingReminder.id)
+    .eq('status', 'awaiting_reminder_time')
+    .select('id')
+    .maybeSingle()
+
+  if (error || !data) {
+    console.error('pending_reminder_insert_failed', {
+      category: error ? 'supabase_error' : 'pending_reminder_not_found',
+    })
+    return 'I couldn’t save that reminder right now.'
+  }
+
+  console.log('pending_reminder_insert_success')
+
+  return `Ok, reminder set for ${formatReminderTimeForUser(remindAt, pendingReminder.timezone)} ${getTimezoneLabel(
+    pendingReminder.timezone
+  )} to ${pendingReminder.reminder_text}.`
+}
+
 async function extractReminderManagementIntent(params: {
   userText: string
   upcomingReminders: ManagedReminderRow[]
@@ -4026,6 +4423,48 @@ Reply naturally as Bergi using the recent conversation context.`
     }
 
     if (isPlainTextMessage) {
+      const calendarCreateEditReply = await resolveCalendarCreateEditReply({
+        supabase,
+        userId,
+        chatId,
+        text: userText,
+      })
+
+      if (calendarCreateEditReply !== null) {
+        if (isLocalTestMode) {
+          console.log('Local test calendar create edit reply generated')
+        } else {
+          await sendTelegramMessage(chatId, calendarCreateEditReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: calendarCreateEditReply })
+        return new Response('OK', { status: 200 })
+      }
+    }
+
+    if (isPlainTextMessage) {
+      const pendingReminderTimeReply = await resolvePendingReminderTimeReply({
+        supabase,
+        userId,
+        chatId,
+        text: userText,
+      })
+
+      if (pendingReminderTimeReply !== null) {
+        const formattedPendingReminderTimeReply = formatForTelegramPlainText(pendingReminderTimeReply)
+
+        if (isLocalTestMode) {
+          console.log('Local test pending reminder time reply generated')
+        } else {
+          await sendTelegramMessage(chatId, formattedPendingReminderTimeReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: formattedPendingReminderTimeReply })
+        return new Response('OK', { status: 200 })
+      }
+    }
+
+    if (isPlainTextMessage) {
       const awaitingReminder = await getLatestAwaitingReminder({ supabase, userId, chatId })
       const lowerUserText = userText.toLowerCase().trim()
 
@@ -4077,6 +4516,15 @@ Reply naturally as Bergi using the recent conversation context.`
       }
 
       if (reminderExtraction.action === 'ask_clarifying_question') {
+        await savePendingReminderTimeClarification({
+          supabase,
+          userId,
+          chatId,
+          text: userText,
+          timezone: 'Asia/Singapore',
+          sourceMessageContent: userText,
+        })
+
         const clarifyingQuestion = formatForTelegramPlainText(reminderExtraction.clarifying_question)
 
         if (isLocalTestMode) {
