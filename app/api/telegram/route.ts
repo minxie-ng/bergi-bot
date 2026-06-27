@@ -51,7 +51,14 @@ import {
   validateExpenseLogForNotion,
 } from '@/lib/finance-logging'
 import { generateDailyProactiveCheckins, getOrCreateProactivePreferences } from '@/lib/proactive-checkins'
+import { createSupabaseExpense, querySupabaseExpenses } from '@/lib/supabase-expenses'
 import { truncateText } from '@/lib/text-utils'
+import {
+  ensureDefaultFeatureFlags,
+  isOwnerTelegramUser,
+  setUserProactiveFeature,
+  upsertOnboardingState,
+} from '@/lib/user-feature-flags'
 
 type TelegramUpdate = {
   message?: {
@@ -312,6 +319,7 @@ type TelegramSlashCommand =
   | '/start'
   | '/help'
   | '/privacy'
+  | '/stop_checkins'
   | '/checkin_status'
   | '/pause_checkins'
   | '/resume_checkins'
@@ -565,6 +573,7 @@ function normalizeTelegramCommand(text: string): TelegramSlashCommand | null {
     case '/start':
     case '/help':
     case '/privacy':
+    case '/stop_checkins':
     case '/checkin_status':
     case '/pause_checkins':
     case '/resume_checkins':
@@ -626,7 +635,7 @@ function getAlphaPrivacyReply(): string {
 
 Please don’t send passwords, private keys, or highly sensitive information.
 
-Google Calendar connection is not live yet for alpha users.`
+Calendar requires connecting Google Calendar later.`
 }
 
 function getAlphaAskNameReply(): string {
@@ -657,6 +666,14 @@ Try asking me:
 • schedule gym tomorrow 7pm
 • log $5 lunch
 • check in with me tomorrow morning`
+}
+
+function getAlphaCalendarUnavailableReply(): string {
+  return 'Calendar connection is coming next. For now, I can still help with reminders and planning in chat.'
+}
+
+function getFeatureUnavailableReply(feature: string): string {
+  return `${feature} isn’t available in this alpha yet.`
 }
 
 function getAlphaStartReplyMarkup(): TelegramInlineKeyboardMarkup {
@@ -692,6 +709,7 @@ function getProactiveCheckinControlActionFromCommand(
   switch (command) {
     case '/checkin_status':
       return 'status'
+    case '/stop_checkins':
     case '/pause_checkins':
       return 'pause'
     case '/resume_checkins':
@@ -1317,6 +1335,7 @@ async function resolveFinanceQueryReply(params: {
   userId: string
   chatId: number
   intent: FinanceQueryIntent
+  useNotionFinance: boolean
 }): Promise<string> {
   const timezone = await getDailyRecapTimezone(params)
   const range = getFinanceQueryDateRange({ intent: params.intent, timezone })
@@ -1324,14 +1343,24 @@ async function resolveFinanceQueryReply(params: {
   logFinanceInfo('finance_query_started', {
     period: params.intent.period,
     hasCategory: params.intent.category !== undefined,
+    store: params.useNotionFinance ? 'notion' : 'supabase',
   })
 
-  const result = await queryNotionExpenses({
-    startIso: range.startIso,
-    endIso: range.endIso,
-    category: params.intent.category,
-    recentLimit: range.recentLimit,
-  })
+  const result = params.useNotionFinance
+    ? await queryNotionExpenses({
+        startIso: range.startIso,
+        endIso: range.endIso,
+        category: params.intent.category,
+        recentLimit: range.recentLimit,
+      })
+    : await querySupabaseExpenses({
+        supabase: params.supabase,
+        userId: params.userId,
+        startIso: range.startIso,
+        endIso: range.endIso,
+        category: params.intent.category,
+        recentLimit: range.recentLimit,
+      })
 
   logFinanceInfo('finance_query_success', {
     count: result.entries.length,
@@ -1341,6 +1370,34 @@ async function resolveFinanceQueryReply(params: {
     result,
     intent: params.intent,
     rangeLabel: range.label,
+  })
+}
+
+async function saveParsedExpenseLog(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  expenseLog: Awaited<ReturnType<typeof parseExpenseLogWithLLM>>
+  rawText: string
+  source: string
+  useNotionFinance: boolean
+}): Promise<void> {
+  if (params.useNotionFinance) {
+    await createNotionExpenseLog({
+      expense: params.expenseLog.expense,
+      date: params.expenseLog.date,
+      amount: params.expenseLog.amount,
+      category: params.expenseLog.category,
+      comment: params.expenseLog.comment ?? params.rawText,
+    })
+    return
+  }
+
+  await createSupabaseExpense({
+    supabase: params.supabase,
+    userId: params.userId,
+    expenseLog: params.expenseLog,
+    rawText: params.rawText,
+    source: params.source,
   })
 }
 
@@ -3358,13 +3415,15 @@ async function getUpcomingReminders(params: {
 
 async function cancelReminderById(params: {
   supabase: ReturnType<typeof getSupabase>
+  userId: string
   reminderId: string
 }): Promise<boolean> {
-  const { supabase, reminderId } = params
+  const { supabase, userId, reminderId } = params
 
   const { data, error } = await supabase
     .from('reminders')
     .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+    .eq('user_id', userId)
     .eq('id', reminderId)
     .eq('status', 'pending')
     .select('id')
@@ -3397,6 +3456,9 @@ async function setProactiveCheckinsEnabled(params: {
       updated_at: new Date().toISOString(),
     })
     .eq('id', preference.id)
+    .eq('user_id', userId)
+    .eq('platform', 'telegram')
+    .eq('telegram_chat_id', chatId)
 
   if (error) {
     throw error
@@ -3605,12 +3667,14 @@ async function resolveProactiveCheckinControlReply(params: {
   const { supabase, userId, chatId, action } = params
 
   if (action === 'pause') {
+    await setUserProactiveFeature({ supabase, userId, enabled: false })
     await setProactiveCheckinsEnabled({ supabase, userId, chatId, enabled: false })
     await cancelFutureScheduledProactiveCheckins({ supabase, userId, chatId })
-    return 'okay min, I’ll pause proactive check-ins for now.'
+    return 'Okay, I’ll pause proactive check-ins for now.'
   }
 
   if (action === 'resume') {
+    await setUserProactiveFeature({ supabase, userId, enabled: true })
     const preference = await setProactiveCheckinsEnabled({ supabase, userId, chatId, enabled: true })
     const restoredCount = await restoreTodayFutureCancelledProactiveCheckins({
       supabase,
@@ -3621,7 +3685,7 @@ async function resolveProactiveCheckinControlReply(params: {
 
     if (restoredCount > 0) {
       const checkinWord = restoredCount === 1 ? 'check-in' : 'check-ins'
-      return `done min, proactive check-ins are back on. I restored ${restoredCount} upcoming ${checkinWord} for today.`
+      return `Done, proactive check-ins are back on. I restored ${restoredCount} upcoming ${checkinWord} for today.`
     }
 
     await generateDailyProactiveCheckins({
@@ -3631,7 +3695,7 @@ async function resolveProactiveCheckinControlReply(params: {
       platform: 'telegram',
       timezone: preference.timezone,
     })
-    return 'done min, proactive check-ins are back on.'
+    return 'Done, proactive check-ins are back on.'
   }
 
   const preference = await getOrCreateProactivePreferences({
@@ -4159,11 +4223,13 @@ function parseReminderTimeOnly(text: string): string | null {
 
 async function cancelPendingReminderTime(params: {
   supabase: ReturnType<typeof getSupabase>
+  userId: string
   id: string
 }): Promise<void> {
   const { error } = await params.supabase
     .from('reminders')
     .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+    .eq('user_id', params.userId)
     .eq('id', params.id)
     .eq('status', 'awaiting_reminder_time')
 
@@ -4185,7 +4251,7 @@ async function resolvePendingReminderTimeReply(params: {
   }
 
   if (/^(cancel|cancel it|stop|never mind|nevermind)$/i.test(params.text.trim())) {
-    await cancelPendingReminderTime({ supabase: params.supabase, id: pendingReminder.id })
+    await cancelPendingReminderTime({ supabase: params.supabase, userId: params.userId, id: pendingReminder.id })
     return "Okay, I won’t set that reminder."
   }
 
@@ -4385,16 +4451,18 @@ async function getLatestAwaitingReminder(params: {
 
 async function resolveReminderPreferenceReply(params: {
   supabase: ReturnType<typeof getSupabase>
+  userId: string
   awaitingReminder: AwaitingReminderRow
   userText: string
 }): Promise<string> {
-  const { supabase, awaitingReminder, userText } = params
+  const { supabase, userId, awaitingReminder, userText } = params
   const lower = userText.toLowerCase().trim()
 
   if (lower === 'no' || lower === 'nah' || lower === 'no need' || lower.includes('不用') || lower.includes('不需要')) {
     const { error } = await supabase
       .from('reminders')
       .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+      .eq('user_id', userId)
       .eq('id', awaitingReminder.id)
       .eq('status', 'awaiting_reminder_preference')
 
@@ -4414,6 +4482,7 @@ async function resolveReminderPreferenceReply(params: {
         status: 'pending',
         updated_at: nowIso,
       })
+      .eq('user_id', userId)
       .eq('id', awaitingReminder.id)
       .eq('status', 'awaiting_reminder_preference')
 
@@ -4468,6 +4537,7 @@ async function resolveReminderPreferenceReply(params: {
       status: 'pending',
       updated_at: new Date().toISOString(),
     })
+    .eq('user_id', userId)
     .eq('id', awaitingReminder.id)
     .eq('status', 'awaiting_reminder_preference')
 
@@ -4480,10 +4550,11 @@ async function resolveReminderPreferenceReply(params: {
 
 async function rescheduleReminderById(params: {
   supabase: ReturnType<typeof getSupabase>
+  userId: string
   reminderId: string
   newRemindAt: string
 }): Promise<boolean> {
-  const { supabase, reminderId, newRemindAt } = params
+  const { supabase, userId, reminderId, newRemindAt } = params
 
   const { data, error } = await supabase
     .from('reminders')
@@ -4491,6 +4562,7 @@ async function rescheduleReminderById(params: {
       remind_at: newRemindAt,
       updated_at: new Date().toISOString(),
     })
+    .eq('user_id', userId)
     .eq('id', reminderId)
     .eq('status', 'pending')
     .select('id')
@@ -4949,10 +5021,18 @@ export async function POST(request: Request) {
         firstName: from.first_name,
         lastName: from.last_name,
       })
+      const isOwner = isOwnerTelegramUser(from.id)
+      await ensureDefaultFeatureFlags({ supabase, userId, isOwner })
       let callbackReply: string | null = null
       let callbackReplyMarkup: TelegramInlineKeyboardMarkup | undefined
 
       if (callbackData === 'alpha_onboarding_agree') {
+        await upsertOnboardingState({
+          supabase,
+          userId,
+          status: 'awaiting_name',
+          privacyAcknowledgedAt: new Date().toISOString(),
+        })
         callbackReply = getAlphaAskNameReply()
       } else if (callbackData === 'alpha_onboarding_privacy') {
         callbackReply = getAlphaPrivacyReply()
@@ -4960,12 +5040,29 @@ export async function POST(request: Request) {
         callbackData === 'alpha_onboarding_proactive_light' ||
         callbackData === 'alpha_onboarding_proactive_none'
       ) {
+        const enabled = callbackData === 'alpha_onboarding_proactive_light'
+        await setUserProactiveFeature({ supabase, userId, enabled })
+        await setProactiveCheckinsEnabled({ supabase, userId, chatId, enabled })
+        if (!enabled) {
+          await cancelFutureScheduledProactiveCheckins({ supabase, userId, chatId })
+        }
+        await upsertOnboardingState({
+          supabase,
+          userId,
+          status: 'choosing_calendar',
+          proactivePreference: enabled ? 'light' : 'off',
+        })
         callbackReply = getAlphaCalendarChoiceReply()
         callbackReplyMarkup = getAlphaCalendarReplyMarkup()
       } else if (
         callbackData === 'alpha_onboarding_calendar_connect' ||
         callbackData === 'alpha_onboarding_calendar_skip'
       ) {
+        await upsertOnboardingState({
+          supabase,
+          userId,
+          status: 'complete',
+        })
         callbackReply =
           callbackData === 'alpha_onboarding_calendar_connect'
             ? `Google Calendar connect is coming next. I’ll leave it skipped for now.\n\n${getAlphaOnboardingDoneReply()}`
@@ -5007,6 +5104,11 @@ export async function POST(request: Request) {
         firstName: from.first_name,
         lastName: from.last_name,
       })
+      await ensureDefaultFeatureFlags({
+        supabase,
+        userId,
+        isOwner: isOwnerTelegramUser(from.id),
+      })
 
       await saveMessage({ supabase, userId, role: 'user', content: nonTextContent })
 
@@ -5033,12 +5135,49 @@ export async function POST(request: Request) {
       firstName: from.first_name,
       lastName: from.last_name,
     })
+    const isOwner = isOwnerTelegramUser(from.id)
+    const featureFlags = await ensureDefaultFeatureFlags({ supabase, userId, isOwner })
+    const canUseNotionFinance = isOwner && featureFlags.notion_enabled
+    const canUseServiceAccountCalendar = isOwner && featureFlags.calendar_enabled
+
+    if (!featureFlags.chat_enabled || !featureFlags.alpha_enabled) {
+      const unavailableReply = getFeatureUnavailableReply('Chat')
+
+      if (isLocalTestMode) {
+        console.log('Local test chat disabled reply generated')
+      } else {
+        await sendTelegramMessage(chatId, unavailableReply)
+      }
+
+      await saveMessage({ supabase, userId, role: 'assistant', content: unavailableReply })
+      return new Response('OK', { status: 200 })
+    }
 
     let userMessageToSave: string
     let userMessageForLLM: string
     let transcribedVoiceText: string | null = null
 
     if (voice !== undefined) {
+      if (!featureFlags.voice_enabled) {
+        const voiceDisabledReply = getFeatureUnavailableReply('Voice messages')
+
+        await saveMessage({
+          supabase,
+          userId,
+          role: 'user',
+          content: '[voice] user sent a voice message while voice was disabled',
+        })
+
+        if (isLocalTestMode) {
+          console.log('Local test voice disabled reply generated')
+        } else {
+          await sendTelegramMessage(chatId, voiceDisabledReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: voiceDisabledReply })
+        return new Response('OK', { status: 200 })
+      }
+
       if (voice.duration !== undefined && voice.duration > 40) {
         const voiceTooLongReply = 'wah minxie this voice note too long sia 😭 keep it under 40 seconds first'
 
@@ -5075,6 +5214,26 @@ export async function POST(request: Request) {
       userMessageToSave = `[voice transcript] ${transcript}`
       userMessageForLLM = formatVoiceTranscriptForLLM(transcript)
     } else if (selectedPhoto !== null) {
+      if (!featureFlags.photo_enabled) {
+        const photoDisabledReply = getFeatureUnavailableReply('Photos')
+
+        await saveMessage({
+          supabase,
+          userId,
+          role: 'user',
+          content: '[photo] user sent a photo while photos were disabled',
+        })
+
+        if (isLocalTestMode) {
+          console.log('Local test photo disabled reply generated')
+        } else {
+          await sendTelegramMessage(chatId, photoDisabledReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: photoDisabledReply })
+        return new Response('OK', { status: 200 })
+      }
+
       const filePath = await getTelegramFilePath(selectedPhoto.file_id)
       const imageBuffer = await downloadTelegramFile(filePath)
       const imageDescription = await describeImage(imageBuffer, 'image/jpeg', caption)
@@ -5121,6 +5280,19 @@ Reply naturally as Bergi using the recent conversation context.`
     }
 
     if (isPlainTextMessage && isThoughtCaptureCommand(userText)) {
+      if (!featureFlags.memory_enabled) {
+        const memoryUnavailableReply = getFeatureUnavailableReply('Memory')
+
+        if (isLocalTestMode) {
+          console.log('Local test memory disabled reply generated')
+        } else {
+          await sendTelegramMessage(chatId, memoryUnavailableReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: memoryUnavailableReply })
+        return new Response('OK', { status: 200 })
+      }
+
       const thoughtCaptureReply = await resolveThoughtCaptureReply({ supabase, userId })
 
       if (isLocalTestMode) {
@@ -5139,6 +5311,12 @@ Reply naturally as Bergi using the recent conversation context.`
       const latestAssistantMessage = await getLatestAssistantMessage({ supabase, userId })
 
       if (latestAssistantMessage === getAlphaAskNameReply()) {
+        await upsertOnboardingState({
+          supabase,
+          userId,
+          status: 'choosing_proactive',
+          preferredName: userText.trim().slice(0, 80),
+        })
         const proactiveChoiceReply = getAlphaProactiveChoiceReply()
 
         if (isLocalTestMode) {
@@ -5195,6 +5373,19 @@ Reply naturally as Bergi using the recent conversation context.`
       }
 
       if (telegramCommand === '/notes') {
+        if (!featureFlags.memory_enabled) {
+          const memoryUnavailableReply = getFeatureUnavailableReply('Memory')
+
+          if (isLocalTestMode) {
+            console.log('Local test memory disabled reply generated')
+          } else {
+            await sendTelegramMessage(chatId, memoryUnavailableReply)
+          }
+
+          await saveMessage({ supabase, userId, role: 'assistant', content: memoryUnavailableReply })
+          return new Response('OK', { status: 200 })
+        }
+
         const recentNotes = await getRecentLifeThreadNotes({ supabase, userId, limit: 3 })
         const notesReply = formatRecentLifeThreadNotesForTelegram(recentNotes)
 
@@ -5209,6 +5400,19 @@ Reply naturally as Bergi using the recent conversation context.`
       }
 
       if (isNaturalMemorySummaryRequest(userText)) {
+        if (!featureFlags.memory_enabled) {
+          const memoryUnavailableReply = getFeatureUnavailableReply('Memory')
+
+          if (isLocalTestMode) {
+            console.log('Local test memory disabled reply generated')
+          } else {
+            await sendTelegramMessage(chatId, memoryUnavailableReply)
+          }
+
+          await saveMessage({ supabase, userId, role: 'assistant', content: memoryUnavailableReply })
+          return new Response('OK', { status: 200 })
+        }
+
         const recentNotes = await getRecentLifeThreadNotes({ supabase, userId, limit: 5 })
         const memorySummaryReply = formatNaturalMemorySummary(recentNotes)
 
@@ -5259,6 +5463,27 @@ Reply naturally as Bergi using the recent conversation context.`
 
     if (
       isPlainTextMessage &&
+      !featureFlags.reminders_enabled &&
+      (normalizeTelegramCommand(userText) === '/list_reminders' ||
+        isLikelyListRemindersRequest(userText) ||
+        isLikelyCancelReminderRequest(userText) ||
+        isLikelyRescheduleReminderRequest(userText) ||
+        isLikelyReminderRequest(userText))
+    ) {
+      const remindersUnavailableReply = getFeatureUnavailableReply('Reminders')
+
+      if (isLocalTestMode) {
+        console.log('Local test reminders disabled reply generated')
+      } else {
+        await sendTelegramMessage(chatId, remindersUnavailableReply)
+      }
+
+      await saveMessage({ supabase, userId, role: 'assistant', content: remindersUnavailableReply })
+      return new Response('OK', { status: 200 })
+    }
+
+    if (
+      isPlainTextMessage &&
       (normalizeTelegramCommand(userText) === '/list_reminders' || isLikelyListRemindersRequest(userText))
     ) {
       const upcomingReminders = await getUpcomingReminders({ supabase, userId, chatId })
@@ -5292,7 +5517,7 @@ Reply naturally as Bergi using the recent conversation context.`
         if (!reminderToCancel) {
           cancelReply = `I can’t find reminder ${cancelNumber}. Say “list reminders” to see your upcoming reminders.`
         } else {
-          const didCancel = await cancelReminderById({ supabase, reminderId: reminderToCancel.id })
+          const didCancel = await cancelReminderById({ supabase, userId, reminderId: reminderToCancel.id })
           cancelReply = didCancel
             ? `Cancelled reminder ${cancelNumber}: ${reminderToCancel.reminder_text}`
             : 'That reminder is no longer active. Say “list reminders” to see your upcoming reminders.'
@@ -5303,7 +5528,7 @@ Reply naturally as Bergi using the recent conversation context.`
         if (!reminderToCancel) {
           cancelReply = 'You don’t have any upcoming reminders.'
         } else {
-          const didCancel = await cancelReminderById({ supabase, reminderId: reminderToCancel.id })
+          const didCancel = await cancelReminderById({ supabase, userId, reminderId: reminderToCancel.id })
           cancelReply = didCancel
             ? `Cancelled your next reminder: ${reminderToCancel.reminder_text}`
             : 'That reminder is no longer active. Say “list reminders” to see your upcoming reminders.'
@@ -5370,6 +5595,7 @@ Reply naturally as Bergi using the recent conversation context.`
         } else {
           const didReschedule = await rescheduleReminderById({
             supabase,
+            userId,
             reminderId: managementIntent.reminder_id,
             newRemindAt: managementIntent.new_remind_at,
           })
@@ -5392,7 +5618,34 @@ Reply naturally as Bergi using the recent conversation context.`
       }
     }
 
-    if (isPlainTextMessage) {
+    if (isPlainTextMessage && !canUseServiceAccountCalendar) {
+      const calendarPlanningIntent = financeText !== null ? detectCalendarPlanningIntent(financeText) : null
+      const calendarQueryIntent = financeText !== null ? detectCalendarQueryIntent(financeText) : null
+      const calendarCreateRequested = isLikelyCalendarCreateRequest(userText)
+
+      if (calendarCreateRequested || calendarPlanningIntent !== null || calendarQueryIntent !== null) {
+        const calendarUnavailableReply = getAlphaCalendarUnavailableReply()
+
+        console.log('calendar_service_account_blocked', {
+          isOwner,
+          calendarEnabled: featureFlags.calendar_enabled,
+          hasCreateIntent: calendarCreateRequested,
+          hasPlanningIntent: calendarPlanningIntent !== null,
+          hasQueryIntent: calendarQueryIntent !== null,
+        })
+
+        if (isLocalTestMode) {
+          console.log('Local test calendar unavailable reply generated')
+        } else {
+          await sendTelegramMessage(chatId, calendarUnavailableReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: calendarUnavailableReply })
+        return new Response('OK', { status: 200 })
+      }
+    }
+
+    if (isPlainTextMessage && canUseServiceAccountCalendar) {
       const calendarCreateConfirmationReply = await resolveCalendarCreateConfirmationReply({
         supabase,
         userId,
@@ -5412,7 +5665,7 @@ Reply naturally as Bergi using the recent conversation context.`
       }
     }
 
-    if (isPlainTextMessage) {
+    if (isPlainTextMessage && canUseServiceAccountCalendar) {
       const calendarCreateEditReply = await resolveCalendarCreateEditReply({
         supabase,
         userId,
@@ -5432,7 +5685,7 @@ Reply naturally as Bergi using the recent conversation context.`
       }
     }
 
-    if (isPlainTextMessage) {
+    if (isPlainTextMessage && canUseServiceAccountCalendar) {
       const calendarCreateTimeClarificationReply = await resolveCalendarCreateTimeClarificationReply({
         supabase,
         userId,
@@ -5457,7 +5710,7 @@ Reply naturally as Bergi using the recent conversation context.`
       }
     }
 
-    if (isPlainTextMessage) {
+    if (isPlainTextMessage && canUseServiceAccountCalendar) {
       const calendarCreateDateClarificationReply = await resolveCalendarCreateDateClarificationReply({
         supabase,
         userId,
@@ -5504,7 +5757,7 @@ Reply naturally as Bergi using the recent conversation context.`
       }
     }
 
-    if (isPlainTextMessage) {
+    if (isPlainTextMessage && canUseServiceAccountCalendar) {
       const calendarCreateRequestReply = await resolveCalendarCreateRequestReply({
         supabase,
         userId,
@@ -5534,7 +5787,7 @@ Reply naturally as Bergi using the recent conversation context.`
         (!isLikelyNewReminderCommand(userText) || lowerUserText === 'remind me now')
       ) {
         const preferenceReply = formatForTelegramPlainText(
-          await resolveReminderPreferenceReply({ supabase, awaitingReminder, userText })
+          await resolveReminderPreferenceReply({ supabase, userId, awaitingReminder, userText })
         )
 
         if (isLocalTestMode) {
@@ -5763,6 +6016,19 @@ Reply naturally as Bergi using the recent conversation context.`
       const financeQueryIntent = detectFinanceQueryIntent(financeText)
 
       if (financeQueryIntent !== null) {
+        if (!featureFlags.finance_enabled) {
+          const financeUnavailableReply = getFeatureUnavailableReply('Finance')
+
+          if (isLocalTestMode) {
+            console.log('Local test finance disabled reply generated')
+          } else {
+            await sendTelegramMessage(chatId, financeUnavailableReply)
+          }
+
+          await saveMessage({ supabase, userId, role: 'assistant', content: financeUnavailableReply })
+          return new Response('OK', { status: 200 })
+        }
+
         logFinanceInfo('finance_query_detected', {
           period: financeQueryIntent.period,
           hasCategory: financeQueryIntent.category !== undefined,
@@ -5776,17 +6042,13 @@ Reply naturally as Bergi using the recent conversation context.`
             userId,
             chatId,
             intent: financeQueryIntent,
+            useNotionFinance: canUseNotionFinance,
           })
         } catch (error) {
-          const notionError =
-            error instanceof NotionExpenseLogError
-              ? error
-              : new NotionExpenseLogError({ category: 'notion_unknown_error' })
-
           logFinanceError('finance_query_failed', {
-            category: notionError.category,
+            category: error instanceof NotionExpenseLogError ? error.category : 'supabase_or_unknown_error',
           })
-          financeQueryReply = 'I couldn’t read your Notion expenses right now.'
+          financeQueryReply = 'I couldn’t read your expenses right now.'
         }
 
         if (isLocalTestMode) {
@@ -5807,6 +6069,19 @@ Reply naturally as Bergi using the recent conversation context.`
         const pendingFinanceConfirmation = await getLatestPendingFinanceConfirmation({ supabase, userId })
 
         if (pendingFinanceConfirmation !== null) {
+          if (!featureFlags.finance_enabled) {
+            const financeUnavailableReply = getFeatureUnavailableReply('Finance')
+
+            if (isLocalTestMode) {
+              console.log('Local test finance disabled reply generated')
+            } else {
+              await sendTelegramMessage(chatId, financeUnavailableReply)
+            }
+
+            await saveMessage({ supabase, userId, role: 'assistant', content: financeUnavailableReply })
+            return new Response('OK', { status: 200 })
+          }
+
           logFinanceInfo('finance_confirmation_detected', {
             hasPendingConfirmation: true,
           })
@@ -5864,19 +6139,23 @@ Reply naturally as Bergi using the recent conversation context.`
             return new Response('OK', { status: 200 })
           }
 
-          const notionStartedAt = Date.now()
-          logFinanceInfo('finance_confirmation_create_started')
+          const financeCreateStartedAt = Date.now()
+          logFinanceInfo('finance_confirmation_create_started', {
+            store: canUseNotionFinance ? 'notion' : 'supabase',
+          })
 
           try {
-            await createNotionExpenseLog({
-              expense: expenseLog.expense,
-              date: expenseLog.date,
-              amount: expenseLog.amount,
-              category: expenseLog.category,
-              comment: expenseLog.comment,
+            await saveParsedExpenseLog({
+              supabase,
+              userId,
+              expenseLog,
+              rawText: correctionText,
+              source: 'telegram_finance_confirmation',
+              useNotionFinance: canUseNotionFinance,
             })
             logFinanceInfo('finance_confirmation_create_success', {
-              durationMs: Date.now() - notionStartedAt,
+              durationMs: Date.now() - financeCreateStartedAt,
+              store: canUseNotionFinance ? 'notion' : 'supabase',
             })
           } catch (error) {
             const notionError =
@@ -5885,16 +6164,17 @@ Reply naturally as Bergi using the recent conversation context.`
                 : new NotionExpenseLogError({ category: 'notion_unknown_error' })
 
             logFinanceError('finance_confirmation_create_failed', {
-              durationMs: Date.now() - notionStartedAt,
+              durationMs: Date.now() - financeCreateStartedAt,
               status: notionError.status,
               notionCode: notionError.notionCode,
-              category: notionError.category,
+              category: error instanceof NotionExpenseLogError ? notionError.category : 'supabase_or_unknown_error',
+              store: canUseNotionFinance ? 'notion' : 'supabase',
             })
 
             const financeToolErrorReply =
-              notionError.category === 'notion_schema_mismatch'
+              canUseNotionFinance && notionError.category === 'notion_schema_mismatch'
                 ? 'I found the expense, but my Notion database fields don’t match what I expected yet.'
-                : 'I found the expense, but I couldn’t save it to Notion right now.'
+                : 'I found the expense, but I couldn’t save it right now.'
 
             if (isLocalTestMode) {
               console.log('Local test finance confirmation tool error reply generated')
@@ -5928,6 +6208,19 @@ Reply naturally as Bergi using the recent conversation context.`
     }
 
     if (financeText !== null && isFinanceCandidate) {
+      if (!featureFlags.finance_enabled) {
+        const financeUnavailableReply = getFeatureUnavailableReply('Finance')
+
+        if (isLocalTestMode) {
+          console.log('Local test finance disabled reply generated')
+        } else {
+          await sendTelegramMessage(chatId, financeUnavailableReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: financeUnavailableReply })
+        return new Response('OK', { status: 200 })
+      }
+
       if (financeSource === 'voice') {
         logFinanceInfo('voice_transcription_finance_candidate_detected', {
           messageLength: financeText.length,
@@ -6023,19 +6316,23 @@ Reply naturally as Bergi using the recent conversation context.`
           return new Response('OK', { status: 200 })
         }
 
-        const notionStartedAt = Date.now()
-        logFinanceInfo('notion_create_started')
+        const financeCreateStartedAt = Date.now()
+        logFinanceInfo('finance_create_started', {
+          store: canUseNotionFinance ? 'notion' : 'supabase',
+        })
 
         try {
-          await createNotionExpenseLog({
-            expense: expenseLog.expense,
-            date: expenseLog.date,
-            amount: expenseLog.amount,
-            category: expenseLog.category,
-            comment: expenseLog.comment ?? financeText,
+          await saveParsedExpenseLog({
+            supabase,
+            userId,
+            expenseLog,
+            rawText: financeText,
+            source: financeSource === 'voice' ? 'telegram_voice' : 'telegram_text',
+            useNotionFinance: canUseNotionFinance,
           })
-          logFinanceInfo('notion_create_success', {
-            durationMs: Date.now() - notionStartedAt,
+          logFinanceInfo('finance_create_success', {
+            durationMs: Date.now() - financeCreateStartedAt,
+            store: canUseNotionFinance ? 'notion' : 'supabase',
           })
         } catch (error) {
           const notionError =
@@ -6043,17 +6340,18 @@ Reply naturally as Bergi using the recent conversation context.`
               ? error
               : new NotionExpenseLogError({ category: 'notion_unknown_error' })
 
-          logFinanceError('notion_create_failed', {
-            durationMs: Date.now() - notionStartedAt,
+          logFinanceError('finance_create_failed', {
+            durationMs: Date.now() - financeCreateStartedAt,
             status: notionError.status,
             notionCode: notionError.notionCode,
-            category: notionError.category,
+            category: error instanceof NotionExpenseLogError ? notionError.category : 'supabase_or_unknown_error',
+            store: canUseNotionFinance ? 'notion' : 'supabase',
           })
 
           const financeToolErrorReply =
-            notionError.category === 'notion_schema_mismatch'
+            canUseNotionFinance && notionError.category === 'notion_schema_mismatch'
               ? 'I found the expense, but my Notion database fields don’t match what I expected yet.'
-              : 'I found the expense, but I couldn’t save it to Notion right now.'
+              : 'I found the expense, but I couldn’t save it right now.'
 
           if (isLocalTestMode) {
             console.log('Local test finance tool error reply generated')
@@ -6158,18 +6456,22 @@ For normal companion replies, prefer a small follow-up question, a grounded obse
 For memory summaries, end with a grounded observation like "i’m reading the current thread as internship-progress stuff for now.", "that’s the main thread i’m seeing so far.", or "this one seems to be the thing your brain keeps coming back to."
 Better endings: "what did you touch today, even roughly?", "that one counts, honestly.", "we can use that as today’s progress check.", "tell me the messy version first." Or simply stop after the useful point.
 `
-    const recentLifeThreadNotes = await getRecentLifeThreadNotes({ supabase, userId, limit: 5 })
+    const recentLifeThreadNotes = featureFlags.memory_enabled
+      ? await getRecentLifeThreadNotes({ supabase, userId, limit: 5 })
+      : []
     const mostRelevantLifeThreadNote = findMostRelevantLifeThreadNote(userMessageForLLM, recentLifeThreadNotes)
     const mostRelevantLifeThreadNoteContext = formatMostRelevantLifeThreadNoteForPrompt(mostRelevantLifeThreadNote)
     const lifeThreadNotesContext = formatRecentLifeThreadNotesForPrompt(recentLifeThreadNotes)
     const recentProactiveCheckin = await getRecentSentProactiveCheckinForReplyContext({ supabase, userId, chatId })
-    await saveProactiveProgressNoteIfMeaningful({
-      supabase,
-      userId,
-      sourceMessageId: savedUserMessageId,
-      rawText: userText ?? userMessageToSave,
-      recentProactiveCheckin,
-    })
+    if (featureFlags.memory_enabled) {
+      await saveProactiveProgressNoteIfMeaningful({
+        supabase,
+        userId,
+        sourceMessageId: savedUserMessageId,
+        rawText: userText ?? userMessageToSave,
+        recentProactiveCheckin,
+      })
+    }
     const recentProactiveCheckinContext = formatRecentProactiveCheckinForPrompt(recentProactiveCheckin)
     const finalSystemPrompt = `${systemPrompt}
 

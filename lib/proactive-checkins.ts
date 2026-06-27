@@ -89,6 +89,7 @@ export async function getOrCreateProactivePreferences(
       user_id: params.userId,
       platform,
       telegram_chat_id: params.telegramChatId,
+      enabled: false,
       timezone,
     })
     .select('*')
