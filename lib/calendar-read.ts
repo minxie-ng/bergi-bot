@@ -48,6 +48,8 @@ export type CalendarCreateEventInput = {
   timezone: string
   description?: string | null
   colorId?: string
+  allDayDate?: string | null
+  allDayEndDate?: string | null
 }
 
 const WEEKDAY_MATCHES: Array<{ index: 0 | 1 | 2 | 3 | 4 | 5 | 6; label: string; pattern: RegExp }> = [
@@ -679,6 +681,20 @@ export async function createGoogleCalendarEvent(params: CalendarCreateEventInput
   const accessToken = await getGoogleCalendarAccessToken()
   const abortController = new AbortController()
   const timeout = setTimeout(() => abortController.abort(), 1800)
+  const start =
+    params.allDayDate && params.allDayEndDate
+      ? { date: params.allDayDate }
+      : {
+          dateTime: params.start,
+          timeZone: params.timezone,
+        }
+  const end =
+    params.allDayDate && params.allDayEndDate
+      ? { date: params.allDayEndDate }
+      : {
+          dateTime: params.end,
+          timeZone: params.timezone,
+        }
 
   try {
     const response = await fetch(`${GOOGLE_CALENDAR_API_BASE_URL}/calendars/${encodeURIComponent(calendarId)}/events`, {
@@ -692,14 +708,8 @@ export async function createGoogleCalendarEvent(params: CalendarCreateEventInput
         summary: params.title,
         description: params.description ?? undefined,
         colorId: params.colorId,
-        start: {
-          dateTime: params.start,
-          timeZone: params.timezone,
-        },
-        end: {
-          dateTime: params.end,
-          timeZone: params.timezone,
-        },
+        start,
+        end,
       }),
     })
 

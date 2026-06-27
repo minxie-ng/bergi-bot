@@ -109,6 +109,8 @@ create table if not exists pending_calendar_events (
   title text not null,
   start_at timestamp with time zone not null,
   end_at timestamp with time zone not null,
+  is_all_day boolean not null default false,
+  all_day_date date,
   timezone text not null default 'Asia/Singapore',
   description text,
   status text not null default 'pending',

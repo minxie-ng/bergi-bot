@@ -193,6 +193,8 @@ type PendingCalendarEventRow = {
   title: string
   start_at: string
   end_at: string
+  is_all_day: boolean
+  all_day_date: string | null
   timezone: string
   description: string | null
   expires_at: string
@@ -201,11 +203,14 @@ type PendingCalendarEventRow = {
 }
 
 type PendingCalendarTimeRow = PendingCalendarEventRow
+type PendingCalendarDateRow = PendingCalendarEventRow
 
 type CalendarEventDraft = {
   title: string
   startAt: string
   endAt: string
+  isAllDay: boolean
+  allDayDate: string | null
   timezone: string
   description: string | null
   datePeriod: string
@@ -237,12 +242,23 @@ type CalendarCreateIntent =
       durationMinutes: number
     }
   | {
+      action: 'ask_date'
+      reply: string
+      title: string
+      timezone: string
+      durationMinutes: number
+      defaultAllDay: boolean
+    }
+  | {
       action: 'ask_clarifying_question'
       reply: string
     }
   | {
       action: 'not_calendar_create'
     }
+
+const PENDING_CALENDAR_EVENT_SELECT =
+  'id, title, start_at, end_at, is_all_day, all_day_date, timezone, description, expires_at, created_at, updated_at'
 
 type RecentSentProactiveCheckinRow = {
   id: string
@@ -1512,6 +1528,8 @@ function isLikelyCalendarCreateRequest(text: string): boolean {
     .replace(/[’']/g, "'")
     .replace(/\s+/g, ' ')
     .trim()
+  const hasBirthdayKeyword = /\b(bday|birthday)\b/.test(normalized)
+  const hasMonthDate = hasCalendarMonthDate(normalized)
   const hasCalendarCreateVerb =
     /\b(add|create|schedule|block)\b/.test(normalized) ||
     /\bput\b.*\b(?:calendar|schedule)\b/.test(normalized) ||
@@ -1519,9 +1537,11 @@ function isLikelyCalendarCreateRequest(text: string): boolean {
   const hasDateOrTime =
     /\b(today|tdy|tomorrow|tmr|this\s+(?:mon|monday|tue|tuesday|wed|wednesday|thu|thursday|fri|friday|sat|saturday|sun|sunday)|next\s+(?:mon|monday|tue|tuesday|wed|wednesday|thu|thursday|fri|friday|sat|saturday|sun|sunday)|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?|morning|afternoon|evening|tonight)\b/.test(
       normalized
-    ) || /\b(?:at\s*)?(?:[01]?\d|2[0-3])(?::[0-5]\d|\.[0-5]\d)?\s*(?:am|pm)\b/.test(normalized)
+    ) ||
+    hasMonthDate ||
+    /\b(?:at\s*)?(?:[01]?\d|2[0-3])(?::[0-5]\d|\.[0-5]\d)?\s*(?:am|pm)\b/.test(normalized)
 
-  return hasCalendarCreateVerb && hasDateOrTime
+  return hasCalendarCreateVerb && (hasDateOrTime || hasBirthdayKeyword)
 }
 
 function isCalendarCreateConfirmation(text: string): boolean {
@@ -1548,12 +1568,115 @@ function getWeekdayIndexFromText(value: string): 0 | 1 | 2 | 3 | 4 | 5 | 6 | nul
   return null
 }
 
+const CALENDAR_MONTH_ALIASES: Record<string, number> = {
+  jan: 1,
+  january: 1,
+  feb: 2,
+  february: 2,
+  mar: 3,
+  march: 3,
+  apr: 4,
+  april: 4,
+  may: 5,
+  jun: 6,
+  june: 6,
+  jul: 7,
+  july: 7,
+  aug: 8,
+  august: 8,
+  sep: 9,
+  sept: 9,
+  september: 9,
+  oct: 10,
+  october: 10,
+  nov: 11,
+  november: 11,
+  dec: 12,
+  december: 12,
+}
+
+const CALENDAR_MONTH_PATTERN =
+  '(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)'
+
+function hasCalendarMonthDate(text: string): boolean {
+  const normalized = text.toLowerCase()
+  return (
+    new RegExp(`\\b(?:[0-2]?\\d|3[01])(?:st|nd|rd|th)?\\s+${CALENDAR_MONTH_PATTERN}\\b`, 'i').test(normalized) ||
+    new RegExp(`\\b${CALENDAR_MONTH_PATTERN}\\s+(?:[0-2]?\\d|3[01])(?:st|nd|rd|th)?\\b`, 'i').test(normalized)
+  )
+}
+
+function parseCalendarCreateMonthDate(params: {
+  text: string
+  timezone: string
+}): { localDate: string; period: string } | null {
+  const normalized = params.text.toLowerCase()
+  const dayFirstMatch = normalized.match(
+    new RegExp(`\\b([0-2]?\\d|3[01])(?:st|nd|rd|th)?\\s+${CALENDAR_MONTH_PATTERN}(?:\\s+(\\d{4}))?\\b`, 'i')
+  )
+  const monthFirstMatch =
+    dayFirstMatch ??
+    normalized.match(
+      new RegExp(`\\b${CALENDAR_MONTH_PATTERN}\\s+([0-2]?\\d|3[01])(?:st|nd|rd|th)?(?:\\s+(\\d{4}))?\\b`, 'i')
+    )
+
+  if (!monthFirstMatch) {
+    return null
+  }
+
+  const dayText = dayFirstMatch ? monthFirstMatch[1] : monthFirstMatch[2]
+  const monthText = dayFirstMatch ? monthFirstMatch[2] : monthFirstMatch[1]
+  const explicitYearText = monthFirstMatch[3]
+
+  if (!dayText || !monthText) {
+    return null
+  }
+
+  const day = Number(dayText)
+  const month = CALENDAR_MONTH_ALIASES[monthText.toLowerCase()]
+
+  if (!month || Number.isNaN(day)) {
+    return null
+  }
+
+  const today = getLocalDateString(new Date(), params.timezone)
+  const [currentYear] = today.split('-').map(Number)
+  let year = explicitYearText ? Number(explicitYearText) : currentYear
+  let localDate = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`
+
+  if (!isValidLocalDate(localDate, year, month, day)) {
+    return null
+  }
+
+  if (!explicitYearText && localDate < today) {
+    year += 1
+    localDate = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`
+  }
+
+  return {
+    localDate,
+    period: normalized.slice(monthFirstMatch.index ?? 0, (monthFirstMatch.index ?? 0) + monthFirstMatch[0].length),
+  }
+}
+
+function isValidLocalDate(localDate: string, year: number, month: number, day: number): boolean {
+  const date = new Date(`${localDate}T00:00:00.000Z`)
+
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day
+}
+
 function parseCalendarCreateLocalDate(params: {
   text: string
   timezone: string
 }): { localDate: string; period: string } | null {
   const normalized = params.text.toLowerCase()
   const today = getLocalDateString(new Date(), params.timezone)
+
+  const monthDate = parseCalendarCreateMonthDate(params)
+
+  if (monthDate) {
+    return monthDate
+  }
 
   if (/\b(today|tdy)\b/.test(normalized)) {
     return { localDate: today, period: 'today' }
@@ -1788,7 +1911,10 @@ function titleCaseCalendarTitle(title: string): string {
 function extractCalendarCreateTitle(text: string): string {
   const title = text
     .replace(/[’']/g, "'")
+    .replace(/\bbday\b/gi, 'birthday')
     .replace(/\b(create\s+calendar\s+event\s+for|create\s+event\s+for|put\s+on\s+(?:my\s+)?calendar|add|schedule|block\s+time\s+to|block\s+\d+(?:\.\d+)?\s*(?:hours?|hrs?|h)\s+for|block)\b/gi, ' ')
+    .replace(new RegExp(`\\b(?:[0-2]?\\d|3[01])(?:st|nd|rd|th)?\\s+${CALENDAR_MONTH_PATTERN}(?:\\s+\\d{4})?\\b`, 'gi'), ' ')
+    .replace(new RegExp(`\\b${CALENDAR_MONTH_PATTERN}\\s+(?:[0-2]?\\d|3[01])(?:st|nd|rd|th)?(?:\\s+\\d{4})?\\b`, 'gi'), ' ')
     .replace(/\b(today|tdy|tomorrow|tmr|this\s+(?:mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)|next\s+(?:mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b/gi, ' ')
     .replace(/\b(?:from\s+)?(?:[01]?\d|2[0-3])(?:(?::|\.)[0-5]\d)?\s*(?:am|pm)?\s*(?:-|to)\s*(?:[01]?\d|2[0-3])(?:(?::|\.)[0-5]\d)?\s*(?:am|pm)?\b/gi, ' ')
     .replace(/\b(?:at\s*)?(?:[01]?\d|2[0-3])(?:(?::|\.)[0-5]\d)?\s*(?:am|pm)?\b/gi, ' ')
@@ -1809,19 +1935,11 @@ function parseCalendarCreateIntent(params: {
     return { action: 'not_calendar_create' }
   }
 
-  const date = parseCalendarCreateLocalDate({ text: params.text, timezone: params.timezone })
-
-  if (!date) {
-    return {
-      action: 'ask_clarifying_question',
-      reply: 'what day should I add that to your calendar?',
-    }
-  }
-
   const timeRange = parseCalendarCreateTimeRange(params.text)
   const startTime = timeRange?.startTime ?? parseCalendarCreateStartTime(params.text)
   const title = extractCalendarCreateTitle(params.text)
   const color = inferCalendarEventColor(title)
+  const isBirthday = /\bbirthday\b/i.test(title)
 
   if (timeRange?.needsClarification) {
     return {
@@ -1830,7 +1948,46 @@ function parseCalendarCreateIntent(params: {
     }
   }
 
+  const date = parseCalendarCreateLocalDate({ text: params.text, timezone: params.timezone })
+
+  if (!date) {
+    if (!isBirthday) {
+      return {
+        action: 'ask_clarifying_question',
+        reply: 'what day should I add that to your calendar?',
+      }
+    }
+
+    return {
+      action: 'ask_date',
+      reply: `what date should I add ${title.toLowerCase()} to your calendar?`,
+      title,
+      timezone: params.timezone,
+      durationMinutes: parseCalendarCreateExplicitDurationMinutes(params.text) ?? timeRange?.durationMinutes ?? 60,
+      defaultAllDay: isBirthday && !startTime,
+    }
+  }
+
   if (!startTime) {
+    if (isBirthday) {
+      return {
+        action: 'draft',
+        draft: {
+          title,
+          startAt: zonedDateTimeToUtcIso(date.localDate, '00:00', params.timezone),
+          endAt: zonedDateTimeToUtcIso(addDaysToLocalDate(date.localDate, 1), '00:00', params.timezone),
+          isAllDay: true,
+          allDayDate: date.localDate,
+          timezone: params.timezone,
+          description: null,
+          datePeriod: date.period,
+          durationMinutes: 24 * 60,
+          colorCategory: color.category,
+          colorId: color.colorId,
+        },
+      }
+    }
+
     return {
       action: 'ask_time',
       reply: `what time should I add ${title.toLowerCase()} ${date.period}?`,
@@ -1859,6 +2016,8 @@ function parseCalendarCreateIntent(params: {
             crossesMidnight: timeRange.crossesMidnight,
           })
         : addMinutesToIso(startAt, durationMinutes),
+      isAllDay: false,
+      allDayDate: null,
       timezone: params.timezone,
       description: null,
       datePeriod: date.period,
@@ -1886,25 +2045,41 @@ function formatCalendarDraftTimeRange(params: {
   return `${dayLabel}, ${start}-${end}`
 }
 
+function formatCalendarAllDayDate(localDate: string): string {
+  return new Intl.DateTimeFormat('en-SG', {
+    timeZone: 'UTC',
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+  }).format(new Date(`${localDate}T12:00:00.000Z`))
+}
+
+function formatCalendarDraftDateTime(draft: CalendarEventDraft | PendingCalendarEventRow): string {
+  const isAllDay = 'isAllDay' in draft ? draft.isAllDay : draft.is_all_day
+  const allDayDate = 'allDayDate' in draft ? draft.allDayDate : draft.all_day_date
+
+  if (isAllDay && allDayDate) {
+    return `${formatCalendarAllDayDate(allDayDate)}, all day`
+  }
+
+  return formatCalendarDraftTimeRange({
+    startAt: 'startAt' in draft ? draft.startAt : draft.start_at,
+    endAt: 'endAt' in draft ? draft.endAt : draft.end_at,
+    timezone: draft.timezone,
+  })
+}
+
 function formatCalendarCreateDraftReply(draft: CalendarEventDraft): string {
   return `I can add this to your calendar:
 
 ${draft.title}
-${formatCalendarDraftTimeRange({
-  startAt: draft.startAt,
-  endAt: draft.endAt,
-  timezone: draft.timezone,
-})}
+${formatCalendarDraftDateTime(draft)}
 
 Confirm?`
 }
 
 function formatCalendarCreatedReply(draft: PendingCalendarEventRow): string {
-  return `added: ${draft.title} — ${formatCalendarDraftTimeRange({
-    startAt: draft.start_at,
-    endAt: draft.end_at,
-    timezone: draft.timezone,
-  })}.`
+  return `added: ${draft.title} — ${formatCalendarDraftDateTime(draft)}.`
 }
 
 function getCalendarPendingSafeMetadata(draft: PendingCalendarEventRow): {
@@ -1916,8 +2091,8 @@ function getCalendarPendingSafeMetadata(draft: PendingCalendarEventRow): {
   return {
     pendingAgeSeconds: Math.max(0, Math.round((Date.now() - Date.parse(draft.created_at)) / 1000)),
     durationMinutes: Math.max(0, Math.round((Date.parse(draft.end_at) - Date.parse(draft.start_at)) / 60000)),
-    hasStartTime: !Number.isNaN(Date.parse(draft.start_at)),
-    hasEndTime: !Number.isNaN(Date.parse(draft.end_at)),
+    hasStartTime: !draft.is_all_day && !Number.isNaN(Date.parse(draft.start_at)),
+    hasEndTime: !draft.is_all_day && !Number.isNaN(Date.parse(draft.end_at)),
   }
 }
 
@@ -1935,7 +2110,7 @@ async function savePendingCalendarEvent(params: {
     .eq('user_id', params.userId)
     .eq('platform', 'telegram')
     .eq('telegram_chat_id', params.chatId)
-    .eq('status', 'pending')
+    .in('status', ['pending', 'awaiting_time', 'awaiting_date'])
 
   if (supersedeError) {
     throw supersedeError
@@ -1948,6 +2123,8 @@ async function savePendingCalendarEvent(params: {
     title: params.draft.title,
     start_at: params.draft.startAt,
     end_at: params.draft.endAt,
+    is_all_day: params.draft.isAllDay,
+    all_day_date: params.draft.allDayDate,
     timezone: params.draft.timezone,
     description: params.draft.description,
     status: 'pending',
@@ -1966,7 +2143,7 @@ async function getLatestPendingCalendarEvent(params: {
 }): Promise<PendingCalendarEventRow | null> {
   const { data, error } = await params.supabase
     .from('pending_calendar_events')
-    .select('id, title, start_at, end_at, timezone, description, expires_at, created_at, updated_at')
+    .select(PENDING_CALENDAR_EVENT_SELECT)
     .eq('user_id', params.userId)
     .eq('platform', 'telegram')
     .eq('telegram_chat_id', params.chatId)
@@ -2011,6 +2188,8 @@ async function updatePendingCalendarEventDraft(params: {
     .update({
       start_at: params.startAt,
       end_at: params.endAt,
+      is_all_day: false,
+      all_day_date: null,
       timezone: params.timezone,
       status: 'pending',
       expires_at: new Date(Date.now() + 20 * 60 * 1000).toISOString(),
@@ -2018,7 +2197,7 @@ async function updatePendingCalendarEventDraft(params: {
     })
     .eq('id', params.id)
     .eq('status', 'pending')
-    .select('id, title, start_at, end_at, timezone, description, expires_at, created_at, updated_at')
+    .select(PENDING_CALENDAR_EVENT_SELECT)
     .maybeSingle()
 
   if (error) {
@@ -2052,7 +2231,7 @@ async function savePendingCalendarTimeClarification(params: {
     .eq('user_id', params.userId)
     .eq('platform', 'telegram')
     .eq('telegram_chat_id', params.chatId)
-    .in('status', ['pending', 'awaiting_time'])
+    .in('status', ['pending', 'awaiting_time', 'awaiting_date'])
 
   if (supersedeError) {
     throw supersedeError
@@ -2065,6 +2244,8 @@ async function savePendingCalendarTimeClarification(params: {
     title: params.title,
     start_at: placeholderStart,
     end_at: placeholderEnd,
+    is_all_day: false,
+    all_day_date: null,
     timezone: params.timezone,
     description: null,
     status: 'awaiting_time',
@@ -2083,11 +2264,82 @@ async function getLatestPendingCalendarTime(params: {
 }): Promise<PendingCalendarTimeRow | null> {
   const { data, error } = await params.supabase
     .from('pending_calendar_events')
-    .select('id, title, start_at, end_at, timezone, description, expires_at, created_at, updated_at')
+    .select(PENDING_CALENDAR_EVENT_SELECT)
     .eq('user_id', params.userId)
     .eq('platform', 'telegram')
     .eq('telegram_chat_id', params.chatId)
     .eq('status', 'awaiting_time')
+    .gt('expires_at', new Date().toISOString())
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+
+  if (error) {
+    throw error
+  }
+
+  return data
+}
+
+async function savePendingCalendarDateClarification(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+  title: string
+  timezone: string
+  durationMinutes: number
+  defaultAllDay: boolean
+}): Promise<void> {
+  const nowIso = new Date().toISOString()
+  const placeholderDate = getLocalDateString(new Date(), params.timezone)
+  const placeholderStart = zonedDateTimeToUtcIso(placeholderDate, '00:00', params.timezone)
+  const placeholderEnd = addMinutesToIso(placeholderStart, Math.max(15, params.durationMinutes))
+  const expiresAt = new Date(Date.now() + 20 * 60 * 1000).toISOString()
+
+  const { error: supersedeError } = await params.supabase
+    .from('pending_calendar_events')
+    .update({ status: 'superseded', updated_at: nowIso })
+    .eq('user_id', params.userId)
+    .eq('platform', 'telegram')
+    .eq('telegram_chat_id', params.chatId)
+    .in('status', ['pending', 'awaiting_time', 'awaiting_date'])
+
+  if (supersedeError) {
+    throw supersedeError
+  }
+
+  const { error } = await params.supabase.from('pending_calendar_events').insert({
+    user_id: params.userId,
+    platform: 'telegram',
+    telegram_chat_id: params.chatId,
+    title: params.title,
+    start_at: placeholderStart,
+    end_at: placeholderEnd,
+    is_all_day: params.defaultAllDay,
+    all_day_date: null,
+    timezone: params.timezone,
+    description: null,
+    status: 'awaiting_date',
+    expires_at: expiresAt,
+  })
+
+  if (error) {
+    throw error
+  }
+}
+
+async function getLatestPendingCalendarDate(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+}): Promise<PendingCalendarDateRow | null> {
+  const { data, error } = await params.supabase
+    .from('pending_calendar_events')
+    .select(PENDING_CALENDAR_EVENT_SELECT)
+    .eq('user_id', params.userId)
+    .eq('platform', 'telegram')
+    .eq('telegram_chat_id', params.chatId)
+    .eq('status', 'awaiting_date')
     .gt('expires_at', new Date().toISOString())
     .order('created_at', { ascending: false })
     .limit(1)
@@ -2115,12 +2367,23 @@ async function cancelPendingCalendarTime(params: {
   }
 }
 
+async function cancelPendingCalendarDate(params: {
+  supabase: ReturnType<typeof getSupabase>
+  id: string
+}): Promise<void> {
+  const { error } = await params.supabase
+    .from('pending_calendar_events')
+    .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+    .eq('id', params.id)
+    .eq('status', 'awaiting_date')
+
+  if (error) {
+    throw error
+  }
+}
+
 function formatCalendarDraftChangedReply(draft: PendingCalendarEventRow): string {
-  const changedTime = formatCalendarDraftTimeRange({
-    startAt: draft.start_at,
-    endAt: draft.end_at,
-    timezone: draft.timezone,
-  })
+  const changedTime = formatCalendarDraftDateTime(draft)
 
   return `Changed to ${changedTime}.
 
@@ -2159,6 +2422,25 @@ async function resolveCalendarCreateRequestReply(params: {
     console.log('calendar_create_time_needed', {
       datePeriod: intent.datePeriod,
       durationMinutes: intent.durationMinutes,
+    })
+
+    return intent.reply
+  }
+
+  if (intent.action === 'ask_date') {
+    await savePendingCalendarDateClarification({
+      supabase: params.supabase,
+      userId: params.userId,
+      chatId: params.chatId,
+      title: intent.title,
+      timezone: intent.timezone,
+      durationMinutes: intent.durationMinutes,
+      defaultAllDay: intent.defaultAllDay,
+    })
+
+    console.log('calendar_create_date_needed', {
+      durationMinutes: intent.durationMinutes,
+      defaultAllDay: intent.defaultAllDay,
     })
 
     return intent.reply
@@ -2297,13 +2579,15 @@ async function resolveCalendarCreateTimeClarificationReply(params: {
     .update({
       start_at: startAt,
       end_at: endAt,
+      is_all_day: false,
+      all_day_date: null,
       status: 'pending',
       expires_at: new Date(Date.now() + 20 * 60 * 1000).toISOString(),
       updated_at: new Date().toISOString(),
     })
     .eq('id', pendingCalendarTime.id)
     .eq('status', 'awaiting_time')
-    .select('id, title, start_at, end_at, timezone, description, expires_at, created_at, updated_at')
+    .select(PENDING_CALENDAR_EVENT_SELECT)
     .maybeSingle()
 
   if (error || !data) {
@@ -2322,9 +2606,107 @@ async function resolveCalendarCreateTimeClarificationReply(params: {
     title: data.title,
     startAt: data.start_at,
     endAt: data.end_at,
+    isAllDay: data.is_all_day,
+    allDayDate: data.all_day_date,
     timezone: data.timezone,
     description: data.description,
     datePeriod: 'pending_date',
+    durationMinutes: getCalendarPendingSafeMetadata(data).durationMinutes,
+    colorCategory: color.category,
+    colorId: color.colorId,
+  })
+}
+
+async function resolveCalendarCreateDateClarificationReply(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+  text: string
+}): Promise<string | null> {
+  const pendingCalendarDate = await getLatestPendingCalendarDate(params)
+
+  if (!pendingCalendarDate) {
+    return null
+  }
+
+  if (isCalendarCreateCancellation(params.text)) {
+    await cancelPendingCalendarDate({ supabase: params.supabase, id: pendingCalendarDate.id })
+    return 'okay, I won’t add it.'
+  }
+
+  const date = parseCalendarCreateLocalDate({
+    text: params.text,
+    timezone: pendingCalendarDate.timezone,
+  })
+
+  if (!date) {
+    return null
+  }
+
+  const timeRange = parseCalendarCreateTimeRange(params.text)
+  const startTime = timeRange?.startTime ?? parseCalendarCreateStartTime(params.text)
+
+  if (timeRange?.needsClarification) {
+    return 'I found an end time before the start time. Should this be an overnight event?'
+  }
+
+  const existingDurationMinutes = Math.max(
+    15,
+    Math.round((Date.parse(pendingCalendarDate.end_at) - Date.parse(pendingCalendarDate.start_at)) / 60000)
+  )
+  const isAllDay = pendingCalendarDate.is_all_day && !startTime
+  const startAt = isAllDay
+    ? zonedDateTimeToUtcIso(date.localDate, '00:00', pendingCalendarDate.timezone)
+    : zonedDateTimeToUtcIso(date.localDate, startTime ?? '09:00', pendingCalendarDate.timezone)
+  const endAt = isAllDay
+    ? zonedDateTimeToUtcIso(addDaysToLocalDate(date.localDate, 1), '00:00', pendingCalendarDate.timezone)
+    : timeRange
+      ? getCalendarRangeEndAt({
+          localDate: date.localDate,
+          endTime: timeRange.endTime,
+          timezone: pendingCalendarDate.timezone,
+          crossesMidnight: timeRange.crossesMidnight,
+        })
+      : addMinutesToIso(startAt, existingDurationMinutes)
+  const color = inferCalendarEventColor(pendingCalendarDate.title)
+
+  const { data, error } = await params.supabase
+    .from('pending_calendar_events')
+    .update({
+      start_at: startAt,
+      end_at: endAt,
+      is_all_day: isAllDay,
+      all_day_date: isAllDay ? date.localDate : null,
+      status: 'pending',
+      expires_at: new Date(Date.now() + 20 * 60 * 1000).toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', pendingCalendarDate.id)
+    .eq('status', 'awaiting_date')
+    .select(PENDING_CALENDAR_EVENT_SELECT)
+    .maybeSingle()
+
+  if (error || !data) {
+    console.error('calendar_create_draft_update_failed', {
+      category: error ? 'supabase_error' : 'pending_calendar_not_found',
+    })
+    return 'I couldn’t update that calendar draft right now.'
+  }
+
+  console.log('calendar_pending_updated', {
+    ...getCalendarPendingSafeMetadata(data),
+    colorCategory: color.category,
+  })
+
+  return formatCalendarCreateDraftReply({
+    title: data.title,
+    startAt: data.start_at,
+    endAt: data.end_at,
+    isAllDay: data.is_all_day,
+    allDayDate: data.all_day_date,
+    timezone: data.timezone,
+    description: data.description,
+    datePeriod: date.period,
     durationMinutes: getCalendarPendingSafeMetadata(data).durationMinutes,
     colorCategory: color.category,
     colorId: color.colorId,
@@ -2375,6 +2757,11 @@ async function resolveCalendarCreateConfirmationReply(params: {
       timezone: pendingCalendarEvent.timezone,
       description: pendingCalendarEvent.description,
       colorId: color.colorId,
+      allDayDate: pendingCalendarEvent.is_all_day ? pendingCalendarEvent.all_day_date : null,
+      allDayEndDate:
+        pendingCalendarEvent.is_all_day && pendingCalendarEvent.all_day_date
+          ? addDaysToLocalDate(pendingCalendarEvent.all_day_date, 1)
+          : null,
     })
 
     await updatePendingCalendarEventStatus({
@@ -4819,6 +5206,31 @@ Reply naturally as Bergi using the recent conversation context.`
           userId,
           role: 'assistant',
           content: calendarCreateTimeClarificationReply,
+        })
+        return new Response('OK', { status: 200 })
+      }
+    }
+
+    if (isPlainTextMessage) {
+      const calendarCreateDateClarificationReply = await resolveCalendarCreateDateClarificationReply({
+        supabase,
+        userId,
+        chatId,
+        text: userText,
+      })
+
+      if (calendarCreateDateClarificationReply !== null) {
+        if (isLocalTestMode) {
+          console.log('Local test calendar create date clarification reply generated')
+        } else {
+          await sendTelegramMessage(chatId, calendarCreateDateClarificationReply)
+        }
+
+        await saveMessage({
+          supabase,
+          userId,
+          role: 'assistant',
+          content: calendarCreateDateClarificationReply,
         })
         return new Response('OK', { status: 200 })
       }

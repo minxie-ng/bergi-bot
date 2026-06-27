@@ -521,10 +521,17 @@ function extractFallbackExpenseTitle(text: string): string {
     .trim()
 }
 
+const MONTH_DATE_ONLY_PATTERN =
+  /^(?:(?:[0-2]?\d|3[01])(?:st|nd|rd|th)?\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)|(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(?:[0-2]?\d|3[01])(?:st|nd|rd|th)?)(?:\s+\d{4})?$/
+
 export function detectFinanceCandidate(text: string): boolean {
   const normalized = normalizeFinanceText(text)
 
   if (isClearCalendarSchedulingRequest(normalized)) {
+    return false
+  }
+
+  if (MONTH_DATE_ONLY_PATTERN.test(normalized)) {
     return false
   }
 
