@@ -55,10 +55,18 @@ import { createSupabaseExpense, querySupabaseExpenses } from '@/lib/supabase-exp
 import { truncateText } from '@/lib/text-utils'
 import {
   ensureDefaultFeatureFlags,
+  type UserFeatureFlags,
   isOwnerTelegramUser,
   setUserProactiveFeature,
   upsertOnboardingState,
 } from '@/lib/user-feature-flags'
+import {
+  disconnectGoogleCalendarIntegration,
+  getGoogleCalendarConnectionStatus,
+  getGoogleCalendarOAuthAccess,
+  GoogleCalendarOAuthError,
+  type GoogleCalendarAccess,
+} from '@/lib/google-calendar-oauth'
 
 type TelegramUpdate = {
   message?: {
@@ -319,6 +327,9 @@ type TelegramSlashCommand =
   | '/start'
   | '/help'
   | '/privacy'
+  | '/connect_calendar'
+  | '/disconnect_calendar'
+  | '/calendar_status'
   | '/stop_checkins'
   | '/checkin_status'
   | '/pause_checkins'
@@ -573,6 +584,9 @@ function normalizeTelegramCommand(text: string): TelegramSlashCommand | null {
     case '/start':
     case '/help':
     case '/privacy':
+    case '/connect_calendar':
+    case '/disconnect_calendar':
+    case '/calendar_status':
     case '/stop_checkins':
     case '/checkin_status':
     case '/pause_checkins':
@@ -669,7 +683,102 @@ Try asking me:
 }
 
 function getAlphaCalendarUnavailableReply(): string {
-  return 'Calendar connection is coming next. For now, I can still help with reminders and planning in chat.'
+  return 'Please connect Google Calendar first.'
+}
+
+function getAlphaCalendarNotConfiguredReply(): string {
+  return 'Google Calendar connection is not configured yet. I can still help with reminders and planning in chat.'
+}
+
+function getGoogleCalendarConnectUrl(params: { telegramUserId: number; chatId: number }): string | null {
+  const redirectUri = process.env.GOOGLE_OAUTH_REDIRECT_URI?.trim()
+
+  if (!redirectUri) {
+    return null
+  }
+
+  try {
+    const url = new URL('/api/integrations/google/start', new URL(redirectUri).origin)
+    url.searchParams.set('telegram_user_id', String(params.telegramUserId))
+    url.searchParams.set('chat_id', String(params.chatId))
+
+    return url.toString()
+  } catch {
+    return null
+  }
+}
+
+function getGoogleCalendarConnectReplyMarkup(connectUrl: string): TelegramInlineKeyboardMarkup {
+  return {
+    inline_keyboard: [[{ text: 'Connect Google Calendar', url: connectUrl }]],
+  }
+}
+
+function getGoogleCalendarConnectReply(connectUrl: string | null): {
+  text: string
+  replyMarkup?: TelegramInlineKeyboardMarkup
+} {
+  if (!connectUrl) {
+    return { text: getAlphaCalendarNotConfiguredReply() }
+  }
+
+  return {
+    text: 'Tap below to connect Google Calendar.',
+    replyMarkup: getGoogleCalendarConnectReplyMarkup(connectUrl),
+  }
+}
+
+type CalendarAccessResolution =
+  | { canUseCalendar: true; mode: 'service_account' | 'oauth'; access?: GoogleCalendarAccess }
+  | { canUseCalendar: false; reply: string }
+
+async function resolveTelegramCalendarAccess(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  telegramUserId: number
+  chatId: number
+  isOwner: boolean
+  featureFlags: UserFeatureFlags
+}): Promise<CalendarAccessResolution> {
+  if (params.isOwner && params.featureFlags.calendar_enabled) {
+    return { canUseCalendar: true, mode: 'service_account' }
+  }
+
+  if (params.isOwner) {
+    return { canUseCalendar: false, reply: getFeatureUnavailableReply('Calendar') }
+  }
+
+  if (!params.featureFlags.calendar_enabled) {
+    return { canUseCalendar: false, reply: getAlphaCalendarUnavailableReply() }
+  }
+
+  try {
+    const access = await getGoogleCalendarOAuthAccess({
+      supabase: params.supabase,
+      userId: params.userId,
+    })
+
+    return { canUseCalendar: true, mode: 'oauth', access }
+  } catch (error) {
+    const category =
+      error instanceof GoogleCalendarOAuthError ? error.category : 'google_calendar_oauth_access_failed'
+
+    console.warn('google_calendar_oauth_access_failed', { category })
+
+    if (category === 'missing_env' || category === 'missing_token_encryption_key') {
+      return { canUseCalendar: false, reply: getAlphaCalendarNotConfiguredReply() }
+    }
+
+    if (category === 'needs_reconnect' || category === 'token_refresh_failed') {
+      return { canUseCalendar: false, reply: 'Please reconnect Google Calendar first.' }
+    }
+
+    return { canUseCalendar: false, reply: getAlphaCalendarUnavailableReply() }
+  }
+}
+
+function getCalendarAccessParams(access: CalendarAccessResolution | null): GoogleCalendarAccess | undefined {
+  return access?.canUseCalendar && access.mode === 'oauth' ? access.access : undefined
 }
 
 function getFeatureUnavailableReply(feature: string): string {
@@ -1645,6 +1754,7 @@ async function resolveCalendarQueryReply(params: {
   userId: string
   chatId: number
   intent: CalendarQueryIntent
+  calendarAccess?: GoogleCalendarAccess
 }): Promise<string> {
   if (params.intent.mode === 'clarify' || params.intent.period === 'unsupported') {
     return getCalendarClarificationReply()
@@ -1662,6 +1772,8 @@ async function resolveCalendarQueryReply(params: {
     timeMin: range.timeMin,
     timeMax: range.timeMax,
     maxResults: range.maxResults,
+    accessToken: params.calendarAccess?.accessToken,
+    calendarId: params.calendarAccess?.calendarId,
   })
 
   console.log('calendar_query_success', {
@@ -2880,6 +2992,7 @@ async function resolveCalendarCreateConfirmationReply(params: {
   userId: string
   chatId: number
   text: string
+  calendarAccess?: GoogleCalendarAccess
 }): Promise<string | null> {
   if (!isCalendarCreateConfirmation(params.text) && !isCalendarCreateCancellation(params.text)) {
     return null
@@ -2924,6 +3037,8 @@ async function resolveCalendarCreateConfirmationReply(params: {
         pendingCalendarEvent.is_all_day && pendingCalendarEvent.all_day_date
           ? addDaysToLocalDate(pendingCalendarEvent.all_day_date, 1)
           : null,
+      accessToken: params.calendarAccess?.accessToken,
+      calendarId: params.calendarAccess?.calendarId,
     })
 
     await updatePendingCalendarEventStatus({
@@ -3320,6 +3435,7 @@ async function resolveCalendarPlanningReply(params: {
   userId: string
   chatId: number
   intent: CalendarPlanningIntent
+  calendarAccess?: GoogleCalendarAccess
 }): Promise<string> {
   if (params.intent.kind === 'clarify' || params.intent.period === 'unsupported') {
     return getCalendarPlanningClarificationReply()
@@ -3337,6 +3453,8 @@ async function resolveCalendarPlanningReply(params: {
     timeMin: range.timeMin,
     timeMax: range.timeMax,
     maxResults: range.maxResults,
+    accessToken: params.calendarAccess?.accessToken,
+    calendarId: params.calendarAccess?.calendarId,
   })
 
   console.log('calendar_planning_success', {
@@ -4921,7 +5039,7 @@ function formatForTelegramPlainText(text: string): string {
 }
 
 type TelegramInlineKeyboardMarkup = {
-  inline_keyboard: Array<Array<{ text: string; callback_data: string }>>
+  inline_keyboard: Array<Array<{ text: string; callback_data?: string; url?: string }>>
 }
 
 async function sendTelegramMessage(
@@ -5063,10 +5181,24 @@ export async function POST(request: Request) {
           userId,
           status: 'complete',
         })
-        callbackReply =
-          callbackData === 'alpha_onboarding_calendar_connect'
-            ? `Google Calendar connect is coming next. I’ll leave it skipped for now.\n\n${getAlphaOnboardingDoneReply()}`
-            : getAlphaOnboardingDoneReply()
+        if (callbackData === 'alpha_onboarding_calendar_connect') {
+          if (isOwner) {
+            callbackReply = `Google Calendar is already available for you.\n\n${getAlphaOnboardingDoneReply()}`
+          } else {
+            const connectionStatus = await getGoogleCalendarConnectionStatus({ supabase, userId })
+            if (connectionStatus.status === 'connected') {
+              callbackReply = `Google Calendar is already connected.\n\n${getAlphaOnboardingDoneReply()}`
+            } else {
+              const connectReply = getGoogleCalendarConnectReply(
+                getGoogleCalendarConnectUrl({ telegramUserId: from.id, chatId })
+              )
+              callbackReply = `${connectReply.text}\n\n${getAlphaOnboardingDoneReply()}`
+              callbackReplyMarkup = connectReply.replyMarkup
+            }
+          }
+        } else {
+          callbackReply = getAlphaOnboardingDoneReply()
+        }
       }
 
       if (callbackReply !== null) {
@@ -5138,7 +5270,6 @@ export async function POST(request: Request) {
     const isOwner = isOwnerTelegramUser(from.id)
     const featureFlags = await ensureDefaultFeatureFlags({ supabase, userId, isOwner })
     const canUseNotionFinance = isOwner && featureFlags.notion_enabled
-    const canUseServiceAccountCalendar = isOwner && featureFlags.calendar_enabled
 
     if (!featureFlags.chat_enabled || !featureFlags.alpha_enabled) {
       const unavailableReply = getFeatureUnavailableReply('Chat')
@@ -5271,12 +5402,30 @@ Reply naturally as Bergi using the recent conversation context.`
     const financeText = selectedPhoto === null ? userText ?? transcribedVoiceText : null
     const financeSource = transcribedVoiceText !== null ? 'voice' : 'text'
     const isFinanceCandidate = financeText !== null && detectFinanceCandidate(financeText)
+    const telegramUserId = from.id
+    const telegramChatId = chatId
 
     if (financeSource === 'voice' && financeText !== null) {
       logFinanceInfo('voice_transcription_finance_checked', {
         transcriptLength: financeText.length,
         isCandidate: isFinanceCandidate,
       })
+    }
+
+    let calendarAccessForRequest: CalendarAccessResolution | null = null
+    const resolveCalendarAccessForRequest = async (): Promise<CalendarAccessResolution> => {
+      if (calendarAccessForRequest === null) {
+        calendarAccessForRequest = await resolveTelegramCalendarAccess({
+          supabase,
+          userId,
+          telegramUserId,
+          chatId: telegramChatId,
+          isOwner,
+          featureFlags,
+        })
+      }
+
+      return calendarAccessForRequest
     }
 
     if (isPlainTextMessage && isThoughtCaptureCommand(userText)) {
@@ -5369,6 +5518,80 @@ Reply naturally as Bergi using the recent conversation context.`
         }
 
         await saveMessage({ supabase, userId, role: 'assistant', content: privacyReply })
+        return new Response('OK', { status: 200 })
+      }
+
+      if (telegramCommand === '/connect_calendar') {
+        let connectReply: string
+        let connectReplyMarkup: TelegramInlineKeyboardMarkup | undefined
+
+        if (isOwner && featureFlags.calendar_enabled) {
+          connectReply = 'Google Calendar is already available for you.'
+        } else {
+          const connectionStatus = await getGoogleCalendarConnectionStatus({ supabase, userId })
+          if (!isOwner && connectionStatus.status === 'connected') {
+            connectReply = 'Google Calendar is already connected.'
+          } else {
+            const response = getGoogleCalendarConnectReply(getGoogleCalendarConnectUrl({ telegramUserId: from.id, chatId }))
+            connectReply = response.text
+            connectReplyMarkup = response.replyMarkup
+          }
+        }
+
+        if (isLocalTestMode) {
+          console.log('Local test calendar connect reply generated')
+        } else {
+          await sendTelegramMessage(chatId, connectReply, connectReplyMarkup)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: connectReply })
+        return new Response('OK', { status: 200 })
+      }
+
+      if (telegramCommand === '/disconnect_calendar') {
+        const disconnectReply =
+          isOwner && featureFlags.calendar_enabled
+            ? 'Owner Calendar uses Bergi’s service-account setup, so I won’t disconnect it here.'
+            : await (async () => {
+                await disconnectGoogleCalendarIntegration({ supabase, userId })
+                return 'Google Calendar disconnected.'
+              })()
+
+        if (isLocalTestMode) {
+          console.log('Local test calendar disconnect reply generated')
+        } else {
+          await sendTelegramMessage(chatId, disconnectReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: disconnectReply })
+        return new Response('OK', { status: 200 })
+      }
+
+      if (telegramCommand === '/calendar_status') {
+        let statusReply: string
+
+        if (isOwner && featureFlags.calendar_enabled) {
+          statusReply = 'Google Calendar is connected for you through Bergi Core.'
+        } else {
+          const connectionStatus = await getGoogleCalendarConnectionStatus({ supabase, userId })
+          if (connectionStatus.status === 'connected') {
+            statusReply = connectionStatus.email
+              ? `Google Calendar is connected as ${connectionStatus.email}.`
+              : 'Google Calendar is connected.'
+          } else if (connectionStatus.status === 'needs_reconnect' || connectionStatus.status === 'expired') {
+            statusReply = 'Google Calendar needs reconnecting.'
+          } else {
+            statusReply = 'Google Calendar is not connected.'
+          }
+        }
+
+        if (isLocalTestMode) {
+          console.log('Local test calendar status reply generated')
+        } else {
+          await sendTelegramMessage(chatId, statusReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: statusReply })
         return new Response('OK', { status: 200 })
       }
 
@@ -5618,54 +5841,82 @@ Reply naturally as Bergi using the recent conversation context.`
       }
     }
 
-    if (isPlainTextMessage && !canUseServiceAccountCalendar) {
+    if (isPlainTextMessage) {
       const calendarPlanningIntent = financeText !== null ? detectCalendarPlanningIntent(financeText) : null
       const calendarQueryIntent = financeText !== null ? detectCalendarQueryIntent(financeText) : null
       const calendarCreateRequested = isLikelyCalendarCreateRequest(userText)
 
       if (calendarCreateRequested || calendarPlanningIntent !== null || calendarQueryIntent !== null) {
-        const calendarUnavailableReply = getAlphaCalendarUnavailableReply()
+        const accessResolution = await resolveCalendarAccessForRequest()
 
-        console.log('calendar_service_account_blocked', {
+        console.log('calendar_access_checked', {
           isOwner,
           calendarEnabled: featureFlags.calendar_enabled,
           hasCreateIntent: calendarCreateRequested,
           hasPlanningIntent: calendarPlanningIntent !== null,
           hasQueryIntent: calendarQueryIntent !== null,
+          mode: accessResolution.canUseCalendar ? accessResolution.mode : 'unavailable',
         })
 
-        if (isLocalTestMode) {
-          console.log('Local test calendar unavailable reply generated')
-        } else {
-          await sendTelegramMessage(chatId, calendarUnavailableReply)
-        }
+        if (!accessResolution.canUseCalendar) {
+          const calendarUnavailableReply = accessResolution.reply
 
-        await saveMessage({ supabase, userId, role: 'assistant', content: calendarUnavailableReply })
-        return new Response('OK', { status: 200 })
+          if (isLocalTestMode) {
+            console.log('Local test calendar unavailable reply generated')
+          } else {
+            await sendTelegramMessage(chatId, calendarUnavailableReply)
+          }
+
+          await saveMessage({ supabase, userId, role: 'assistant', content: calendarUnavailableReply })
+          return new Response('OK', { status: 200 })
+        }
       }
     }
 
-    if (isPlainTextMessage && canUseServiceAccountCalendar) {
-      const calendarCreateConfirmationReply = await resolveCalendarCreateConfirmationReply({
-        supabase,
-        userId,
-        chatId,
-        text: userText,
-      })
+    if (
+      isPlainTextMessage &&
+      (isCalendarCreateConfirmation(userText) || isCalendarCreateCancellation(userText))
+    ) {
+      const pendingCalendarEvent = await getLatestPendingCalendarEvent({ supabase, userId, chatId })
 
-      if (calendarCreateConfirmationReply !== null) {
-        if (isLocalTestMode) {
-          console.log('Local test calendar create confirmation reply generated')
-        } else {
-          await sendTelegramMessage(chatId, calendarCreateConfirmationReply)
+      if (pendingCalendarEvent !== null) {
+        const accessResolution = await resolveCalendarAccessForRequest()
+
+        if (!accessResolution.canUseCalendar && isCalendarCreateConfirmation(userText)) {
+          const calendarUnavailableReply = accessResolution.reply
+
+          if (isLocalTestMode) {
+            console.log('Local test calendar unavailable reply generated')
+          } else {
+            await sendTelegramMessage(chatId, calendarUnavailableReply)
+          }
+
+          await saveMessage({ supabase, userId, role: 'assistant', content: calendarUnavailableReply })
+          return new Response('OK', { status: 200 })
         }
 
-        await saveMessage({ supabase, userId, role: 'assistant', content: calendarCreateConfirmationReply })
-        return new Response('OK', { status: 200 })
+        const calendarCreateConfirmationReply = await resolveCalendarCreateConfirmationReply({
+          supabase,
+          userId,
+          chatId,
+          text: userText,
+          calendarAccess: getCalendarAccessParams(accessResolution),
+        })
+
+        if (calendarCreateConfirmationReply !== null) {
+          if (isLocalTestMode) {
+            console.log('Local test calendar create confirmation reply generated')
+          } else {
+            await sendTelegramMessage(chatId, calendarCreateConfirmationReply)
+          }
+
+          await saveMessage({ supabase, userId, role: 'assistant', content: calendarCreateConfirmationReply })
+          return new Response('OK', { status: 200 })
+        }
       }
     }
 
-    if (isPlainTextMessage && canUseServiceAccountCalendar) {
+    if (isPlainTextMessage && isCalendarDraftEditRequest(userText)) {
       const calendarCreateEditReply = await resolveCalendarCreateEditReply({
         supabase,
         userId,
@@ -5685,7 +5936,7 @@ Reply naturally as Bergi using the recent conversation context.`
       }
     }
 
-    if (isPlainTextMessage && canUseServiceAccountCalendar) {
+    if (isPlainTextMessage) {
       const calendarCreateTimeClarificationReply = await resolveCalendarCreateTimeClarificationReply({
         supabase,
         userId,
@@ -5710,7 +5961,7 @@ Reply naturally as Bergi using the recent conversation context.`
       }
     }
 
-    if (isPlainTextMessage && canUseServiceAccountCalendar) {
+    if (isPlainTextMessage) {
       const calendarCreateDateClarificationReply = await resolveCalendarCreateDateClarificationReply({
         supabase,
         userId,
@@ -5757,7 +6008,22 @@ Reply naturally as Bergi using the recent conversation context.`
       }
     }
 
-    if (isPlainTextMessage && canUseServiceAccountCalendar) {
+    if (isPlainTextMessage && isLikelyCalendarCreateRequest(userText)) {
+      const accessResolution = await resolveCalendarAccessForRequest()
+
+      if (!accessResolution.canUseCalendar) {
+        const calendarUnavailableReply = accessResolution.reply
+
+        if (isLocalTestMode) {
+          console.log('Local test calendar unavailable reply generated')
+        } else {
+          await sendTelegramMessage(chatId, calendarUnavailableReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: calendarUnavailableReply })
+        return new Response('OK', { status: 200 })
+      }
+
       const calendarCreateRequestReply = await resolveCalendarCreateRequestReply({
         supabase,
         userId,
@@ -5890,27 +6156,33 @@ Reply naturally as Bergi using the recent conversation context.`
         })
 
         let calendarPlanningReply: string
+        const accessResolution = await resolveCalendarAccessForRequest()
 
-        try {
-          calendarPlanningReply = await resolveCalendarPlanningReply({
-            supabase,
-            userId,
-            chatId,
-            intent: calendarPlanningIntent,
-          })
-        } catch (error) {
-          const calendarError =
-            error instanceof CalendarReadError
-              ? error
-              : new CalendarReadError({ category: 'google_unknown_error' })
+        if (!accessResolution.canUseCalendar) {
+          calendarPlanningReply = accessResolution.reply
+        } else {
+          try {
+            calendarPlanningReply = await resolveCalendarPlanningReply({
+              supabase,
+              userId,
+              chatId,
+              intent: calendarPlanningIntent,
+              calendarAccess: getCalendarAccessParams(accessResolution),
+            })
+          } catch (error) {
+            const calendarError =
+              error instanceof CalendarReadError
+                ? error
+                : new CalendarReadError({ category: 'google_unknown_error' })
 
-          console.error('calendar_planning_failed', {
-            category: calendarError.category,
-          })
-          calendarPlanningReply =
-            calendarError.category === 'missing_env'
-              ? 'I can read your calendar once the Google Calendar connection is set up.'
-              : 'I couldn’t read your calendar right now.'
+            console.error('calendar_planning_failed', {
+              category: calendarError.category,
+            })
+            calendarPlanningReply =
+              calendarError.category === 'missing_env'
+                ? 'I can read your calendar once the Google Calendar connection is set up.'
+                : 'I couldn’t read your calendar right now.'
+          }
         }
 
         if (isLocalTestMode) {
@@ -5976,29 +6248,35 @@ Reply naturally as Bergi using the recent conversation context.`
         })
 
         let calendarQueryReply: string
+        const accessResolution = await resolveCalendarAccessForRequest()
 
-        try {
-          calendarQueryReply = await resolveCalendarQueryReply({
-            supabase,
-            userId,
-            chatId,
-            intent: calendarQueryIntent,
-          })
-        } catch (error) {
-          const calendarError =
-            error instanceof CalendarReadError
-              ? error
-              : new CalendarReadError({ category: 'google_unknown_error' })
+        if (!accessResolution.canUseCalendar) {
+          calendarQueryReply = accessResolution.reply
+        } else {
+          try {
+            calendarQueryReply = await resolveCalendarQueryReply({
+              supabase,
+              userId,
+              chatId,
+              intent: calendarQueryIntent,
+              calendarAccess: getCalendarAccessParams(accessResolution),
+            })
+          } catch (error) {
+            const calendarError =
+              error instanceof CalendarReadError
+                ? error
+                : new CalendarReadError({ category: 'google_unknown_error' })
 
-          console.error('calendar_query_failed', {
-            category: calendarError.category,
-            status: calendarError.status,
-            reason: calendarError.reason,
-          })
-          calendarQueryReply =
-            calendarError.category === 'missing_env'
-              ? 'I can read your calendar once the Google Calendar connection is set up.'
-              : 'I couldn’t read your calendar right now.'
+            console.error('calendar_query_failed', {
+              category: calendarError.category,
+              status: calendarError.status,
+              reason: calendarError.reason,
+            })
+            calendarQueryReply =
+              calendarError.category === 'missing_env'
+                ? 'I can read your calendar once the Google Calendar connection is set up.'
+                : 'I couldn’t read your calendar right now.'
+          }
         }
 
         if (isLocalTestMode) {

@@ -50,6 +50,8 @@ export type CalendarCreateEventInput = {
   colorId?: string
   allDayDate?: string | null
   allDayEndDate?: string | null
+  accessToken?: string
+  calendarId?: string
 }
 
 const WEEKDAY_MATCHES: Array<{ index: 0 | 1 | 2 | 3 | 4 | 5 | 6; label: string; pattern: RegExp }> = [
@@ -607,14 +609,16 @@ export async function queryGoogleCalendarEvents(params: {
   timeMin: string
   timeMax?: string
   maxResults?: number
+  accessToken?: string
+  calendarId?: string
 }): Promise<CalendarEvent[]> {
-  const calendarId = process.env.GOOGLE_CALENDAR_ID
+  const calendarId = params.calendarId ?? process.env.GOOGLE_CALENDAR_ID
 
   if (!calendarId) {
     throw new CalendarReadError({ category: 'missing_env' })
   }
 
-  const accessToken = await getGoogleCalendarAccessToken()
+  const accessToken = params.accessToken ?? (await getGoogleCalendarAccessToken())
   const searchParams = new URLSearchParams({
     timeMin: params.timeMin,
     singleEvents: 'true',
@@ -672,13 +676,13 @@ export async function queryGoogleCalendarEvents(params: {
 }
 
 export async function createGoogleCalendarEvent(params: CalendarCreateEventInput): Promise<void> {
-  const calendarId = process.env.GOOGLE_CALENDAR_ID
+  const calendarId = params.calendarId ?? process.env.GOOGLE_CALENDAR_ID
 
   if (!calendarId) {
     throw new CalendarReadError({ category: 'missing_env' })
   }
 
-  const accessToken = await getGoogleCalendarAccessToken()
+  const accessToken = params.accessToken ?? (await getGoogleCalendarAccessToken())
   const abortController = new AbortController()
   const timeout = setTimeout(() => abortController.abort(), 1800)
   const start =
