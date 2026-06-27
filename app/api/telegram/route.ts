@@ -82,6 +82,21 @@ type TelegramUpdate = {
       file_size?: number
     }>
   }
+  callback_query?: {
+    id: string
+    data?: string
+    from?: {
+      id?: number
+      username?: string
+      first_name?: string
+      last_name?: string
+    }
+    message?: {
+      chat?: {
+        id?: number
+      }
+    }
+  }
 }
 
 function getTelegramMessageTypes(message: TelegramUpdate['message']): string[] {
@@ -294,7 +309,9 @@ type SaveReminderParams = {
 
 type ProactiveCheckinControlAction = 'pause' | 'resume' | 'status'
 type TelegramSlashCommand =
+  | '/start'
   | '/help'
+  | '/privacy'
   | '/checkin_status'
   | '/pause_checkins'
   | '/resume_checkins'
@@ -545,7 +562,9 @@ function normalizeTelegramCommand(text: string): TelegramSlashCommand | null {
   const command = firstToken.split('@')[0]
 
   switch (command) {
+    case '/start':
     case '/help':
+    case '/privacy':
     case '/checkin_status':
     case '/pause_checkins':
     case '/resume_checkins':
@@ -579,6 +598,92 @@ commands:
 /capture_this — save the previous thought as a note
 
 you don’t need exact commands most of the time — just talk to me naturally.`
+}
+
+function getAlphaStartReply(): string {
+  return `Hey, I’m Bergi — Min Xie’s private AI companion project.
+
+For this short private alpha, I can help with:
+
+• chat naturally with you
+• remember useful life notes
+• understand voice messages
+• understand photos you send
+• set reminders
+• check in proactively, if you enable it
+• log and query simple finance records
+• help with Google Calendar planning, if you connect Calendar
+
+To work properly, I may store things like your messages, reminders, finance logs, calendar connection status, and useful memory notes.
+
+Please don’t send passwords, private keys, or highly sensitive information.
+
+Ready to try Bergi?`
+}
+
+function getAlphaPrivacyReply(): string {
+  return `Bergi stores only what it needs to work during this private alpha: messages, reminders, finance logs, check-in settings, calendar connection status, and useful memory notes.
+
+Please don’t send passwords, private keys, or highly sensitive information.
+
+Google Calendar connection is not live yet for alpha users.`
+}
+
+function getAlphaAskNameReply(): string {
+  return 'What should I call you?'
+}
+
+function getAlphaProactiveChoiceReply(): string {
+  return `Do you want Bergi to proactively check in with you during this test?
+
+This is one of Bergi’s core features — it lets Bergi message first instead of only replying when you start the chat.`
+}
+
+function getAlphaCalendarChoiceReply(): string {
+  return `Want to connect Google Calendar?
+
+This lets Bergi help you check your schedule, find free time, and create calendar events after confirmation.`
+}
+
+function getAlphaOnboardingDoneReply(): string {
+  return `You’re set.
+
+Try asking me:
+• send me a voice note
+• send me a photo and ask what I think
+• remind me to drink water in 30 minutes
+• what’s on my calendar tomorrow?
+• when am I free today?
+• schedule gym tomorrow 7pm
+• log $5 lunch
+• check in with me tomorrow morning`
+}
+
+function getAlphaStartReplyMarkup(): TelegramInlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [{ text: 'Agree and start', callback_data: 'alpha_onboarding_agree' }],
+      [{ text: 'Privacy details', callback_data: 'alpha_onboarding_privacy' }],
+    ],
+  }
+}
+
+function getAlphaProactiveReplyMarkup(): TelegramInlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [{ text: 'Light check-ins — recommended', callback_data: 'alpha_onboarding_proactive_light' }],
+      [{ text: 'No, only reply when I message', callback_data: 'alpha_onboarding_proactive_none' }],
+    ],
+  }
+}
+
+function getAlphaCalendarReplyMarkup(): TelegramInlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [{ text: 'Connect Google Calendar — recommended', callback_data: 'alpha_onboarding_calendar_connect' }],
+      [{ text: 'Skip for now', callback_data: 'alpha_onboarding_calendar_skip' }],
+    ],
+  }
 }
 
 function getProactiveCheckinControlActionFromCommand(
@@ -4447,6 +4552,26 @@ async function getRecentMessages(params: {
     .map((message) => ({ role: message.role as 'user' | 'assistant', content: message.content as string }))
 }
 
+async function getLatestAssistantMessage(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+}): Promise<string | null> {
+  const { data, error } = await params.supabase
+    .from('messages')
+    .select('content')
+    .eq('user_id', params.userId)
+    .eq('role', 'assistant')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+
+  if (error) {
+    throw error
+  }
+
+  return typeof data?.content === 'string' ? data.content : null
+}
+
 function trimMessagesByCharacterLimit(
   messages: Array<{ role: 'user' | 'assistant'; content: string }>,
   maxCharacters: number
@@ -4723,7 +4848,15 @@ function formatForTelegramPlainText(text: string): string {
     .trim()
 }
 
-async function sendTelegramMessage(chatId: number, text: string): Promise<void> {
+type TelegramInlineKeyboardMarkup = {
+  inline_keyboard: Array<Array<{ text: string; callback_data: string }>>
+}
+
+async function sendTelegramMessage(
+  chatId: number,
+  text: string,
+  replyMarkup?: TelegramInlineKeyboardMarkup
+): Promise<void> {
   const botToken = process.env.TELEGRAM_BOT_TOKEN
 
   if (!botToken) {
@@ -4738,6 +4871,7 @@ async function sendTelegramMessage(chatId: number, text: string): Promise<void> 
     body: JSON.stringify({
       chat_id: chatId,
       text,
+      reply_markup: replyMarkup,
     }),
   })
 
@@ -4746,21 +4880,45 @@ async function sendTelegramMessage(chatId: number, text: string): Promise<void> 
   }
 }
 
+async function answerTelegramCallbackQuery(callbackQueryId: string): Promise<void> {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN
+
+  if (!botToken) {
+    throw new Error('Missing Telegram bot token')
+  }
+
+  const response = await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      callback_query_id: callbackQueryId,
+    }),
+  })
+
+  if (!response.ok) {
+    throw new Error(`Telegram answerCallbackQuery request failed: ${response.status}`)
+  }
+}
+
 export async function POST(request: Request) {
   let chatId: number | undefined
 
   try {
     const update = (await request.json()) as TelegramUpdate
-    chatId = update.message?.chat?.id
+    chatId = update.message?.chat?.id ?? update.callback_query?.message?.chat?.id
     const userText = update.message?.text
     const caption = update.message?.caption
     const voice = update.message?.voice
     const photo = update.message?.photo
-    const from = update.message?.from
+    const from = update.message?.from ?? update.callback_query?.from
+    const callbackData = update.callback_query?.data
     const isLocalTestMode = process.env.LOCAL_TEST_MODE === 'true'
 
     console.log('Telegram webhook received', {
       hasMessage: Boolean(update.message),
+      hasCallbackQuery: Boolean(update.callback_query),
       messageTypes: getTelegramMessageTypes(update.message),
       hasChatId: chatId !== undefined,
       hasUserId: from?.id !== undefined,
@@ -4780,6 +4938,51 @@ export async function POST(request: Request) {
       }
 
       return new Response('OK', { status: 200 })
+    }
+
+    if (callbackData !== undefined && update.callback_query?.id !== undefined) {
+      const supabase = getSupabase()
+      const userId = await findOrCreateUserAccount({
+        supabase,
+        platformUserId: String(from.id),
+        username: from.username,
+        firstName: from.first_name,
+        lastName: from.last_name,
+      })
+      let callbackReply: string | null = null
+      let callbackReplyMarkup: TelegramInlineKeyboardMarkup | undefined
+
+      if (callbackData === 'alpha_onboarding_agree') {
+        callbackReply = getAlphaAskNameReply()
+      } else if (callbackData === 'alpha_onboarding_privacy') {
+        callbackReply = getAlphaPrivacyReply()
+      } else if (
+        callbackData === 'alpha_onboarding_proactive_light' ||
+        callbackData === 'alpha_onboarding_proactive_none'
+      ) {
+        callbackReply = getAlphaCalendarChoiceReply()
+        callbackReplyMarkup = getAlphaCalendarReplyMarkup()
+      } else if (
+        callbackData === 'alpha_onboarding_calendar_connect' ||
+        callbackData === 'alpha_onboarding_calendar_skip'
+      ) {
+        callbackReply =
+          callbackData === 'alpha_onboarding_calendar_connect'
+            ? `Google Calendar connect is coming next. I’ll leave it skipped for now.\n\n${getAlphaOnboardingDoneReply()}`
+            : getAlphaOnboardingDoneReply()
+      }
+
+      if (callbackReply !== null) {
+        if (!isLocalTestMode) {
+          await answerTelegramCallbackQuery(update.callback_query.id)
+          await sendTelegramMessage(chatId, callbackReply, callbackReplyMarkup)
+        } else {
+          console.log('Local test onboarding callback reply generated')
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: callbackReply })
+        return new Response('OK', { status: 200 })
+      }
     }
 
     const selectedPhoto = chooseTelegramPhotoSize(photo)
@@ -4932,8 +5135,38 @@ Reply naturally as Bergi using the recent conversation context.`
 
     const savedUserMessageId = await saveMessage({ supabase, userId, role: 'user', content: userMessageToSave })
 
+    if (isPlainTextMessage && normalizeTelegramCommand(userText) === null) {
+      const latestAssistantMessage = await getLatestAssistantMessage({ supabase, userId })
+
+      if (latestAssistantMessage === getAlphaAskNameReply()) {
+        const proactiveChoiceReply = getAlphaProactiveChoiceReply()
+
+        if (isLocalTestMode) {
+          console.log('Local test onboarding proactive choice reply generated')
+        } else {
+          await sendTelegramMessage(chatId, proactiveChoiceReply, getAlphaProactiveReplyMarkup())
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: proactiveChoiceReply })
+        return new Response('OK', { status: 200 })
+      }
+    }
+
     if (isPlainTextMessage) {
       const telegramCommand = normalizeTelegramCommand(userText)
+
+      if (telegramCommand === '/start') {
+        const startReply = getAlphaStartReply()
+
+        if (isLocalTestMode) {
+          console.log('Local test start reply generated')
+        } else {
+          await sendTelegramMessage(chatId, startReply, getAlphaStartReplyMarkup())
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: startReply })
+        return new Response('OK', { status: 200 })
+      }
 
       if (telegramCommand === '/help') {
         const helpReply = getHelpReply()
@@ -4945,6 +5178,19 @@ Reply naturally as Bergi using the recent conversation context.`
         }
 
         await saveMessage({ supabase, userId, role: 'assistant', content: helpReply })
+        return new Response('OK', { status: 200 })
+      }
+
+      if (telegramCommand === '/privacy') {
+        const privacyReply = getAlphaPrivacyReply()
+
+        if (isLocalTestMode) {
+          console.log('Local test privacy reply generated')
+        } else {
+          await sendTelegramMessage(chatId, privacyReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: privacyReply })
         return new Response('OK', { status: 200 })
       }
 
