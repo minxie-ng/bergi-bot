@@ -4184,7 +4184,7 @@ Rules:
 - If the user does not mention a timezone or location, assume Asia/Singapore.
 - Resolve relative dates like "today", "later", "tomorrow", "tonight", and "next week" based on the timezone being used, not UTC.
 - Only detect future events that have enough event info and time info.
-- Do not create reminders directly. Ask whether Min wants a reminder.
+- Do not create reminders directly. Ask whether the user wants a reminder.
 - event_time must include an explicit timezone offset or Z.
 - timezone must be an IANA timezone.
 - Also support simple German future event mentions, especially words like: Treffen, Termin, Unterricht, Prüfung, Projekt, Projektmeeting, Anruf, Präsentation.

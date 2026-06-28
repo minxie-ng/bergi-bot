@@ -41,6 +41,7 @@ export type FinanceBlockReason =
   | 'query'
   | 'foreign_currency'
   | 'multiple_expenses'
+  | 'unclear_logging_intent'
   | 'suspicious_high_amount'
   | 'invalid_expense'
 
@@ -266,6 +267,32 @@ const EVERYDAY_EXPENSE_KEYWORDS = [
 ]
 const EXPENSE_VERB_PATTERN =
   /\b(spent|spend|paid|pay|bought|buy|renewal|subscription|subscribe|treat|treated)\b/gi
+const EXPENSE_LOG_COMMAND_PATTERN = /\b(log|record|track|add)\b/i
+const VAGUE_EXPENSE_TITLE_WORDS = new Set([
+  'idk',
+  'lol',
+  'haha',
+  'this',
+  'that',
+  'it',
+  'thing',
+  'things',
+  'stuff',
+  'something',
+  'anything',
+  'one',
+  'there',
+  'here',
+  'looks',
+  'look',
+  'like',
+  'seems',
+  'seem',
+  'maybe',
+  'probably',
+  'so',
+  'much',
+])
 const FINANCE_QUERY_KEYWORDS = [
   'how much did i spend',
   'what did i spend',
@@ -516,9 +543,56 @@ function extractFallbackExpenseTitle(text: string): string {
     .replace(/\b(i|i'm|im|me|my)\b/gi, ' ')
     .replace(/\b(today|yesterday|tonight|this morning|this afternoon|this evening)\b/gi, ' ')
     .replace(EXPENSE_VERB_PATTERN, ' ')
+    .replace(EXPENSE_LOG_COMMAND_PATTERN, ' ')
     .replace(/^\s*(on|for)\s+/i, '')
     .replace(/\s+/g, ' ')
     .trim()
+}
+
+function hasConversationalMoneyCue(text: string): boolean {
+  return /\b(idk|lol|haha|looks?\s+like|seems?\s+like|so\s+much|maybe|probably)\b/i.test(text)
+}
+
+function hasConcreteExpenseTitle(text: string): boolean {
+  const title = extractFallbackExpenseTitle(text)
+  const concreteWords = title
+    .toLowerCase()
+    .split(/\s+/)
+    .map((word) => word.replace(/[^a-z0-9-]/g, ''))
+    .filter((word) => word.length > 0 && !VAGUE_EXPENSE_TITLE_WORDS.has(word))
+
+  return concreteWords.length > 0
+}
+
+function hasExplicitExpenseLoggingIntent(text: string): boolean {
+  return (
+    EXPENSE_LOG_COMMAND_PATTERN.test(text) ||
+    /\b(?:log|record|track|add)\s+(?:it|this|that|expense)\b/i.test(text)
+  )
+}
+
+function hasClearSpendExpensePattern(text: string): boolean {
+  return (
+    hasFinanceKeyword(text) &&
+    hasConcreteExpenseTitle(text) &&
+    !/\b(?:spend|spent|paid|pay|bought|buy)\b.*\b(?:on|for)\s+(?:this|that|it|something|stuff|thing)\b/i.test(text)
+  )
+}
+
+function hasClearExpenseLoggingIntent(text: string): boolean {
+  if (hasExplicitExpenseLoggingIntent(text)) {
+    return true
+  }
+
+  if (hasConversationalMoneyCue(text)) {
+    return false
+  }
+
+  return (
+    (hasAmountItemPattern(text) && hasConcreteExpenseTitle(text)) ||
+    (hasItemAmountPattern(text) && hasConcreteExpenseTitle(text)) ||
+    hasClearSpendExpensePattern(text)
+  )
 }
 
 const MONTH_DATE_ONLY_PATTERN =
@@ -624,6 +698,14 @@ export function classifyFinanceIntent(text: string): FinanceIntentClassification
     return {
       intent: 'query',
       reason: 'query',
+    }
+  }
+
+  if (!hasClearExpenseLoggingIntent(normalized)) {
+    return {
+      intent: 'ambiguous',
+      reason: 'unclear_logging_intent',
+      reply: 'Do you want me to log this as an expense?',
     }
   }
 

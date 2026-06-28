@@ -1,7 +1,9 @@
 import { createClient } from '@supabase/supabase-js'
+import { getOnboardingState, isOwnerTelegramUser } from '@/lib/user-feature-flags'
 
 type ReminderRow = {
   id: string
+  user_id: string
   telegram_chat_id: number
   reminder_text: string
 }
@@ -40,6 +42,36 @@ async function sendTelegramMessage(chatId: number, text: string): Promise<void> 
   }
 }
 
+async function formatReminderDeliveryMessage(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  telegramChatId: number
+  reminderText: string
+}): Promise<string> {
+  if (isOwnerTelegramUser(params.telegramChatId)) {
+    return `Min, reminder: ${params.reminderText}`
+  }
+
+  let onboardingState: Awaited<ReturnType<typeof getOnboardingState>> = null
+
+  try {
+    onboardingState = await getOnboardingState({ supabase: params.supabase, userId: params.userId })
+  } catch (error) {
+    const supabaseError = error as { code?: unknown }
+    console.warn('reminder_preferred_name_lookup_failed', {
+      code: typeof supabaseError.code === 'string' ? supabaseError.code : undefined,
+    })
+  }
+
+  const preferredName = onboardingState?.preferred_name?.trim()
+
+  if (preferredName) {
+    return `${preferredName}, reminder: ${params.reminderText}`
+  }
+
+  return `Reminder: ${params.reminderText}`
+}
+
 function isAuthorized(request: Request): boolean {
   const cronSecret = process.env.CRON_SECRET
 
@@ -69,7 +101,7 @@ async function handleSendReminders(request: Request) {
 
     const { data: dueReminders, error: dueRemindersError } = await supabase
       .from('reminders')
-      .select('id, telegram_chat_id, reminder_text')
+      .select('id, user_id, telegram_chat_id, reminder_text')
       .eq('status', 'pending')
       .lte('remind_at', nowIso)
       .limit(10)
@@ -92,7 +124,7 @@ async function handleSendReminders(request: Request) {
         })
         .eq('id', reminder.id)
         .eq('status', 'pending')
-        .select('id, telegram_chat_id, reminder_text')
+        .select('id, user_id, telegram_chat_id, reminder_text')
         .maybeSingle()
 
       if (claimError) {
@@ -107,7 +139,14 @@ async function handleSendReminders(request: Request) {
       }
 
       try {
-        await sendTelegramMessage(claimedReminder.telegram_chat_id, `Min, reminder: ${claimedReminder.reminder_text}`)
+        const reminderMessage = await formatReminderDeliveryMessage({
+          supabase,
+          userId: claimedReminder.user_id,
+          telegramChatId: claimedReminder.telegram_chat_id,
+          reminderText: claimedReminder.reminder_text,
+        })
+
+        await sendTelegramMessage(claimedReminder.telegram_chat_id, reminderMessage)
 
         const sentTime = new Date().toISOString()
         const { error: sentError } = await supabase
