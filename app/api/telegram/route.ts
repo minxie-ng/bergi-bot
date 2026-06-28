@@ -39,11 +39,14 @@ import {
   createNotionExpenseLog,
   detectFinanceCandidate,
   detectFinanceQueryIntent,
+  FINANCE_CATEGORIES,
   formatFinanceCorrectionForParser,
   formatExpenseLoggedReply,
   type FinanceExpenseQueryResult,
   type FinanceQueryIntent,
+  type FinanceCategory,
   NotionExpenseLogError,
+  type ParsedExpenseLog,
   parseFinanceAmountCorrection,
   parseExpenseLogWithLLM,
   parsePendingSuspiciousExpenseConfirmation,
@@ -164,6 +167,23 @@ type SaveMessageParams = {
   userId: string
   role: 'user' | 'assistant'
   content: string
+}
+
+type PendingFinanceConfirmationRow = {
+  id: string
+  user_id: string
+  telegram_chat_id: string | null
+  amount: number | string
+  currency: string | null
+  category: string | null
+  merchant: string | null
+  note: string | null
+  raw_text: string | null
+  spent_at: string
+  status: string
+  expires_at: string
+  created_at: string
+  updated_at: string
 }
 
 type UserProfile = {
@@ -2497,12 +2517,17 @@ async function getLatestPendingCalendarEvent(params: {
 
 async function updatePendingCalendarEventStatus(params: {
   supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
   id: string
   status: 'confirmed' | 'cancelled' | 'failed'
 }): Promise<void> {
   const { error } = await params.supabase
     .from('pending_calendar_events')
     .update({ status: params.status, updated_at: new Date().toISOString() })
+    .eq('user_id', params.userId)
+    .eq('platform', 'telegram')
+    .eq('telegram_chat_id', params.chatId)
     .eq('id', params.id)
 
   if (error) {
@@ -2512,6 +2537,8 @@ async function updatePendingCalendarEventStatus(params: {
 
 async function updatePendingCalendarEventDraft(params: {
   supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
   id: string
   startAt: string
   endAt: string
@@ -2529,6 +2556,9 @@ async function updatePendingCalendarEventDraft(params: {
       expires_at: new Date(Date.now() + 20 * 60 * 1000).toISOString(),
       updated_at: new Date().toISOString(),
     })
+    .eq('user_id', params.userId)
+    .eq('platform', 'telegram')
+    .eq('telegram_chat_id', params.chatId)
     .eq('id', params.id)
     .eq('status', 'pending')
     .select(PENDING_CALENDAR_EVENT_SELECT)
@@ -2688,11 +2718,16 @@ async function getLatestPendingCalendarDate(params: {
 
 async function cancelPendingCalendarTime(params: {
   supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
   id: string
 }): Promise<void> {
   const { error } = await params.supabase
     .from('pending_calendar_events')
     .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+    .eq('user_id', params.userId)
+    .eq('platform', 'telegram')
+    .eq('telegram_chat_id', params.chatId)
     .eq('id', params.id)
     .eq('status', 'awaiting_time')
 
@@ -2703,11 +2738,16 @@ async function cancelPendingCalendarTime(params: {
 
 async function cancelPendingCalendarDate(params: {
   supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
   id: string
 }): Promise<void> {
   const { error } = await params.supabase
     .from('pending_calendar_events')
     .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+    .eq('user_id', params.userId)
+    .eq('platform', 'telegram')
+    .eq('telegram_chat_id', params.chatId)
     .eq('id', params.id)
     .eq('status', 'awaiting_date')
 
@@ -2850,6 +2890,8 @@ async function resolveCalendarCreateEditReply(params: {
 
   const updatedPendingCalendarEvent = await updatePendingCalendarEventDraft({
     supabase: params.supabase,
+    userId: params.userId,
+    chatId: params.chatId,
     id: pendingCalendarEvent.id,
     startAt,
     endAt,
@@ -2877,7 +2919,12 @@ async function resolveCalendarCreateTimeClarificationReply(params: {
   }
 
   if (isCalendarCreateCancellation(params.text)) {
-    await cancelPendingCalendarTime({ supabase: params.supabase, id: pendingCalendarTime.id })
+    await cancelPendingCalendarTime({
+      supabase: params.supabase,
+      userId: params.userId,
+      chatId: params.chatId,
+      id: pendingCalendarTime.id,
+    })
     return 'okay, I won’t add it.'
   }
 
@@ -2919,6 +2966,9 @@ async function resolveCalendarCreateTimeClarificationReply(params: {
       expires_at: new Date(Date.now() + 20 * 60 * 1000).toISOString(),
       updated_at: new Date().toISOString(),
     })
+    .eq('user_id', params.userId)
+    .eq('platform', 'telegram')
+    .eq('telegram_chat_id', params.chatId)
     .eq('id', pendingCalendarTime.id)
     .eq('status', 'awaiting_time')
     .select(PENDING_CALENDAR_EVENT_SELECT)
@@ -2964,7 +3014,12 @@ async function resolveCalendarCreateDateClarificationReply(params: {
   }
 
   if (isCalendarCreateCancellation(params.text)) {
-    await cancelPendingCalendarDate({ supabase: params.supabase, id: pendingCalendarDate.id })
+    await cancelPendingCalendarDate({
+      supabase: params.supabase,
+      userId: params.userId,
+      chatId: params.chatId,
+      id: pendingCalendarDate.id,
+    })
     return 'okay, I won’t add it.'
   }
 
@@ -3015,6 +3070,9 @@ async function resolveCalendarCreateDateClarificationReply(params: {
       expires_at: new Date(Date.now() + 20 * 60 * 1000).toISOString(),
       updated_at: new Date().toISOString(),
     })
+    .eq('user_id', params.userId)
+    .eq('platform', 'telegram')
+    .eq('telegram_chat_id', params.chatId)
     .eq('id', pendingCalendarDate.id)
     .eq('status', 'awaiting_date')
     .select(PENDING_CALENDAR_EVENT_SELECT)
@@ -3070,6 +3128,8 @@ async function resolveCalendarCreateConfirmationReply(params: {
   if (isCalendarCreateCancellation(params.text)) {
     await updatePendingCalendarEventStatus({
       supabase: params.supabase,
+      userId: params.userId,
+      chatId: params.chatId,
       id: pendingCalendarEvent.id,
       status: 'cancelled',
     })
@@ -3103,6 +3163,8 @@ async function resolveCalendarCreateConfirmationReply(params: {
 
     await updatePendingCalendarEventStatus({
       supabase: params.supabase,
+      userId: params.userId,
+      chatId: params.chatId,
       id: pendingCalendarEvent.id,
       status: 'confirmed',
     })
@@ -3119,6 +3181,8 @@ async function resolveCalendarCreateConfirmationReply(params: {
 
     await updatePendingCalendarEventStatus({
       supabase: params.supabase,
+      userId: params.userId,
+      chatId: params.chatId,
       id: pendingCalendarEvent.id,
       status: 'failed',
     })
@@ -3968,7 +4032,127 @@ async function saveMessage(params: SaveMessageParams): Promise<string> {
   return String(data.id)
 }
 
+const PENDING_FINANCE_CONFIRMATION_SELECT =
+  'id,user_id,telegram_chat_id,amount,currency,category,merchant,note,raw_text,spent_at,status,expires_at,created_at,updated_at'
+
 async function getLatestPendingFinanceConfirmation(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+}): Promise<PendingFinanceConfirmationRow | null> {
+  const { data, error } = await params.supabase
+    .from('pending_finance_confirmations')
+    .select(PENDING_FINANCE_CONFIRMATION_SELECT)
+    .eq('user_id', params.userId)
+    .eq('telegram_chat_id', String(params.chatId))
+    .eq('status', 'pending')
+    .gt('expires_at', new Date().toISOString())
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+
+  if (error) {
+    throw error
+  }
+
+  return data as PendingFinanceConfirmationRow | null
+}
+
+async function savePendingFinanceConfirmation(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+  expenseLog: ParsedExpenseLog
+  rawText: string
+}): Promise<void> {
+  const nowIso = new Date().toISOString()
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString()
+
+  const { error: supersedeError } = await params.supabase
+    .from('pending_finance_confirmations')
+    .update({ status: 'superseded', updated_at: nowIso })
+    .eq('user_id', params.userId)
+    .eq('telegram_chat_id', String(params.chatId))
+    .eq('status', 'pending')
+
+  if (supersedeError) {
+    throw supersedeError
+  }
+
+  const { error } = await params.supabase.from('pending_finance_confirmations').insert({
+    user_id: params.userId,
+    telegram_chat_id: String(params.chatId),
+    amount: params.expenseLog.amount,
+    currency: 'SGD',
+    category: params.expenseLog.category,
+    merchant: params.expenseLog.expense,
+    note: params.expenseLog.comment,
+    raw_text: params.rawText,
+    spent_at: params.expenseLog.date,
+    status: 'pending',
+    expires_at: expiresAt,
+  })
+
+  if (error) {
+    throw error
+  }
+}
+
+async function updatePendingFinanceConfirmationStatus(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  chatId: number
+  id: string
+  status: 'logged' | 'cancelled' | 'failed'
+}): Promise<void> {
+  const { error } = await params.supabase
+    .from('pending_finance_confirmations')
+    .update({ status: params.status, updated_at: new Date().toISOString() })
+    .eq('user_id', params.userId)
+    .eq('telegram_chat_id', String(params.chatId))
+    .eq('id', params.id)
+    .eq('status', 'pending')
+
+  if (error) {
+    throw error
+  }
+}
+
+function isFinanceConfirmationYes(text: string): boolean {
+  return /^(yes|yea|yeah|yep|yup|sure|ok|okay|confirm|log it|save it)$/i.test(text.trim())
+}
+
+function isFinanceConfirmationNo(text: string): boolean {
+  return /^(no|nah|nope|cancel|cancel it|don't|dont|do not|never mind|nevermind)$/i.test(text.trim())
+}
+
+function isFinanceCategory(value: string | null): value is FinanceCategory {
+  return value !== null && FINANCE_CATEGORIES.includes(value as FinanceCategory)
+}
+
+function pendingFinanceConfirmationToExpenseLog(row: PendingFinanceConfirmationRow): ParsedExpenseLog {
+  const amount = Number(row.amount)
+
+  return {
+    is_expense: true,
+    date: row.spent_at,
+    expense: row.merchant?.trim() || row.note?.trim() || 'expense',
+    amount: Number.isFinite(amount) ? amount : 0,
+    category: isFinanceCategory(row.category) ? row.category : 'Others',
+    comment: row.note,
+  }
+}
+
+function isParsedExpenseLogUsable(expenseLog: ParsedExpenseLog): boolean {
+  return (
+    expenseLog.is_expense === true &&
+    expenseLog.expense.trim().length > 0 &&
+    Number.isFinite(expenseLog.amount) &&
+    expenseLog.amount > 0
+  )
+}
+
+async function getLatestSuspiciousFinanceConfirmationFromAssistant(params: {
   supabase: ReturnType<typeof getSupabase>
   userId: string
 }) {
@@ -4484,6 +4668,9 @@ async function resolvePendingReminderTimeReply(params: {
       status: 'pending',
       updated_at: new Date().toISOString(),
     })
+    .eq('user_id', params.userId)
+    .eq('platform', 'telegram')
+    .eq('telegram_chat_id', params.chatId)
     .eq('id', pendingReminder.id)
     .eq('status', 'awaiting_reminder_time')
     .select('id')
@@ -6474,6 +6661,151 @@ Reply naturally as Bergi using the recent conversation context.`
       }
     }
 
+    if (financeText !== null && (isFinanceConfirmationYes(financeText) || isFinanceConfirmationNo(financeText))) {
+      const pendingFinanceConfirmation = await getLatestPendingFinanceConfirmation({ supabase, userId, chatId })
+
+      if (pendingFinanceConfirmation !== null) {
+        if (!featureFlags.finance_enabled) {
+          const financeUnavailableReply = getFeatureUnavailableReply('Finance')
+
+          if (isLocalTestMode) {
+            console.log('Local test finance disabled reply generated')
+          } else {
+            await sendTelegramMessage(chatId, financeUnavailableReply)
+          }
+
+          await saveMessage({ supabase, userId, role: 'assistant', content: financeUnavailableReply })
+          return new Response('OK', { status: 200 })
+        }
+
+        if (isFinanceConfirmationNo(financeText)) {
+          await updatePendingFinanceConfirmationStatus({
+            supabase,
+            userId,
+            chatId,
+            id: pendingFinanceConfirmation.id,
+            status: 'cancelled',
+          })
+
+          const cancelFinanceReply = "Okay, I won’t log it."
+
+          if (isLocalTestMode) {
+            console.log('Local test pending finance cancellation reply generated')
+          } else {
+            await sendTelegramMessage(chatId, cancelFinanceReply)
+          }
+
+          await saveMessage({ supabase, userId, role: 'assistant', content: cancelFinanceReply })
+          logFinanceInfo('finance_pending_confirmation_cancelled')
+          return new Response('OK', { status: 200 })
+        }
+
+        const expenseLog = pendingFinanceConfirmationToExpenseLog(pendingFinanceConfirmation)
+
+        if (!isParsedExpenseLogUsable(expenseLog)) {
+          await updatePendingFinanceConfirmationStatus({
+            supabase,
+            userId,
+            chatId,
+            id: pendingFinanceConfirmation.id,
+            status: 'failed',
+          })
+
+          const invalidPendingFinanceReply = "I couldn't understand that pending expense clearly enough to log it."
+
+          if (isLocalTestMode) {
+            console.log('Local test pending finance invalid reply generated')
+          } else {
+            await sendTelegramMessage(chatId, invalidPendingFinanceReply)
+          }
+
+          await saveMessage({ supabase, userId, role: 'assistant', content: invalidPendingFinanceReply })
+          logFinanceInfo('finance_pending_confirmation_invalid')
+          return new Response('OK', { status: 200 })
+        }
+
+        const financeCreateStartedAt = Date.now()
+        logFinanceInfo('finance_pending_confirmation_create_started', {
+          store: canUseNotionFinance ? 'notion' : 'supabase',
+        })
+
+        try {
+          await saveParsedExpenseLog({
+            supabase,
+            userId,
+            expenseLog,
+            rawText: pendingFinanceConfirmation.raw_text ?? 'pending finance confirmation',
+            source: 'telegram_pending_finance_confirmation',
+            useNotionFinance: canUseNotionFinance,
+          })
+          await updatePendingFinanceConfirmationStatus({
+            supabase,
+            userId,
+            chatId,
+            id: pendingFinanceConfirmation.id,
+            status: 'logged',
+          })
+          logFinanceInfo('finance_pending_confirmation_create_success', {
+            durationMs: Date.now() - financeCreateStartedAt,
+            store: canUseNotionFinance ? 'notion' : 'supabase',
+          })
+        } catch (error) {
+          const notionError =
+            error instanceof NotionExpenseLogError
+              ? error
+              : new NotionExpenseLogError({ category: 'notion_unknown_error' })
+
+          logFinanceError('finance_pending_confirmation_create_failed', {
+            durationMs: Date.now() - financeCreateStartedAt,
+            status: notionError.status,
+            notionCode: notionError.notionCode,
+            category: error instanceof NotionExpenseLogError ? notionError.category : 'supabase_or_unknown_error',
+            store: canUseNotionFinance ? 'notion' : 'supabase',
+          })
+
+          try {
+            await updatePendingFinanceConfirmationStatus({
+              supabase,
+              userId,
+              chatId,
+              id: pendingFinanceConfirmation.id,
+              status: 'failed',
+            })
+          } catch (statusError) {
+            logFinanceError('finance_pending_confirmation_status_failed', {
+              category: (statusError as { code?: unknown }).code ?? 'unknown_error',
+            })
+          }
+
+          const financeToolErrorReply =
+            canUseNotionFinance && notionError.category === 'notion_schema_mismatch'
+              ? 'I found the expense, but my Notion database fields don’t match what I expected yet.'
+              : 'I found the expense, but I couldn’t save it right now.'
+
+          if (isLocalTestMode) {
+            console.log('Local test pending finance tool error reply generated')
+          } else {
+            await sendTelegramMessage(chatId, financeToolErrorReply)
+          }
+
+          await saveMessage({ supabase, userId, role: 'assistant', content: financeToolErrorReply })
+          return new Response('OK', { status: 200 })
+        }
+
+        const financeReply = formatExpenseLoggedReply(expenseLog)
+
+        if (isLocalTestMode) {
+          console.log('Local test pending finance confirmation reply generated')
+        } else {
+          await sendTelegramMessage(chatId, financeReply)
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: financeReply })
+        logFinanceInfo('finance_pending_confirmation_reply_sent')
+        return new Response('OK', { status: 200 })
+      }
+    }
+
     if (financeText !== null) {
       const financeQueryIntent = detectFinanceQueryIntent(financeText)
 
@@ -6528,7 +6860,7 @@ Reply naturally as Bergi using the recent conversation context.`
       const correctionAmount = parseFinanceAmountCorrection(financeText)
 
       if (correctionAmount !== null) {
-        const pendingFinanceConfirmation = await getLatestPendingFinanceConfirmation({ supabase, userId })
+        const pendingFinanceConfirmation = await getLatestSuspiciousFinanceConfirmationFromAssistant({ supabase, userId })
 
         if (pendingFinanceConfirmation !== null) {
           if (!featureFlags.finance_enabled) {
@@ -6695,8 +7027,9 @@ Reply naturally as Bergi using the recent conversation context.`
       })
 
       const financeIntent = classifyFinanceIntent(financeText)
-
-      const shouldTryExpenseLog = financeIntent.intent === 'expense_log'
+      const shouldCreatePendingFinanceConfirmation =
+        financeIntent.intent === 'ambiguous' && financeIntent.reason === 'unclear_logging_intent'
+      const shouldTryExpenseLog = financeIntent.intent === 'expense_log' || shouldCreatePendingFinanceConfirmation
 
       if (financeIntent.intent === 'query') {
         logFinanceInfo('finance_ambiguous', { reason: financeIntent.reason ?? 'query' })
@@ -6775,6 +7108,46 @@ Reply naturally as Bergi using the recent conversation context.`
 
           await saveMessage({ supabase, userId, role: 'assistant', content: financeValidation.reply })
           logFinanceInfo('finance_reply_sent', { outcome: financeValidation.reason })
+          return new Response('OK', { status: 200 })
+        }
+
+        if (shouldCreatePendingFinanceConfirmation) {
+          try {
+            await savePendingFinanceConfirmation({
+              supabase,
+              userId,
+              chatId,
+              expenseLog,
+              rawText: financeText,
+            })
+            logFinanceInfo('finance_pending_confirmation_created')
+          } catch (error) {
+            logFinanceError('finance_pending_confirmation_create_failed', {
+              category: (error as { code?: unknown }).code ?? 'supabase_or_unknown_error',
+            })
+
+            const financePendingErrorReply = 'I found a possible expense, but I couldn’t save the confirmation right now.'
+
+            if (isLocalTestMode) {
+              console.log('Local test finance pending confirmation error reply generated')
+            } else {
+              await sendTelegramMessage(chatId, financePendingErrorReply)
+            }
+
+            await saveMessage({ supabase, userId, role: 'assistant', content: financePendingErrorReply })
+            return new Response('OK', { status: 200 })
+          }
+
+          const financeConfirmationReply = financeIntent.reply ?? 'Do you want me to log this as an expense?'
+
+          if (isLocalTestMode) {
+            console.log('Local test finance pending confirmation reply generated')
+          } else {
+            await sendTelegramMessage(chatId, financeConfirmationReply)
+          }
+
+          await saveMessage({ supabase, userId, role: 'assistant', content: financeConfirmationReply })
+          logFinanceInfo('finance_reply_sent', { outcome: 'pending_confirmation_created' })
           return new Response('OK', { status: 200 })
         }
 
