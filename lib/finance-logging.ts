@@ -705,7 +705,7 @@ export function classifyFinanceIntent(text: string): FinanceIntentClassification
     return {
       intent: 'ambiguous',
       reason: 'unclear_logging_intent',
-      reply: 'Do you want me to log this as an expense?',
+      reply: 'I’m not fully sure if that was an expense. To log it, say something like: ‘log $20 for lunch’.',
     }
   }
 

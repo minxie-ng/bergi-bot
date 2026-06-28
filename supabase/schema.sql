@@ -2,6 +2,60 @@ create extension if not exists pgcrypto;
 create extension if not exists pg_cron;
 create extension if not exists pg_net;
 
+create table if not exists users (
+  id uuid primary key default gen_random_uuid(),
+  created_at timestamp with time zone not null default now(),
+  updated_at timestamp with time zone not null default now()
+);
+
+alter table users enable row level security;
+
+create table if not exists user_accounts (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references users(id) on delete cascade,
+  platform text not null,
+  platform_user_id text not null,
+  username text,
+  first_name text,
+  last_name text,
+  created_at timestamp with time zone not null default now(),
+  updated_at timestamp with time zone not null default now(),
+  constraint user_accounts_platform_user_key unique (platform, platform_user_id)
+);
+
+create index if not exists user_accounts_user_id_idx
+on user_accounts(user_id);
+
+alter table user_accounts enable row level security;
+
+create table if not exists messages (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references users(id) on delete cascade,
+  platform text not null default 'telegram',
+  role text not null,
+  content text not null,
+  created_at timestamp with time zone not null default now()
+);
+
+create index if not exists messages_user_created_at_idx
+on messages(user_id, created_at desc);
+
+create index if not exists messages_user_platform_role_created_at_idx
+on messages(user_id, platform, role, created_at desc);
+
+alter table messages enable row level security;
+
+create table if not exists user_profiles (
+  user_id uuid primary key references users(id) on delete cascade,
+  display_name text,
+  preferred_language text,
+  personality_prompt text,
+  created_at timestamp with time zone not null default now(),
+  updated_at timestamp with time zone not null default now()
+);
+
+alter table user_profiles enable row level security;
+
 create table if not exists reminders (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null references users(id) on delete cascade,
@@ -208,6 +262,31 @@ create index if not exists expenses_user_category_spent_at_idx
 on expenses(user_id, category, spent_at desc);
 
 alter table expenses enable row level security;
+
+create table if not exists pending_finance_confirmations (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references users(id) on delete cascade,
+  telegram_chat_id text,
+  amount numeric not null,
+  currency text not null default 'SGD',
+  category text,
+  merchant text,
+  note text,
+  raw_text text,
+  spent_at timestamp with time zone not null default now(),
+  status text not null default 'pending',
+  expires_at timestamp with time zone not null,
+  created_at timestamp with time zone not null default now(),
+  updated_at timestamp with time zone not null default now()
+);
+
+create index if not exists pending_finance_confirmations_user_chat_status_idx
+on pending_finance_confirmations(user_id, telegram_chat_id, status, expires_at);
+
+create index if not exists pending_finance_confirmations_status_expires_idx
+on pending_finance_confirmations(status, expires_at);
+
+alter table pending_finance_confirmations enable row level security;
 
 create table if not exists user_integrations (
   id uuid primary key default gen_random_uuid(),

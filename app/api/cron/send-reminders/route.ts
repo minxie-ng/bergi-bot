@@ -123,6 +123,7 @@ async function handleSendReminders(request: Request) {
           updated_at: claimTime,
         })
         .eq('id', reminder.id)
+        .eq('user_id', reminder.user_id)
         .eq('status', 'pending')
         .select('id, user_id, telegram_chat_id, reminder_text')
         .maybeSingle()
@@ -157,6 +158,7 @@ async function handleSendReminders(request: Request) {
             updated_at: sentTime,
           })
           .eq('id', claimedReminder.id)
+          .eq('user_id', claimedReminder.user_id)
 
         if (sentError) {
           throw sentError
@@ -174,6 +176,7 @@ async function handleSendReminders(request: Request) {
             updated_at: failedTime,
           })
           .eq('id', claimedReminder.id)
+          .eq('user_id', claimedReminder.user_id)
 
         if (failedUpdateError) {
           console.error('Failed to mark reminder as failed:', failedUpdateError)
