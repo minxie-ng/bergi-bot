@@ -20,6 +20,16 @@ export type UserFeatureFlags = {
 export type OnboardingStatus = 'not_started' | 'awaiting_name' | 'choosing_proactive' | 'choosing_calendar' | 'complete'
 export type ProactivePreference = 'light' | 'off'
 
+export type OnboardingState = {
+  user_id: string
+  status: OnboardingStatus
+  preferred_name: string | null
+  proactive_preference: ProactivePreference | null
+  privacy_acknowledged_at: string | null
+  created_at: string
+  updated_at: string
+}
+
 export function isOwnerTelegramUser(telegramUserId: number): boolean {
   const ownerTelegramUserId = process.env.OWNER_TELEGRAM_USER_ID?.trim()
 
@@ -189,6 +199,29 @@ export async function setUserProactiveFeature(params: {
     logAlphaFoundationSupabaseError('set_user_proactive_feature', 'user_feature_flags', error)
     throw error
   }
+}
+
+export async function getOnboardingState(params: {
+  supabase: SupabaseClient
+  userId: string
+}): Promise<OnboardingState | null> {
+  const { data, error } = await params.supabase
+    .from('onboarding_state')
+    .select('*')
+    .eq('user_id', params.userId)
+    .maybeSingle()
+
+  if (error) {
+    if (isMissingAlphaFoundationTableError(error, 'onboarding_state')) {
+      logMissingAlphaFoundationTable('get_onboarding_state', 'onboarding_state', error)
+      return null
+    }
+
+    logAlphaFoundationSupabaseError('get_onboarding_state', 'onboarding_state', error)
+    throw error
+  }
+
+  return data as OnboardingState | null
 }
 
 export async function upsertOnboardingState(params: {

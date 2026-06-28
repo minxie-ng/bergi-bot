@@ -55,6 +55,7 @@ import { createSupabaseExpense, querySupabaseExpenses } from '@/lib/supabase-exp
 import { truncateText } from '@/lib/text-utils'
 import {
   ensureDefaultFeatureFlags,
+  getOnboardingState,
   type UserFeatureFlags,
   isOwnerTelegramUser,
   setUserProactiveFeature,
@@ -5229,6 +5230,36 @@ export async function POST(request: Request) {
     }
 
     const selectedPhoto = chooseTelegramPhotoSize(photo)
+    const supabase = getSupabase()
+    const userId = await findOrCreateUserAccount({
+      supabase,
+      platformUserId: String(from.id),
+      username: from.username,
+      firstName: from.first_name,
+      lastName: from.last_name,
+    })
+    const isOwner = isOwnerTelegramUser(from.id)
+    const featureFlags = await ensureDefaultFeatureFlags({ supabase, userId, isOwner })
+
+    if (!isOwner && (userText !== undefined || voice !== undefined || selectedPhoto !== null)) {
+      const onboardingState = await getOnboardingState({ supabase, userId })
+      const onboardingStatus = onboardingState?.status ?? 'not_started'
+      const isAwaitingNameTextReply =
+        onboardingStatus === 'awaiting_name' && userText !== undefined && voice === undefined && selectedPhoto === null
+
+      if (onboardingStatus !== 'complete' && !isAwaitingNameTextReply) {
+        const startReply = getAlphaStartReply()
+
+        if (isLocalTestMode) {
+          console.log('Local test auto-start onboarding reply generated')
+        } else {
+          await sendTelegramMessage(chatId, startReply, getAlphaStartReplyMarkup())
+        }
+
+        await saveMessage({ supabase, userId, role: 'assistant', content: startReply })
+        return new Response('OK', { status: 200 })
+      }
+    }
 
     if (userText === undefined && voice === undefined && selectedPhoto === null) {
       let nonTextReply = "eh I received something, but I don't know how to process it yet 😵‍💫"
@@ -5241,20 +5272,6 @@ export async function POST(request: Request) {
         nonTextReply = 'gif received but I not smart enough to understand it yet sia'
         nonTextContent = '[gif] user sent a GIF'
       }
-
-      const supabase = getSupabase()
-      const userId = await findOrCreateUserAccount({
-        supabase,
-        platformUserId: String(from.id),
-        username: from.username,
-        firstName: from.first_name,
-        lastName: from.last_name,
-      })
-      await ensureDefaultFeatureFlags({
-        supabase,
-        userId,
-        isOwner: isOwnerTelegramUser(from.id),
-      })
 
       await saveMessage({ supabase, userId, role: 'user', content: nonTextContent })
 
@@ -5273,16 +5290,6 @@ export async function POST(request: Request) {
       return new Response('OK', { status: 200 })
     }
 
-    const supabase = getSupabase()
-    const userId = await findOrCreateUserAccount({
-      supabase,
-      platformUserId: String(from.id),
-      username: from.username,
-      firstName: from.first_name,
-      lastName: from.last_name,
-    })
-    const isOwner = isOwnerTelegramUser(from.id)
-    const featureFlags = await ensureDefaultFeatureFlags({ supabase, userId, isOwner })
     const canUseNotionFinance = isOwner && featureFlags.notion_enabled
 
     if (!featureFlags.chat_enabled || !featureFlags.alpha_enabled) {
