@@ -153,6 +153,10 @@ create table if not exists pending_calendar_events (
 create index if not exists pending_calendar_events_user_chat_status_idx
 on pending_calendar_events(user_id, platform, telegram_chat_id, status, expires_at);
 
+create index if not exists pending_calendar_events_all_day_date_idx
+on pending_calendar_events(all_day_date)
+where is_all_day = true;
+
 alter table pending_calendar_events enable row level security;
 
 create table if not exists expenses (

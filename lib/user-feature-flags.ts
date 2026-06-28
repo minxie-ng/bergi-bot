@@ -57,23 +57,45 @@ function buildDefaultFeatureFlags(params: { userId: string; isOwner: boolean }):
   }
 }
 
-function isMissingAlphaFoundationTableError(error: unknown): boolean {
+function getSupabaseErrorMetadata(error: unknown): { code: string; message: string } {
   const candidate = error as { code?: unknown; message?: unknown } | null
   const code = typeof candidate?.code === 'string' ? candidate.code : ''
   const message = typeof candidate?.message === 'string' ? candidate.message.toLowerCase() : ''
 
+  return { code, message }
+}
+
+function isMissingAlphaFoundationTableError(error: unknown, tableName: string): boolean {
+  const { code, message } = getSupabaseErrorMetadata(error)
+  const mentionsExpectedTable = message.includes(tableName)
+
   return (
     code === 'PGRST205' ||
     code === '42P01' ||
-    message.includes('user_feature_flags') ||
-    message.includes('onboarding_state') ||
-    message.includes('could not find the table') ||
-    message.includes('does not exist')
+    (mentionsExpectedTable && message.includes('could not find the table')) ||
+    (mentionsExpectedTable && message.includes('schema cache')) ||
+    (mentionsExpectedTable && message.includes('relation') && message.includes('does not exist'))
   )
 }
 
-function logMissingAlphaFoundationTable(context: string): void {
-  console.warn('alpha_foundation_table_missing', { context })
+function logMissingAlphaFoundationTable(context: string, tableName: string, error: unknown): void {
+  const { code, message } = getSupabaseErrorMetadata(error)
+  console.warn('alpha_foundation_table_missing', {
+    context,
+    table: tableName,
+    code: code || undefined,
+    message: message ? message.slice(0, 160) : undefined,
+  })
+}
+
+function logAlphaFoundationSupabaseError(context: string, tableName: string, error: unknown): void {
+  const { code, message } = getSupabaseErrorMetadata(error)
+  console.warn('alpha_foundation_supabase_error', {
+    context,
+    table: tableName,
+    code: code || undefined,
+    message: message ? message.slice(0, 160) : undefined,
+  })
 }
 
 export async function getFeatureFlags(params: {
@@ -87,11 +109,12 @@ export async function getFeatureFlags(params: {
     .maybeSingle()
 
   if (error) {
-    if (isMissingAlphaFoundationTableError(error)) {
-      logMissingAlphaFoundationTable('get_feature_flags')
+    if (isMissingAlphaFoundationTableError(error, 'user_feature_flags')) {
+      logMissingAlphaFoundationTable('get_feature_flags', 'user_feature_flags', error)
       return null
     }
 
+    logAlphaFoundationSupabaseError('get_feature_flags', 'user_feature_flags', error)
     throw error
   }
 
@@ -122,19 +145,22 @@ export async function ensureDefaultFeatureFlags(params: {
     return data as UserFeatureFlags
   }
 
-  if (error && isMissingAlphaFoundationTableError(error)) {
-    logMissingAlphaFoundationTable('ensure_default_feature_flags')
+  if (error && isMissingAlphaFoundationTableError(error, 'user_feature_flags')) {
+    logMissingAlphaFoundationTable('ensure_default_feature_flags', 'user_feature_flags', error)
     return buildDefaultFeatureFlags(params)
   }
 
   const createdByRace = await getFeatureFlags(params)
 
   if (!createdByRace) {
-    if (error && isMissingAlphaFoundationTableError(error)) {
-      logMissingAlphaFoundationTable('ensure_default_feature_flags_race')
+    if (error && isMissingAlphaFoundationTableError(error, 'user_feature_flags')) {
+      logMissingAlphaFoundationTable('ensure_default_feature_flags_race', 'user_feature_flags', error)
       return buildDefaultFeatureFlags(params)
     }
 
+    if (error) {
+      logAlphaFoundationSupabaseError('ensure_default_feature_flags', 'user_feature_flags', error)
+    }
     throw error ?? new Error('Could not create user feature flags')
   }
 
@@ -155,11 +181,12 @@ export async function setUserProactiveFeature(params: {
     .eq('user_id', params.userId)
 
   if (error) {
-    if (isMissingAlphaFoundationTableError(error)) {
-      logMissingAlphaFoundationTable('set_user_proactive_feature')
+    if (isMissingAlphaFoundationTableError(error, 'user_feature_flags')) {
+      logMissingAlphaFoundationTable('set_user_proactive_feature', 'user_feature_flags', error)
       return
     }
 
+    logAlphaFoundationSupabaseError('set_user_proactive_feature', 'user_feature_flags', error)
     throw error
   }
 }
@@ -185,11 +212,12 @@ export async function upsertOnboardingState(params: {
   )
 
   if (error) {
-    if (isMissingAlphaFoundationTableError(error)) {
-      logMissingAlphaFoundationTable('upsert_onboarding_state')
+    if (isMissingAlphaFoundationTableError(error, 'onboarding_state')) {
+      logMissingAlphaFoundationTable('upsert_onboarding_state', 'onboarding_state', error)
       return
     }
 
+    logAlphaFoundationSupabaseError('upsert_onboarding_state', 'onboarding_state', error)
     throw error
   }
 }
