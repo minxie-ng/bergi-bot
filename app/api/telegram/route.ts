@@ -1705,15 +1705,29 @@ ${busierDayLines}`
 
 function formatCalendarEventTime(event: CalendarEvent, timezone: string): string {
   if (event.isAllDay) {
-    return 'all day'
+    return 'All day'
   }
 
-  return new Intl.DateTimeFormat('en-SG', {
+  const formatter = new Intl.DateTimeFormat('en-SG', {
     timeZone: timezone,
     hour: '2-digit',
     minute: '2-digit',
     hourCycle: 'h23',
-  }).format(new Date(event.start))
+  })
+  const startTime = formatter.format(new Date(event.start))
+
+  if (event.end === null) {
+    return startTime
+  }
+
+  const startMs = Date.parse(event.start)
+  const endMs = Date.parse(event.end)
+
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+    return startTime
+  }
+
+  return `${startTime}–${formatter.format(new Date(event.end))}`
 }
 
 function formatCalendarQueryReply(params: {
