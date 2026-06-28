@@ -4,7 +4,7 @@
 
 Bergi is a Telegram-first AI companion and personal operator. The product direction is not to compete only on raw chat quality, but to build continuity: memory, proactive follow-up, reminders, personal workflows, and useful context that carries across days.
 
-Bergi Core owns personality, memory, reminders, proactive check-ins, finance routing, calendar read/planning/create routing, and decision logic. Supabase is the source of truth for Bergi internal state. Notion is currently used as the finance storage layer for expenses. Google Calendar is currently used for schedule reads and confirmed event creation.
+Bergi Core owns personality, memory, reminders, proactive check-ins, finance routing, calendar read/planning/create routing, and decision logic. Supabase is the source of truth for Bergi internal state. For alpha friends, finance is Supabase-first. Min Xie's owner-only Notion finance path remains available only behind owner checks and `notion_enabled=true`. Google Calendar is used through owner-only service-account Calendar for Min Xie and Google OAuth Calendar for non-owner alpha users.
 
 n8n is not active for finance logging anymore. The earlier Bergi Core -> n8n -> Notion finance prototype was removed. n8n may still be useful later for external automations such as Calendar, Gmail, Notion sync, or other tool workflows, but finance currently runs directly in Bergi Core.
 
@@ -23,15 +23,19 @@ n8n is not active for finance logging anymore. The earlier Bergi Core -> n8n -> 
 - `thread_label`
 - Thread-aware recall
 - Natural daily recap
-- Direct Notion finance logging
+- Owner-only direct Notion finance logging
+- Supabase finance logging for alpha users
 - Text expense logging
 - Voice expense logging
 - Spoken-number voice finance support
 - Finance validation and edge-case handling
-- Finance query/read support from Notion
+- Finance query/read support from Notion for owner and Supabase for alpha users
 - Google Calendar schedule queries
 - Google Calendar read-only planning suggestions
 - Google Calendar confirmed event creation
+- Invite-link onboarding
+- `/help`
+- Casual German practice
 
 ## 3. Core architecture flow
 
@@ -70,6 +74,12 @@ Known tables and purpose:
 - `proactive_preferences`: per-user proactive check-in settings such as enabled flag, chat ID, timezone, and daily ranges.
 - `proactive_checkins`: generated proactive check-in schedule rows and sender state.
 - `life_thread_notes`: captured thoughts and lightweight progress events.
+- `expenses`: Supabase expense records for alpha-user finance.
+- `pending_finance_confirmations`: short-lived pending expense candidates for ambiguous money messages.
+- `user_feature_flags`: per-user feature switches and owner/alpha separation.
+- `onboarding_state`: alpha onboarding status, preferred name, and check-in choice.
+- `alpha_invites`: Telegram deep-link invite codes for private alpha onboarding.
+- `user_integrations`: encrypted OAuth integrations such as Google Calendar for non-owner users.
 
 `life_thread_notes` stores:
 
@@ -93,7 +103,27 @@ Proactive system:
 - Main statuses include `scheduled`, `sending`, `sent`, and `failed`; paused rows may be marked `cancelled`.
 - Context-aware proactive templates use recent life notes to select more relevant controlled templates, not full free-form LLM generation.
 
-## 5. Notion finance integration
+Finance pending confirmation:
+
+- Clear finance commands such as `log $5 lunch`, `record $12 coffee`, `add $8 transport`, and `spent $20 on dinner, log it` log directly after parser/validation succeeds.
+- Ambiguous money messages create a row in `pending_finance_confirmations` and ask whether to log it.
+- `yes`, `yeah`, `yup`, `sure`, `ok`, `confirm`, `log it`, and `save it` log the pending expense if it is still unexpired.
+- `no`, `nope`, `cancel`, and similar replies cancel the pending expense.
+- Pending finance rows are scoped by `user_id` and Telegram chat.
+
+## 5. Finance integration
+
+Owner path:
+
+Telegram -> Bergi Core -> finance detector/parser/validator -> Notion API
+
+Alpha friend path:
+
+Telegram -> Bergi Core -> finance detector/parser/validator -> Supabase `expenses`
+
+Non-owner users must never use Notion finance. Notion finance requires owner identity and `notion_enabled=true`.
+
+## 5a. Notion finance integration
 
 Active path:
 
@@ -137,6 +167,8 @@ Validation behavior:
 - Foreign currency is unsupported for now. Bergi does not silently convert or log it as SGD.
 - Suspicious high amounts ask for confirmation before creating a row.
 - Corrected amounts can be logged after confirmation, using the same real Notion create path.
+- Ambiguous casual money messages create a short-lived pending finance confirmation instead of logging immediately.
+- A plain confirmation reply logs the pending expense only if the pending row is still active and scoped to that user/chat.
 - Debts, loans, transfers, savings, budgets, and income are not logged as expenses.
 - Multiple expenses in one message are not merged. Bergi asks the user to send them one by one.
 - Finance query messages do not create rows.
@@ -159,8 +191,9 @@ Supported query examples:
 
 Finance query mode:
 
-- Uses Notion as source of truth.
-- Reads rows from All Expenses / All Expenses Master.
+- Owner uses Notion as source of truth when owner checks and `notion_enabled=true` pass.
+- Alpha friends use Supabase `expenses` as source of truth.
+- Owner Notion mode reads rows from All Expenses / All Expenses Master.
 - Supports today, this week, this month, this year, and recent expenses.
 - Supports category filters such as food or transport.
 - Sums `Amount`.
@@ -175,6 +208,9 @@ Known environment variables currently used:
 
 - `TELEGRAM_BOT_TOKEN`
 - `ALLOWED_TELEGRAM_USER_IDS`
+- `OWNER_TELEGRAM_USER_ID`
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
 - `OPENAI_BASE_URL`
 - `OPENAI_API_KEY`
 - `OPENAI_MODEL`
@@ -182,12 +218,18 @@ Known environment variables currently used:
 - `TRANSCRIPTION_BASE_URL`
 - `TRANSCRIPTION_API_KEY`
 - `TRANSCRIPTION_MODEL`
-- `SUPABASE_URL`
-- `SUPABASE_SERVICE_ROLE_KEY`
-- `LOCAL_TEST_MODE`
 - `CRON_SECRET`
+- `TOKEN_ENCRYPTION_KEY`
+- `GOOGLE_OAUTH_CLIENT_ID`
+- `GOOGLE_OAUTH_CLIENT_SECRET`
+- `GOOGLE_OAUTH_REDIRECT_URI`
+- `GOOGLE_CALENDAR_SCOPES`
 - `NOTION_TOKEN`
 - `NOTION_EXPENSES_DATABASE_ID`
+- `GOOGLE_CALENDAR_SERVICE_ACCOUNT_EMAIL`
+- `GOOGLE_CALENDAR_PRIVATE_KEY`
+- `GOOGLE_CALENDAR_ID`
+- `LOCAL_TEST_MODE`
 - `GOOGLE_CALENDAR_SERVICE_ACCOUNT_EMAIL`
 - `GOOGLE_CALENDAR_PRIVATE_KEY`
 - `GOOGLE_CALENDAR_ID`
@@ -218,12 +260,14 @@ Current status:
 
 Auth approach:
 
-- Server-side Google service account with Google Calendar Events scope.
-- The target Google Calendar must be shared with the service account email.
+- Owner path uses a server-side Google service account with Google Calendar Events scope.
+- Non-owner alpha users use Google OAuth stored in `user_integrations` with encrypted tokens.
+- The owner target Google Calendar must be shared with the service account email.
 - `GOOGLE_CALENDAR_ID` should point to the shared calendar ID, often the calendar owner's email address for a primary calendar.
 - For event creation, the calendar sharing permission for the service account must be "Make changes to events".
 - For read-only access only, "See all event details" is enough.
-- The service account approach is for the current personal MVP. A product launch or multi-user version should use OAuth later.
+- The service account approach is owner-only. It must never be used for alpha friends.
+- OAuth start state is signed. A one-time server-side OAuth connect token is still a follow-up hardening item before broader launch.
 
 Required environment variables:
 
