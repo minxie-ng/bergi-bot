@@ -1,6 +1,7 @@
 import { createClient } from '@supabase/supabase-js'
 
 import { generateDailyProactiveCheckins } from '@/lib/proactive-checkins'
+import { isOwnerTelegramUser } from '@/lib/user-feature-flags'
 
 type ProactivePreferenceRow = {
   user_id: string
@@ -84,6 +85,21 @@ async function handleGenerateProactiveCheckins(request: Request) {
     for (const preference of (preferences ?? []) as ProactivePreferenceRow[]) {
       try {
         const featureFlags = await getProactiveFeatureFlags({ supabase, userId: preference.user_id })
+        const isOwner = isOwnerTelegramUser(preference.telegram_chat_id)
+
+        console.log('proactive_generation_checked', {
+          userId: preference.user_id,
+          isOwner,
+          proactiveEnabled: featureFlags?.proactive_enabled === true,
+          alphaEnabled: featureFlags?.alpha_enabled === true,
+          contextSources: {
+            preferences: true,
+            lifeNotes: false,
+            calendar: false,
+            reminders: false,
+            finance: false,
+          },
+        })
 
         if (!featureFlags?.alpha_enabled || !featureFlags.proactive_enabled) {
           skippedDisabled += 1

@@ -202,6 +202,18 @@ async function handleSendProactiveCheckins(request: Request) {
       })
 
       if (!eligibility.enabled) {
+        console.log('proactive_send_skipped_disabled', {
+          userId: claimedCheckin.user_id,
+          isOwner: eligibility.isOwner,
+          proactiveEnabled: false,
+          contextSources: {
+            recentProactiveMessages: false,
+            lifeNotes: false,
+            calendar: false,
+            reminders: false,
+            finance: false,
+          },
+        })
         const cancelledTime = new Date().toISOString()
         const { error: cancelledError } = await supabase
           .from('proactive_checkins')
@@ -231,6 +243,18 @@ async function handleSendProactiveCheckins(request: Request) {
             userId: claimedCheckin.user_id,
           })
         : []
+      console.log('proactive_send_context_selected', {
+        userId: claimedCheckin.user_id,
+        isOwner: eligibility.isOwner,
+        proactiveEnabled: eligibility.enabled,
+        contextSources: {
+          recentProactiveMessages: recentMessages.length > 0,
+          lifeNotes: eligibility.isOwner && recentNotes.length > 0,
+          calendar: false,
+          reminders: false,
+          finance: false,
+        },
+      })
       const messageText = selectProactiveCheckinMessage({
         block: claimedCheckin.block,
         recentMessages,
