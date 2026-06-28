@@ -62,6 +62,14 @@ import {
   upsertOnboardingState,
 } from '@/lib/user-feature-flags'
 import {
+  AlphaInviteError,
+  claimAlphaInvite,
+  getInviteByCode,
+  isInviteClaimable,
+  isTelegramUserAlphaAllowed,
+  normalizeAlphaInviteCode,
+} from '@/lib/alpha-invites'
+import {
   disconnectGoogleCalendarIntegration,
   getGoogleCalendarConnectionStatus,
   getGoogleCalendarOAuthAccess,
@@ -374,6 +382,21 @@ function isAllowedTelegramUser(telegramUserId: number): boolean {
     .map((id) => id.trim())
     .filter(Boolean)
     .includes(String(telegramUserId))
+}
+
+function getTelegramStartPayload(text: string | undefined): string | null {
+  if (!text) {
+    return null
+  }
+
+  const [command, ...payloadParts] = text.trim().split(/\s+/)
+  const normalizedCommand = command?.toLowerCase().split('@')[0]
+
+  if (normalizedCommand !== '/start' || payloadParts.length === 0) {
+    return null
+  }
+
+  return payloadParts.join('_').trim() || null
 }
 
 function chooseTelegramPhotoSize(
@@ -3884,6 +3907,24 @@ async function findOrCreateUserAccount(params: FindOrCreateUserAccountParams): P
   return user.id
 }
 
+async function findUserAccountId(params: {
+  supabase: ReturnType<typeof getSupabase>
+  platformUserId: string
+}): Promise<string | null> {
+  const { data, error } = await params.supabase
+    .from('user_accounts')
+    .select('user_id')
+    .eq('platform', 'telegram')
+    .eq('platform_user_id', params.platformUserId)
+    .maybeSingle()
+
+  if (error) {
+    throw error
+  }
+
+  return data?.user_id ?? null
+}
+
 async function saveMessage(params: SaveMessageParams): Promise<string> {
   const { supabase, userId, role, content } = params
 
@@ -5133,7 +5174,70 @@ export async function POST(request: Request) {
       return new Response('OK', { status: 200 })
     }
 
-    if (!isAllowedTelegramUser(from.id)) {
+    const ownerUser = isOwnerTelegramUser(from.id)
+    const staticAllowedUser = ownerUser || isAllowedTelegramUser(from.id)
+    const startPayload = getTelegramStartPayload(userText)
+    const alphaInviteCode = startPayload !== null ? normalizeAlphaInviteCode(startPayload) : null
+    let accessSupabase: ReturnType<typeof getSupabase> | null = null
+    let preResolvedUserId: string | null = null
+    let shouldClaimAlphaInvite = false
+
+    if (!staticAllowedUser) {
+      accessSupabase = getSupabase()
+
+      if (alphaInviteCode !== null) {
+        let invite = null
+
+        try {
+          invite = await getInviteByCode({ supabase: accessSupabase, code: alphaInviteCode })
+        } catch (error) {
+          const category = error instanceof AlphaInviteError ? error.category : 'unknown'
+          console.warn('alpha_invite_lookup_failed', { category })
+        }
+
+        if (!invite || !isInviteClaimable(invite)) {
+          const invalidInviteReply = 'This Bergi invite link is invalid or expired. Please ask Min Xie for a new one.'
+
+          if (isLocalTestMode) {
+            console.log('Local test invalid invite response generated')
+          } else {
+            await sendTelegramMessage(chatId, invalidInviteReply)
+          }
+
+          return new Response('OK', { status: 200 })
+        }
+
+        shouldClaimAlphaInvite = true
+      } else {
+        const existingUserId = await findUserAccountId({
+          supabase: accessSupabase,
+          platformUserId: String(from.id),
+        })
+        let alphaAllowed = false
+
+        try {
+          alphaAllowed =
+            existingUserId !== null &&
+            (await isTelegramUserAlphaAllowed({
+              supabase: accessSupabase,
+              userId: existingUserId,
+              telegramUserId: String(from.id),
+            }))
+        } catch (error) {
+          const category = error instanceof AlphaInviteError ? error.category : 'unknown'
+          console.warn('alpha_allowed_lookup_failed', { category })
+        }
+
+        if (alphaAllowed) {
+          preResolvedUserId = existingUserId
+        }
+      }
+    } else if (alphaInviteCode !== null && !ownerUser) {
+      accessSupabase = getSupabase()
+      shouldClaimAlphaInvite = true
+    }
+
+    if (!staticAllowedUser && preResolvedUserId === null && !shouldClaimAlphaInvite) {
       console.log('Blocked unauthorized Telegram user')
 
       if (isLocalTestMode) {
@@ -5230,15 +5334,44 @@ export async function POST(request: Request) {
     }
 
     const selectedPhoto = chooseTelegramPhotoSize(photo)
-    const supabase = getSupabase()
-    const userId = await findOrCreateUserAccount({
-      supabase,
-      platformUserId: String(from.id),
-      username: from.username,
-      firstName: from.first_name,
-      lastName: from.last_name,
-    })
-    const isOwner = isOwnerTelegramUser(from.id)
+    const supabase = accessSupabase ?? getSupabase()
+    const userId =
+      preResolvedUserId ??
+      (await findOrCreateUserAccount({
+        supabase,
+        platformUserId: String(from.id),
+        username: from.username,
+        firstName: from.first_name,
+        lastName: from.last_name,
+      }))
+    const isOwner = ownerUser
+
+    if (shouldClaimAlphaInvite && alphaInviteCode !== null) {
+      try {
+        await claimAlphaInvite({
+          supabase,
+          code: alphaInviteCode,
+          userId,
+          telegramUserId: String(from.id),
+        })
+        console.log('alpha_invite_claimed')
+      } catch (error) {
+        if (error instanceof AlphaInviteError) {
+          console.warn('alpha_invite_claim_failed', { category: error.category })
+        }
+
+        const invalidInviteReply = 'This Bergi invite link is invalid or expired. Please ask Min Xie for a new one.'
+
+        if (isLocalTestMode) {
+          console.log('Local test invalid invite response generated')
+        } else {
+          await sendTelegramMessage(chatId, invalidInviteReply)
+        }
+
+        return new Response('OK', { status: 200 })
+      }
+    }
+
     const featureFlags = await ensureDefaultFeatureFlags({ supabase, userId, isOwner })
 
     if (!isOwner && (userText !== undefined || voice !== undefined || selectedPhoto !== null)) {
