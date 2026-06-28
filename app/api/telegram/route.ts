@@ -656,6 +656,7 @@ For this short private alpha, I can help with:
 • remember useful life notes
 • understand voice messages
 • understand photos you send
+• practise German casually with you
 • set reminders
 • check in proactively, if you enable it
 • log and query simple finance records
