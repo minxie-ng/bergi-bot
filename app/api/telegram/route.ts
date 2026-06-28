@@ -707,6 +707,29 @@ function getAlphaCalendarUnavailableReply(): string {
   return 'Please connect Google Calendar first.'
 }
 
+function getRuntimeAddress(params: { isOwner: boolean; preferredName?: string | null }): string | null {
+  if (params.isOwner) {
+    return 'minxie'
+  }
+
+  const preferredName = params.preferredName?.trim()
+  return preferredName ? preferredName : null
+}
+
+function getVoiceTooLongReply(params: { isOwner: boolean; preferredName?: string | null }): string {
+  const address = getRuntimeAddress(params)
+  return address
+    ? `wah ${address} this voice note too long sia 😭 keep it under 40 seconds first`
+    : 'wah this voice note too long sia 😭 keep it under 40 seconds first'
+}
+
+function getGenericWebhookErrorReply(params: { isOwner: boolean; preferredName?: string | null }): string {
+  const address = getRuntimeAddress(params)
+  return address
+    ? `eh ${address} I glitch a bit just now 😵‍💫 try again later can?`
+    : 'I glitched a bit just now 😵‍💫 try again later can?'
+}
+
 function getAlphaCalendarNotConfiguredReply(): string {
   return 'Google Calendar connection is not configured yet. I can still help with reminders and planning in chat.'
 }
@@ -4188,7 +4211,7 @@ Rules:
   - "Ich habe morgen um 19 Uhr ein Treffen."
   - "Ich habe nächsten Dienstag einen Termin."
   - "Ich habe am 25. Juni 2026 um 8 Uhr ein Projektmeeting."
-- ask_message should ask whether Min wants to be reminded before the event.
+- ask_message should ask whether the user wants to be reminded before the event.
 - Example ask_message: "Got it — meeting at 4:30pm Singapore time. Want me to remind you before it? Reply like '10 mins before' or 'no'."`
 
   const response = await callLLM({
@@ -5149,6 +5172,10 @@ async function answerTelegramCallbackQuery(callbackQueryId: string): Promise<voi
 
 export async function POST(request: Request) {
   let chatId: number | undefined
+  let fallbackIsOwner = false
+  let fallbackSupabase: ReturnType<typeof getSupabase> | null = null
+  let fallbackUserId: string | null = null
+  let fallbackPreferredName: string | null = null
 
   try {
     const update = (await request.json()) as TelegramUpdate
@@ -5174,6 +5201,7 @@ export async function POST(request: Request) {
     }
 
     const ownerUser = isOwnerTelegramUser(from.id)
+    fallbackIsOwner = ownerUser
     const staticAllowedUser = ownerUser || isAllowedTelegramUser(from.id)
     const startPayload = getTelegramStartPayload(userText)
     const alphaInviteCode = startPayload !== null ? normalizeAlphaInviteCode(startPayload) : null
@@ -5195,7 +5223,7 @@ export async function POST(request: Request) {
         }
 
         if (!invite || !isInviteClaimable(invite)) {
-          const invalidInviteReply = 'This Bergi invite link is invalid or expired. Please ask Min Xie for a new one.'
+          const invalidInviteReply = 'This Bergi invite link is invalid or expired. Please ask for a new invite link.'
 
           if (isLocalTestMode) {
             console.log('Local test invalid invite response generated')
@@ -5344,6 +5372,8 @@ export async function POST(request: Request) {
         lastName: from.last_name,
       }))
     const isOwner = ownerUser
+    fallbackSupabase = supabase
+    fallbackUserId = userId
 
     if (shouldClaimAlphaInvite && alphaInviteCode !== null) {
       try {
@@ -5359,7 +5389,7 @@ export async function POST(request: Request) {
           console.warn('alpha_invite_claim_failed', { category: error.category })
         }
 
-        const invalidInviteReply = 'This Bergi invite link is invalid or expired. Please ask Min Xie for a new one.'
+        const invalidInviteReply = 'This Bergi invite link is invalid or expired. Please ask for a new invite link.'
 
         if (isLocalTestMode) {
           console.log('Local test invalid invite response generated')
@@ -5375,6 +5405,7 @@ export async function POST(request: Request) {
 
     if (!isOwner && (userText !== undefined || voice !== undefined || selectedPhoto !== null)) {
       const onboardingState = await getOnboardingState({ supabase, userId })
+      fallbackPreferredName = onboardingState?.preferred_name?.trim() || null
       const onboardingStatus = onboardingState?.status ?? 'not_started'
       const isAwaitingNameTextReply =
         onboardingStatus === 'awaiting_name' && userText !== undefined && voice === undefined && selectedPhoto === null
@@ -5463,7 +5494,7 @@ export async function POST(request: Request) {
       }
 
       if (voice.duration !== undefined && voice.duration > 40) {
-        const voiceTooLongReply = 'wah minxie this voice note too long sia 😭 keep it under 40 seconds first'
+        const voiceTooLongReply = getVoiceTooLongReply({ isOwner, preferredName: fallbackPreferredName })
 
         await saveMessage({
           supabase,
@@ -6824,13 +6855,15 @@ Reply naturally as Bergi using the recent conversation context.`
     const systemPrompt =
       profile?.personalityPrompt ??
       'You are Bergi, a private AI friend on Telegram. Reply casually, warmly, and concisely. Use recent chat history for context, but do not over-explain.'
+    const userReference = isOwner ? 'Min' : fallbackPreferredName || 'the user'
+    const userPossessiveReference = isOwner ? "Min's" : fallbackPreferredName ? `${fallbackPreferredName}'s` : "the user's"
     const responseModeGuidance = `
 Response mode guidance:
-Before replying, privately decide what kind of response Min needs. Do not mention the mode label.
+Before replying, privately decide what kind of response ${userReference} needs. Do not mention the mode label.
 
-Use casual chat mode when Min is just chatting, sharing something lightly, or asking for a normal friendly reply.
+Use casual chat mode when ${userReference} is just chatting, sharing something lightly, or asking for a normal friendly reply.
 
-Use organise mode when Min explicitly says things like:
+Use organise mode when ${userReference} explicitly says things like:
 - organise this
 - summarize this
 - make this clearer
@@ -6840,7 +6873,7 @@ Use organise mode when Min explicitly says things like:
 - structure this
 - clean this up
 
-Also use organise mode when Min sends a long, messy, brain-dump style message or voice transcript that clearly needs structure, even if he does not explicitly say "organise".
+Also use organise mode when ${userReference} sends a long, messy, brain-dump style message or voice transcript that clearly needs structure, even if they do not explicitly say "organise".
 
 In organise mode:
 - be clear and useful first
@@ -6849,10 +6882,10 @@ In organise mode:
 - use numbered lists for priority/order
 - use simple bullets with "-"
 - remove repeated/filler ideas
-- preserve Min's intended meaning
+- preserve ${userPossessiveReference} intended meaning
 - do not invent missing details
 - ask a brief clarifying question if the message is too unclear
-- keep the output compact unless Min asks for detail
+- keep the output compact unless ${userReference} asks for detail
 
 Telegram formatting rule:
 Telegram messages are currently sent as plain text. Do not use Markdown or HTML formatting.
@@ -6876,10 +6909,10 @@ Do this now:
 - What is pending
 
 Style rule:
-Always answer Min's actual request first. Use humour, Singlish, and playful friend energy lightly, but not in every reply. Avoid turning every response into a comedy bit.
+Always answer ${userPossessiveReference} actual request first. Use humour, Singlish, and playful friend energy lightly, but not in every reply. Avoid turning every response into a comedy bit.
 Bergi should feel like a friend continuing the conversation, not a service offering features.
 Never claim an expense was logged, saved to Notion, or added to finance records from normal chat. Only the finance logging code can say "Logged:" after the real finance logger succeeds. If an expense-like message reaches normal chat, ask for a clearer text expense instead of pretending it was logged.
-Do not default to ending helpful replies with "if you want, I can...". Use that kind of offer only when Min explicitly asks for a template, draft, plan, checklist, concrete next action, or help generating something.
+Do not default to ending helpful replies with "if you want, I can...". Use that kind of offer only when ${userReference} explicitly asks for a template, draft, plan, checklist, concrete next action, or help generating something.
 Avoid generic assistant endings like "If you want, I can help you with that", "Let me know if you want me to...", "I can also...", "Would you like me to...", "say so and I’ll...", "if you mean X, say so...", or "tell me if you want...".
 If Bergi has already answered enough, just stop. Do not add a trailing meta-offer or clarification offer by default.
 If clarification is genuinely needed, ask one direct human question instead of a service-style offer.
@@ -6969,7 +7002,22 @@ Reply naturally as Bergi. If the current text seems related to the photo, use th
 
     try {
       if (chatId !== undefined) {
-        await sendTelegramMessage(chatId, 'eh minxie I glitch a bit just now 😵‍💫 try again later can?')
+        if (!fallbackIsOwner && fallbackPreferredName === null && fallbackSupabase !== null && fallbackUserId !== null) {
+          try {
+            const onboardingState = await getOnboardingState({ supabase: fallbackSupabase, userId: fallbackUserId })
+            fallbackPreferredName = onboardingState?.preferred_name?.trim() || null
+          } catch (preferredNameError) {
+            const supabaseError = preferredNameError as { code?: unknown }
+            console.warn('fallback_preferred_name_lookup_failed', {
+              code: typeof supabaseError.code === 'string' ? supabaseError.code : undefined,
+            })
+          }
+        }
+
+        await sendTelegramMessage(
+          chatId,
+          getGenericWebhookErrorReply({ isOwner: fallbackIsOwner, preferredName: fallbackPreferredName })
+        )
       }
     } catch (fallbackError) {
       console.error('Telegram fallback message error:', fallbackError)

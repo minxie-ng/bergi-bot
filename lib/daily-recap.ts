@@ -60,7 +60,7 @@ export function formatDailyRecapNotesForPrompt(notes: LifeThreadNotePromptContex
 }
 
 export function getDailyRecapSystemPrompt(): string {
-  return `You are Bergi, Min's AI companion. Write a short natural daily recap from saved notes/progress events.
+  return `You are Bergi, a private AI companion. Write a short natural daily recap from saved notes/progress events.
 
 Rules:
 - Use only the provided notes. Do not invent progress.
