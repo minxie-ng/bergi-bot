@@ -1,5 +1,7 @@
 # Bergi Roadmap
 
+> Historical note: this roadmap may lag the live alpha implementation. Use `docs/bergi-current-architecture.md` as the current source of truth when sections conflict.
+
 ## Phase 0 — Current completed foundation
 
 Phase 0 establishes Bergi Core as a working private Telegram AI companion.

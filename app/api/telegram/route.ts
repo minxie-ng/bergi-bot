@@ -652,8 +652,8 @@ function getHelpReply(): string {
 • ‘remind me to drink water in 30 minutes’
 • ‘log $5 lunch’
 • ‘what did I spend today?’
-• ‘what’s on my calendar tomorrow?’
-• ‘schedule gym tomorrow 7pm’
+• ‘what’s on my calendar tomorrow?’ if Calendar is connected
+• ‘schedule gym tomorrow 7pm’ if Calendar is connected
 • ‘practise German with me’
 
 Useful controls:
@@ -664,7 +664,7 @@ Useful controls:
 }
 
 function getAlphaStartReply(): string {
-  return `Hey, I’m Bergi — Min Xie’s private AI companion project.
+  return `Hey, I’m Bergi — a private AI companion project currently in alpha.
 
 For this short private alpha, I can help with:
 
@@ -4205,7 +4205,7 @@ function parseReminderExtraction(raw: string): ReminderExtraction {
       return JSON.parse(cleaned.slice(firstBrace, lastBrace + 1)) as ReminderExtraction
     }
 
-    throw new Error(`Failed to parse reminder extraction JSON: ${raw}`)
+    throw new Error('Failed to parse reminder extraction JSON')
   }
 }
 
@@ -4227,7 +4227,7 @@ function parseFutureEventExtraction(raw: string): FutureEventExtraction {
       return JSON.parse(cleaned.slice(firstBrace, lastBrace + 1)) as FutureEventExtraction
     }
 
-    throw new Error(`Failed to parse future event extraction JSON: ${raw}`)
+    throw new Error('Failed to parse future event extraction JSON')
   }
 }
 
@@ -4249,7 +4249,7 @@ function parseReminderManagementIntent(raw: string): ReminderManagementIntent {
       return JSON.parse(cleaned.slice(firstBrace, lastBrace + 1)) as ReminderManagementIntent
     }
 
-    throw new Error(`Failed to parse reminder management JSON: ${raw}`)
+    throw new Error('Failed to parse reminder management JSON')
   }
 }
 
@@ -7138,7 +7138,9 @@ Reply naturally as Bergi using the recent conversation context.`
             return new Response('OK', { status: 200 })
           }
 
-          const financeConfirmationReply = financeIntent.reply ?? 'Do you want me to log this as an expense?'
+          const financeConfirmationReply =
+            financeIntent.reply ??
+            'Do you want me to log this as an SGD expense? Reply yes to log it or no to ignore it.'
 
           if (isLocalTestMode) {
             console.log('Local test finance pending confirmation reply generated')

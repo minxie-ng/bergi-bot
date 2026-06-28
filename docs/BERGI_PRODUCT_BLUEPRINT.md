@@ -1,5 +1,7 @@
 # Bergi Product Blueprint
 
+> Historical note: this product blueprint may lag the live alpha implementation. Use `docs/bergi-current-architecture.md` as the current source of truth when sections conflict.
+
 ## Product vision
 
 Bergi is Min's private AI companion: a personal brain and trusted helper that lives in Telegram, understands everyday context, remembers useful conversation history, and can gradually connect to real-world tools with explicit approval.

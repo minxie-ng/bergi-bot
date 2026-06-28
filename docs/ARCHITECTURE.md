@@ -1,5 +1,7 @@
 # Bergi Architecture
 
+> Historical note: this document may lag the live alpha implementation. Use `docs/bergi-current-architecture.md` as the current source of truth when sections conflict.
+
 ## Current architecture
 
 Bergi currently runs as a private Telegram bot backed by a custom Next.js API and Supabase.

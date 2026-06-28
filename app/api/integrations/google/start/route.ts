@@ -27,7 +27,7 @@ export async function GET(request: Request) {
   const chatIdRaw = url.searchParams.get('chat_id')?.trim()
   const chatId = chatIdRaw ? Number(chatIdRaw) : NaN
 
-  if (!telegramUserId || !Number.isFinite(chatId)) {
+  if (!telegramUserId || !Number.isSafeInteger(chatId)) {
     return htmlResponse('This Calendar connect link is invalid. Please return to Telegram and try again.', 400)
   }
 

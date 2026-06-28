@@ -34,7 +34,7 @@ n8n is not active for finance logging anymore. The earlier Bergi Core -> n8n -> 
 - Google Calendar read-only planning suggestions
 - Google Calendar confirmed event creation
 - Invite-link onboarding
-- `/help`
+- Slash commands: `/start`, `/help`, `/privacy`, `/connect_calendar`, `/disconnect_calendar`, `/calendar_status`, `/stop_checkins`, `/checkin_status`, `/pause_checkins`, `/resume_checkins`, `/list_reminders`, `/capture_this`, and `/notes`
 - Casual German practice
 
 ## 3. Core architecture flow
@@ -110,6 +110,7 @@ Finance pending confirmation:
 - `yes`, `yeah`, `yup`, `sure`, `ok`, `confirm`, `log it`, and `save it` log the pending expense if it is still unexpired.
 - `no`, `nope`, `cancel`, and similar replies cancel the pending expense.
 - Pending finance rows are scoped by `user_id` and Telegram chat.
+- `pending_finance_confirmations.telegram_chat_id` is currently stored as `text` while several older Telegram chat ID columns are `bigint`; standardize only with an explicit migration if production data needs it.
 
 ## 5. Finance integration
 
@@ -230,9 +231,6 @@ Known environment variables currently used:
 - `GOOGLE_CALENDAR_PRIVATE_KEY`
 - `GOOGLE_CALENDAR_ID`
 - `LOCAL_TEST_MODE`
-- `GOOGLE_CALENDAR_SERVICE_ACCOUNT_EMAIL`
-- `GOOGLE_CALENDAR_PRIVATE_KEY`
-- `GOOGLE_CALENDAR_ID`
 
 Never commit real secrets.
 

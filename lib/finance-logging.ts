@@ -705,7 +705,7 @@ export function classifyFinanceIntent(text: string): FinanceIntentClassification
     return {
       intent: 'ambiguous',
       reason: 'unclear_logging_intent',
-      reply: 'Do you want me to log this as an expense?',
+      reply: 'Do you want me to log this as an SGD expense? Reply yes to log it or no to ignore it.',
     }
   }
 

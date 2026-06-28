@@ -180,6 +180,9 @@ async function handleSendProactiveCheckins(request: Request) {
           updated_at: claimTime,
         })
         .eq('id', checkin.id)
+        .eq('user_id', checkin.user_id)
+        .eq('platform', checkin.platform)
+        .eq('telegram_chat_id', checkin.telegram_chat_id)
         .eq('status', 'scheduled')
         .select('id, user_id, platform, telegram_chat_id, block')
         .maybeSingle()
@@ -222,6 +225,9 @@ async function handleSendProactiveCheckins(request: Request) {
             updated_at: cancelledTime,
           })
           .eq('id', claimedCheckin.id)
+          .eq('user_id', claimedCheckin.user_id)
+          .eq('platform', claimedCheckin.platform)
+          .eq('telegram_chat_id', claimedCheckin.telegram_chat_id)
 
         if (cancelledError) {
           console.error('Failed to cancel disabled proactive check-in:', cancelledError)
@@ -275,6 +281,9 @@ async function handleSendProactiveCheckins(request: Request) {
             updated_at: sentTime,
           })
           .eq('id', claimedCheckin.id)
+          .eq('user_id', claimedCheckin.user_id)
+          .eq('platform', claimedCheckin.platform)
+          .eq('telegram_chat_id', claimedCheckin.telegram_chat_id)
 
         if (sentError) {
           throw sentError
@@ -292,6 +301,9 @@ async function handleSendProactiveCheckins(request: Request) {
             updated_at: failedTime,
           })
           .eq('id', claimedCheckin.id)
+          .eq('user_id', claimedCheckin.user_id)
+          .eq('platform', claimedCheckin.platform)
+          .eq('telegram_chat_id', claimedCheckin.telegram_chat_id)
 
         if (failedUpdateError) {
           console.error('Failed to mark proactive check-in as failed:', failedUpdateError)
