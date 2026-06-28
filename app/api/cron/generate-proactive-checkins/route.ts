@@ -9,6 +9,11 @@ type ProactivePreferenceRow = {
   timezone: string
 }
 
+type ProactiveFeatureFlagsRow = {
+  proactive_enabled: boolean
+  alpha_enabled: boolean
+}
+
 function getSupabase() {
   const supabaseUrl = process.env.SUPABASE_URL
   const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -34,6 +39,23 @@ function isAuthorized(request: Request): boolean {
   return bearerToken === cronSecret || querySecret === cronSecret
 }
 
+async function getProactiveFeatureFlags(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+}): Promise<ProactiveFeatureFlagsRow | null> {
+  const { data, error } = await params.supabase
+    .from('user_feature_flags')
+    .select('proactive_enabled, alpha_enabled')
+    .eq('user_id', params.userId)
+    .maybeSingle()
+
+  if (error) {
+    throw error
+  }
+
+  return data as ProactiveFeatureFlagsRow | null
+}
+
 async function handleGenerateProactiveCheckins(request: Request) {
   try {
     if (!process.env.CRON_SECRET) {
@@ -57,9 +79,17 @@ async function handleGenerateProactiveCheckins(request: Request) {
 
     let generated = 0
     let failed = 0
+    let skippedDisabled = 0
 
     for (const preference of (preferences ?? []) as ProactivePreferenceRow[]) {
       try {
+        const featureFlags = await getProactiveFeatureFlags({ supabase, userId: preference.user_id })
+
+        if (!featureFlags?.alpha_enabled || !featureFlags.proactive_enabled) {
+          skippedDisabled += 1
+          continue
+        }
+
         const rows = await generateDailyProactiveCheckins({
           supabase,
           userId: preference.user_id,
@@ -84,6 +114,7 @@ async function handleGenerateProactiveCheckins(request: Request) {
       success: true,
       checked: preferences?.length ?? 0,
       generated,
+      skippedDisabled,
       failed,
     })
   } catch (error) {

@@ -3,6 +3,7 @@ import type { LifeThreadNotePromptContext } from './life-thread-notes'
 type ProactiveCheckinBlock = 'morning' | 'afternoon' | 'evening'
 type ProactiveTemplateBank = Record<ProactiveCheckinBlock, Record<string, readonly string[]>>
 type ProactiveContextCategory = 'internship_progress' | 'bergi_product' | 'german_learning'
+type ProactiveAudience = 'owner' | 'alpha'
 
 const CONTEXT_AWARE_PROACTIVE_TEMPLATES: Record<ProactiveContextCategory, readonly string[]> = {
   internship_progress: [
@@ -108,6 +109,45 @@ const PROACTIVE_CHECKIN_TEMPLATES: ProactiveTemplateBank = {
   },
 }
 
+const ALPHA_SAFE_PROACTIVE_TEMPLATES: ProactiveTemplateBank = {
+  morning: {
+    day_check: [
+      'morning check-in — how’s your day starting?',
+      'quick morning check-in: anything you want help remembering or planning today?',
+      'morning — want to use Bergi for a reminder, voice note, photo, or quick expense today?',
+    ],
+    gentle_start: [
+      'how’s the morning going so far?',
+      'quick check-in — anything you want to make easier today?',
+      'morning check-in: what’s one thing you want to keep track of today?',
+    ],
+  },
+  afternoon: {
+    day_progress: [
+      'quick check-in — how’s your day going?',
+      'midday check-in: anything you want help remembering, planning, or sorting out?',
+      'small check-in — need a reminder, quick plan, voice note, photo help, or expense log?',
+    ],
+    reset: [
+      'how’s the afternoon feeling?',
+      'quick reset — anything Bergi can help you keep track of?',
+      'checking in — anything you want to plan or remember before the day gets busier?',
+    ],
+  },
+  evening: {
+    wrap_up: [
+      'evening check-in — how did the day go?',
+      'quick evening check-in: anything from today worth remembering?',
+      'before the day ends, want help setting a reminder, planning tomorrow, or logging an expense?',
+    ],
+    memory_prompt: [
+      'anything useful from today you want Bergi to remember?',
+      'evening check-in — any small thing you want to keep track of?',
+      'quick check-in: want to send a voice note or photo if that’s easier?',
+    ],
+  },
+}
+
 function isProactiveCheckinBlock(block: string): block is ProactiveCheckinBlock {
   return block in PROACTIVE_CHECKIN_TEMPLATES
 }
@@ -154,10 +194,25 @@ export function selectProactiveCheckinMessage(params: {
   block: string
   recentMessages?: string[]
   recentNotes?: LifeThreadNotePromptContext[]
+  audience?: ProactiveAudience
   random?: () => number
 }): string {
   const random = params.random ?? Math.random
   const recentMessages = new Set(params.recentMessages ?? [])
+  const audience = params.audience ?? 'owner'
+
+  if (audience === 'alpha') {
+    const alphaTemplatesByCategory = isProactiveCheckinBlock(params.block)
+      ? ALPHA_SAFE_PROACTIVE_TEMPLATES[params.block]
+      : ALPHA_SAFE_PROACTIVE_TEMPLATES.afternoon
+    const alphaCategories = Object.keys(alphaTemplatesByCategory)
+    const alphaCategory = chooseRandomItem(alphaCategories, random)
+    const alphaTemplates = alphaTemplatesByCategory[alphaCategory]
+    const freshAlphaTemplates = alphaTemplates.filter((template) => !recentMessages.has(template))
+
+    return chooseRandomItem(freshAlphaTemplates.length > 0 ? freshAlphaTemplates : alphaTemplates, random)
+  }
+
   const contextCategory = findContextCategory(params.recentNotes)
 
   if (contextCategory) {

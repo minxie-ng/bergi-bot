@@ -2,6 +2,7 @@ import { createClient } from '@supabase/supabase-js'
 
 import { getRecentLifeThreadNotes } from '@/lib/life-thread-notes'
 import { selectProactiveCheckinMessage } from '@/lib/proactive-message-templates'
+import { isOwnerTelegramUser } from '@/lib/user-feature-flags'
 
 type ProactiveCheckinRow = {
   id: string
@@ -9,6 +10,11 @@ type ProactiveCheckinRow = {
   platform: string
   telegram_chat_id: number
   block: string
+}
+
+type ProactiveSendEligibility = {
+  enabled: boolean
+  isOwner: boolean
 }
 
 function getSupabase() {
@@ -100,6 +106,43 @@ async function getRecentProactiveContextNotes(params: {
   return notes.filter((note) => Date.parse(note.created_at) >= sevenDaysAgoMs)
 }
 
+async function getProactiveSendEligibility(params: {
+  supabase: ReturnType<typeof getSupabase>
+  userId: string
+  platform: string
+  telegramChatId: number
+}): Promise<ProactiveSendEligibility> {
+  const { data: featureFlags, error: featureFlagsError } = await params.supabase
+    .from('user_feature_flags')
+    .select('alpha_enabled, proactive_enabled')
+    .eq('user_id', params.userId)
+    .maybeSingle()
+
+  if (featureFlagsError) {
+    throw featureFlagsError
+  }
+
+  const { data: preference, error: preferenceError } = await params.supabase
+    .from('proactive_preferences')
+    .select('enabled')
+    .eq('user_id', params.userId)
+    .eq('platform', params.platform)
+    .eq('telegram_chat_id', params.telegramChatId)
+    .maybeSingle()
+
+  if (preferenceError) {
+    throw preferenceError
+  }
+
+  return {
+    enabled:
+      featureFlags?.alpha_enabled === true &&
+      featureFlags.proactive_enabled === true &&
+      preference?.enabled === true,
+    isOwner: isOwnerTelegramUser(params.telegramChatId),
+  }
+}
+
 async function handleSendProactiveCheckins(request: Request) {
   try {
     if (!process.env.CRON_SECRET) {
@@ -151,20 +194,48 @@ async function handleSendProactiveCheckins(request: Request) {
         continue
       }
 
+      const eligibility = await getProactiveSendEligibility({
+        supabase,
+        userId: claimedCheckin.user_id,
+        platform: claimedCheckin.platform,
+        telegramChatId: claimedCheckin.telegram_chat_id,
+      })
+
+      if (!eligibility.enabled) {
+        const cancelledTime = new Date().toISOString()
+        const { error: cancelledError } = await supabase
+          .from('proactive_checkins')
+          .update({
+            status: 'cancelled',
+            updated_at: cancelledTime,
+          })
+          .eq('id', claimedCheckin.id)
+
+        if (cancelledError) {
+          console.error('Failed to cancel disabled proactive check-in:', cancelledError)
+          failed += 1
+        }
+
+        continue
+      }
+
       const recentMessages = await getRecentSentProactiveMessages({
         supabase,
         userId: claimedCheckin.user_id,
         platform: claimedCheckin.platform,
         telegramChatId: claimedCheckin.telegram_chat_id,
       })
-      const recentNotes = await getRecentProactiveContextNotes({
-        supabase,
-        userId: claimedCheckin.user_id,
-      })
+      const recentNotes = eligibility.isOwner
+        ? await getRecentProactiveContextNotes({
+            supabase,
+            userId: claimedCheckin.user_id,
+          })
+        : []
       const messageText = selectProactiveCheckinMessage({
         block: claimedCheckin.block,
         recentMessages,
         recentNotes,
+        audience: eligibility.isOwner ? 'owner' : 'alpha',
       })
 
       try {

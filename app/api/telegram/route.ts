@@ -1187,23 +1187,24 @@ function buildProactiveProgressFallbackNote(rawText: string): ThoughtNoteDraft {
   }
 }
 
-async function structureProactiveProgressNote(rawText: string): Promise<ThoughtNoteDraft> {
+async function structureProactiveProgressNote(params: { rawText: string; isOwner: boolean }): Promise<ThoughtNoteDraft> {
+  const subject = params.isOwner ? 'Min' : 'the user'
+
   try {
     const raw = await callLLM({
-      systemPrompt:
-        'You structure a short progress event from a user replying to a proactive check-in. Return only valid JSON with keys title, summary, open_question, next_step. Title should describe what changed. Summary should be one short sentence in third person using Min. Use null for open_question or next_step when not obvious. Do not add markdown.',
+      systemPrompt: `You structure a short progress event from a user replying to a proactive check-in. Return only valid JSON with keys title, summary, open_question, next_step. Title should describe what changed. Summary should be one short sentence in third person using ${subject}. Use null for open_question or next_step when not obvious. Do not add markdown.`,
       chatMessages: [
         {
           role: 'user',
-          content: `User proactive check-in reply:\n${rawText}`,
+          content: `User proactive check-in reply:\n${params.rawText}`,
         },
       ],
     })
 
-    return parseThoughtNoteDraft(raw, rawText)
+    return parseThoughtNoteDraft(raw, params.rawText)
   } catch (error) {
     console.error('Failed to structure proactive progress note:', error)
-    return buildProactiveProgressFallbackNote(rawText)
+    return buildProactiveProgressFallbackNote(params.rawText)
   }
 }
 
@@ -1212,9 +1213,10 @@ async function saveProactiveProgressNoteIfMeaningful(params: {
   userId: string
   sourceMessageId: string
   rawText: string
+  isOwner: boolean
   recentProactiveCheckin: RecentSentProactiveCheckinRow | null
 }): Promise<void> {
-  const { supabase, userId, sourceMessageId, rawText, recentProactiveCheckin } = params
+  const { supabase, userId, sourceMessageId, rawText, isOwner, recentProactiveCheckin } = params
 
   if (!recentProactiveCheckin || !isMeaningfulProactiveProgressReply(rawText)) {
     return
@@ -1252,7 +1254,7 @@ async function saveProactiveProgressNoteIfMeaningful(params: {
     return
   }
 
-  const note = await structureProactiveProgressNote(rawText)
+  const note = await structureProactiveProgressNote({ rawText, isOwner })
   await saveLifeThreadNote({
     supabase,
     userId,
@@ -6901,6 +6903,7 @@ Better endings: "what did you touch today, even roughly?", "that one counts, hon
         userId,
         sourceMessageId: savedUserMessageId,
         rawText: userText ?? userMessageToSave,
+        isOwner,
         recentProactiveCheckin,
       })
     }
