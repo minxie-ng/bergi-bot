@@ -625,26 +625,22 @@ function normalizeTelegramCommand(text: string): TelegramSlashCommand | null {
 }
 
 function getHelpReply(): string {
-  return `hey, I’m Bergi — kind of an AI companion you can talk to.
+  return `Not sure what to try? Here are a few things Bergi can help with:
 
-you can:
-• chat with me normally
-• send me voice notes
-• send me photos and ask about them
-• ask me to organise messy thoughts
-• ask me to remind you about things
-• practise German casually with me
-• let me check in on you during the day
-• ask me what i remember from recent thoughts
+• Send me a normal message or voice note
+• Send me a photo and ask something about it
+• ‘remind me to drink water in 30 minutes’
+• ‘log $5 lunch’
+• ‘what did I spend today?’
+• ‘what’s on my calendar tomorrow?’
+• ‘schedule gym tomorrow 7pm’
+• ‘practise German with me’
 
-commands:
-/checkin_status — see whether check-ins are on
-/pause_checkins — pause check-ins
-/resume_checkins — resume check-ins
-/list_reminders — show active reminders
-/capture_this — save the previous thought as a note
-
-you don’t need exact commands most of the time — just talk to me naturally.`
+Useful controls:
+• /connect_calendar — connect Google Calendar
+• /calendar_status — check Calendar connection
+• /stop_checkins — stop proactive check-ins
+• /privacy — see what Bergi stores`
 }
 
 function getAlphaStartReply(): string {
