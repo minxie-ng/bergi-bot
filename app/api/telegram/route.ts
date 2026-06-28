@@ -664,7 +664,7 @@ Useful controls:
 }
 
 function getAlphaStartReply(): string {
-  return `Hey, I’m Bergi — a private AI companion project currently in alpha.
+  return `Hey, I’m Bergi — Min Xie’s private AI companion project, currently in alpha.
 
 For this short private alpha, I can help with:
 
@@ -7140,7 +7140,7 @@ Reply naturally as Bergi using the recent conversation context.`
 
           const financeConfirmationReply =
             financeIntent.reply ??
-            'Do you want me to log this as an SGD expense? Reply yes to log it or no to ignore it.'
+            'I’m not fully sure if that was an expense. To log it, say something like: ‘log $20 for lunch’.'
 
           if (isLocalTestMode) {
             console.log('Local test finance pending confirmation reply generated')
