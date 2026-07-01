@@ -79,52 +79,13 @@ import {
   GoogleCalendarOAuthError,
   type GoogleCalendarAccess,
 } from '@/lib/google-calendar-oauth'
-
-type TelegramUpdate = {
-  message?: {
-    from?: {
-      id?: number
-      username?: string
-      first_name?: string
-      last_name?: string
-    }
-    chat?: {
-      id?: number
-    }
-    text?: string
-    caption?: string
-    sticker?: unknown
-    animation?: unknown
-    voice?: {
-      file_id: string
-      duration?: number
-      mime_type?: string
-      file_size?: number
-    }
-    photo?: Array<{
-      file_id: string
-      file_unique_id?: string
-      width?: number
-      height?: number
-      file_size?: number
-    }>
-  }
-  callback_query?: {
-    id: string
-    data?: string
-    from?: {
-      id?: number
-      username?: string
-      first_name?: string
-      last_name?: string
-    }
-    message?: {
-      chat?: {
-        id?: number
-      }
-    }
-  }
-}
+import { downloadTelegramFile, getTelegramFilePath } from '@/lib/telegram/files'
+import {
+  answerTelegramCallbackQuery,
+  sendTelegramMessage,
+  type TelegramInlineKeyboardMarkup,
+} from '@/lib/telegram/send-message'
+import type { TelegramUpdate } from '@/lib/telegram/types'
 
 function getTelegramMessageTypes(message: TelegramUpdate['message']): string[] {
   if (!message) {
@@ -5208,45 +5169,6 @@ Analyze the image specifically to help answer the caption/question. Focus only o
   return content
 }
 
-async function getTelegramFilePath(fileId: string): Promise<string> {
-  const botToken = process.env.TELEGRAM_BOT_TOKEN
-
-  if (!botToken) {
-    throw new Error('Missing Telegram bot token')
-  }
-
-  const response = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${encodeURIComponent(fileId)}`)
-
-  if (!response.ok) {
-    throw new Error(`Telegram getFile request failed: ${response.status}`)
-  }
-
-  const data = await response.json()
-  const filePath = data.result?.file_path
-
-  if (!data.ok || typeof filePath !== 'string') {
-    throw new Error('Telegram getFile response did not include a file path')
-  }
-
-  return filePath
-}
-
-async function downloadTelegramFile(filePath: string): Promise<ArrayBuffer> {
-  const botToken = process.env.TELEGRAM_BOT_TOKEN
-
-  if (!botToken) {
-    throw new Error('Missing Telegram bot token')
-  }
-
-  const response = await fetch(`https://api.telegram.org/file/bot${botToken}/${filePath}`)
-
-  if (!response.ok) {
-    throw new Error(`Telegram file download failed: ${response.status}`)
-  }
-
-  return response.arrayBuffer()
-}
-
 async function transcribeAudio(audioBuffer: ArrayBuffer, filename = 'voice.ogg'): Promise<string> {
   const baseUrl = process.env.TRANSCRIPTION_BASE_URL
   const apiKey = process.env.TRANSCRIPTION_API_KEY
@@ -5301,60 +5223,6 @@ function formatForTelegramPlainText(text: string): string {
     .replace(/^\s*(-{3,}|\*{3,}|_{3,})\s*$/gm, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
-}
-
-type TelegramInlineKeyboardMarkup = {
-  inline_keyboard: Array<Array<{ text: string; callback_data?: string; url?: string }>>
-}
-
-async function sendTelegramMessage(
-  chatId: number,
-  text: string,
-  replyMarkup?: TelegramInlineKeyboardMarkup
-): Promise<void> {
-  const botToken = process.env.TELEGRAM_BOT_TOKEN
-
-  if (!botToken) {
-    throw new Error('Missing Telegram bot token')
-  }
-
-  const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      reply_markup: replyMarkup,
-    }),
-  })
-
-  if (!response.ok) {
-    throw new Error(`Telegram sendMessage request failed: ${response.status}`)
-  }
-}
-
-async function answerTelegramCallbackQuery(callbackQueryId: string): Promise<void> {
-  const botToken = process.env.TELEGRAM_BOT_TOKEN
-
-  if (!botToken) {
-    throw new Error('Missing Telegram bot token')
-  }
-
-  const response = await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      callback_query_id: callbackQueryId,
-    }),
-  })
-
-  if (!response.ok) {
-    throw new Error(`Telegram answerCallbackQuery request failed: ${response.status}`)
-  }
 }
 
 export async function POST(request: Request) {

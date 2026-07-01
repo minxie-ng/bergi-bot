@@ -1,5 +1,6 @@
 import { isCronAuthorized as isAuthorized } from '@/lib/server/cron-auth'
 import { getServiceRoleSupabase as getSupabase } from '@/lib/server/supabase'
+import { sendTelegramMessage } from '@/lib/telegram/send-message'
 import { getOnboardingState, isOwnerTelegramUser } from '@/lib/user-feature-flags'
 
 type ReminderRow = {
@@ -7,29 +8,6 @@ type ReminderRow = {
   user_id: string
   telegram_chat_id: number
   reminder_text: string
-}
-
-async function sendTelegramMessage(chatId: number, text: string): Promise<void> {
-  const botToken = process.env.TELEGRAM_BOT_TOKEN
-
-  if (!botToken) {
-    throw new Error('Missing Telegram bot token')
-  }
-
-  const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-    }),
-  })
-
-  if (!response.ok) {
-    throw new Error(`Telegram sendMessage request failed: ${response.status}`)
-  }
 }
 
 async function formatReminderDeliveryMessage(params: {

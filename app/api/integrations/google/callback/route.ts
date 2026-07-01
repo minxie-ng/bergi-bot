@@ -6,30 +6,13 @@ import {
   storeGoogleCalendarIntegration,
 } from '@/lib/google-calendar-oauth'
 import { getServiceRoleSupabase as getSupabase } from '@/lib/server/supabase'
+import { sendTelegramMessage } from '@/lib/telegram/send-message'
 
 function htmlResponse(message: string, status = 200): Response {
   return new Response(`<!doctype html><html><body><p>${message}</p></body></html>`, {
     status,
     headers: { 'Content-Type': 'text/html; charset=utf-8' },
   })
-}
-
-async function sendTelegramMessage(chatId: number, text: string): Promise<void> {
-  const botToken = process.env.TELEGRAM_BOT_TOKEN
-
-  if (!botToken) {
-    return
-  }
-
-  const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text }),
-  })
-
-  if (!response.ok) {
-    console.error('google_calendar_oauth_telegram_notify_failed', { status: response.status })
-  }
 }
 
 export async function GET(request: Request) {
@@ -62,10 +45,11 @@ export async function GET(request: Request) {
       tokenExpiry: tokenData.expiry,
     })
 
-    await sendTelegramMessage(
-      statePayload.chatId,
-      'Google Calendar connected. You can now ask me about your schedule.'
-    )
+    await sendTelegramMessage(statePayload.chatId, 'Google Calendar connected. You can now ask me about your schedule.', {
+      missingBotToken: 'return',
+      failedResponse: 'log',
+      failureLogEvent: 'google_calendar_oauth_telegram_notify_failed',
+    })
 
     return htmlResponse('Google Calendar connected. You can return to Telegram.')
   } catch (error) {
