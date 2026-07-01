@@ -1,18 +1,7 @@
-import { createClient } from '@supabase/supabase-js'
 import { NextResponse } from 'next/server'
 
 import { buildGoogleOAuthUrl, createGoogleOAuthState, GoogleCalendarOAuthError } from '@/lib/google-calendar-oauth'
-
-function getSupabase() {
-  const supabaseUrl = process.env.SUPABASE_URL
-  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY
-
-  if (!supabaseUrl || !serviceRoleKey) {
-    throw new Error('Missing Supabase environment variables')
-  }
-
-  return createClient(supabaseUrl, serviceRoleKey)
-}
+import { getServiceRoleSupabase as getSupabase } from '@/lib/server/supabase'
 
 function htmlResponse(message: string, status = 200): Response {
   return new Response(`<!doctype html><html><body><p>${message}</p></body></html>`, {

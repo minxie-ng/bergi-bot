@@ -1,6 +1,6 @@
-import { createClient } from '@supabase/supabase-js'
-
 import { getRecentLifeThreadNotes } from '@/lib/life-thread-notes'
+import { isCronAuthorized as isAuthorized } from '@/lib/server/cron-auth'
+import { getServiceRoleSupabase as getSupabase } from '@/lib/server/supabase'
 import { selectProactiveCheckinMessage } from '@/lib/proactive-message-templates'
 import { isOwnerTelegramUser } from '@/lib/user-feature-flags'
 
@@ -15,17 +15,6 @@ type ProactiveCheckinRow = {
 type ProactiveSendEligibility = {
   enabled: boolean
   isOwner: boolean
-}
-
-function getSupabase() {
-  const supabaseUrl = process.env.SUPABASE_URL
-  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY
-
-  if (!supabaseUrl || !serviceRoleKey) {
-    throw new Error('Missing Supabase environment variables')
-  }
-
-  return createClient(supabaseUrl, serviceRoleKey)
 }
 
 async function sendTelegramMessage(chatId: number, text: string): Promise<void> {
@@ -49,20 +38,6 @@ async function sendTelegramMessage(chatId: number, text: string): Promise<void> 
   if (!response.ok) {
     throw new Error(`Telegram sendMessage request failed: ${response.status}`)
   }
-}
-
-function isAuthorized(request: Request): boolean {
-  const cronSecret = process.env.CRON_SECRET
-
-  if (!cronSecret) {
-    throw new Error('Missing CRON_SECRET')
-  }
-
-  const authorization = request.headers.get('authorization')
-  const bearerToken = authorization?.startsWith('Bearer ') ? authorization.slice('Bearer '.length) : null
-  const querySecret = new URL(request.url).searchParams.get('secret')
-
-  return bearerToken === cronSecret || querySecret === cronSecret
 }
 
 async function getRecentSentProactiveMessages(params: {

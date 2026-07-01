@@ -1,4 +1,5 @@
-import { createClient } from '@supabase/supabase-js'
+import { isCronAuthorized as isAuthorized } from '@/lib/server/cron-auth'
+import { getServiceRoleSupabase as getSupabase } from '@/lib/server/supabase'
 import { getOnboardingState, isOwnerTelegramUser } from '@/lib/user-feature-flags'
 
 type ReminderRow = {
@@ -6,17 +7,6 @@ type ReminderRow = {
   user_id: string
   telegram_chat_id: number
   reminder_text: string
-}
-
-function getSupabase() {
-  const supabaseUrl = process.env.SUPABASE_URL
-  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY
-
-  if (!supabaseUrl || !serviceRoleKey) {
-    throw new Error('Missing Supabase environment variables')
-  }
-
-  return createClient(supabaseUrl, serviceRoleKey)
 }
 
 async function sendTelegramMessage(chatId: number, text: string): Promise<void> {
@@ -70,20 +60,6 @@ async function formatReminderDeliveryMessage(params: {
   }
 
   return `Reminder: ${params.reminderText}`
-}
-
-function isAuthorized(request: Request): boolean {
-  const cronSecret = process.env.CRON_SECRET
-
-  if (!cronSecret) {
-    throw new Error('Missing CRON_SECRET')
-  }
-
-  const authorization = request.headers.get('authorization')
-  const bearerToken = authorization?.startsWith('Bearer ') ? authorization.slice('Bearer '.length) : null
-  const querySecret = new URL(request.url).searchParams.get('secret')
-
-  return bearerToken === cronSecret || querySecret === cronSecret
 }
 
 async function handleSendReminders(request: Request) {
