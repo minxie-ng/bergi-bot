@@ -79,7 +79,41 @@ import {
   GoogleCalendarOAuthError,
   type GoogleCalendarAccess,
 } from '@/lib/google-calendar-oauth'
+import {
+  getProactiveCheckinControlAction,
+  getProactiveCheckinControlActionFromCommand,
+  isLikelyCancelReminderRequest,
+  isLikelyFutureEventMention,
+  isLikelyListRemindersRequest,
+  isLikelyNewReminderCommand,
+  isLikelyReminderPreferenceReply,
+  isLikelyReminderRequest,
+  isLikelyRescheduleReminderRequest,
+  isMeaningfulThoughtSource,
+  isNaturalMemorySummaryRequest,
+  isThoughtCaptureCommand,
+  type ProactiveCheckinControlAction,
+} from '@/lib/routing/intent-detectors'
+import { getTelegramStartPayload, normalizeTelegramCommand } from '@/lib/telegram/commands'
 import { downloadTelegramFile, getTelegramFilePath } from '@/lib/telegram/files'
+import {
+  getAlphaAskNameReply,
+  getAlphaCalendarChoiceReply,
+  getAlphaCalendarNotConfiguredReply,
+  getAlphaCalendarReplyMarkup,
+  getAlphaCalendarUnavailableReply,
+  getAlphaOnboardingDoneReply,
+  getAlphaPrivacyReply,
+  getAlphaProactiveChoiceReply,
+  getAlphaProactiveReplyMarkup,
+  getAlphaStartReply,
+  getAlphaStartReplyMarkup,
+  getFeatureUnavailableReply,
+  getGenericWebhookErrorReply,
+  getGoogleCalendarConnectReply,
+  getHelpReply,
+  getVoiceTooLongReply,
+} from '@/lib/telegram/replies'
 import {
   answerTelegramCallbackQuery,
   sendTelegramMessage,
@@ -312,22 +346,6 @@ type SaveReminderParams = {
   sourceMessageContent: string
 }
 
-type ProactiveCheckinControlAction = 'pause' | 'resume' | 'status'
-type TelegramSlashCommand =
-  | '/start'
-  | '/help'
-  | '/privacy'
-  | '/connect_calendar'
-  | '/disconnect_calendar'
-  | '/calendar_status'
-  | '/stop_checkins'
-  | '/checkin_status'
-  | '/pause_checkins'
-  | '/resume_checkins'
-  | '/list_reminders'
-  | '/capture_this'
-  | '/notes'
-
 type ThoughtCaptureSourceMessage = {
   id: string
   content: string
@@ -365,21 +383,6 @@ function isAllowedTelegramUser(telegramUserId: number): boolean {
     .includes(String(telegramUserId))
 }
 
-function getTelegramStartPayload(text: string | undefined): string | null {
-  if (!text) {
-    return null
-  }
-
-  const [command, ...payloadParts] = text.trim().split(/\s+/)
-  const normalizedCommand = command?.toLowerCase().split('@')[0]
-
-  if (normalizedCommand !== '/start' || payloadParts.length === 0) {
-    return null
-  }
-
-  return payloadParts.join('_').trim() || null
-}
-
 function chooseTelegramPhotoSize(
   photoSizes: NonNullable<TelegramUpdate['message']>['photo']
 ): { file_id: string; width?: number; height?: number; file_size?: number } | null {
@@ -388,331 +391,6 @@ function chooseTelegramPhotoSize(
   }
 
   return photoSizes[photoSizes.length - 1]
-}
-
-function isLikelyReminderRequest(text: string): boolean {
-  const lower = text.toLowerCase()
-  return (
-    lower.includes('remind me') ||
-    lower.includes('reminder') ||
-    lower.includes('提醒我') ||
-    lower.includes('提醒') ||
-    lower.includes('叫我') ||
-    lower.includes('let me know') ||
-    lower.includes('tell me before') ||
-    lower.includes('erinnere mich') ||
-    lower.includes('erinner mich') ||
-    lower.includes('erinnerung') ||
-    lower.includes('erinnere mich daran') ||
-    lower.includes('erinner mich daran')
-  )
-}
-
-function isLikelyFutureEventMention(text: string): boolean {
-  const lower = text.toLowerCase()
-
-  const hasTimeOrDate =
-    /\b\d{1,2}(:\d{2})?\s*(am|pm)\b/i.test(text) ||
-    /\b\d{1,2}\.\d{2}\s*(am|pm)?\b/i.test(text) ||
-    /\b\d{1,2}\s*uhr\b/i.test(text) ||
-    /\b\d{1,2}\.\s*(januar|februar|märz|maerz|april|mai|juni|juli|august|september|oktober|november|dezember)\b/i.test(lower) ||
-    lower.includes('later') ||
-    lower.includes('tomorrow') ||
-    lower.includes('next ') ||
-    lower.includes('today') ||
-    lower.includes('tonight') ||
-    lower.includes('morgen') ||
-    lower.includes('heute') ||
-    lower.includes('heute abend') ||
-    lower.includes('nächste') ||
-    lower.includes('naechste') ||
-    lower.includes('nächsten') ||
-    lower.includes('naechsten') ||
-    lower.includes('明天') ||
-    lower.includes('今天') ||
-    lower.includes('今晚')
-
-  const hasEventWord =
-    lower.includes('meeting') ||
-    lower.includes('class') ||
-    lower.includes('call') ||
-    lower.includes('interview') ||
-    lower.includes('appointment') ||
-    lower.includes('project') ||
-    lower.includes('presentation') ||
-    lower.includes('exam') ||
-    lower.includes('test') ||
-    lower.includes('deadline') ||
-    lower.includes('meetup') ||
-    lower.includes('trek') ||
-    lower.includes('treffen') ||
-    lower.includes('termin') ||
-    lower.includes('unterricht') ||
-    lower.includes('prüfung') ||
-    lower.includes('pruefung') ||
-    lower.includes('projekt') ||
-    lower.includes('projektmeeting') ||
-    lower.includes('anruf') ||
-    lower.includes('präsentation') ||
-    lower.includes('praesentation') ||
-    lower.includes('会议') ||
-    lower.includes('开会') ||
-    lower.includes('课') ||
-    lower.includes('考试') ||
-    lower.includes('面试') ||
-    lower.includes('项目') ||
-    lower.includes('截止')
-
-  return hasTimeOrDate && hasEventWord
-}
-
-function isLikelyReminderPreferenceReply(text: string): boolean {
-  const lower = text.toLowerCase().trim()
-  const standaloneDuration =
-    /^(?:yes,?\s*)?(?:remind me\s*)?\d+\s*(mins?|minutes?|hours?|hrs?)$/i.test(lower) ||
-    /^\d+\s*(minuten|stunden)$/i.test(lower) ||
-    /^\d+\s*(分钟|小时)$/.test(lower)
-
-  return (
-    lower.includes('before') ||
-    lower.includes('vorher') ||
-    /(?:提前\s*\d+\s*(分钟|小时)|\d+\s*(分钟|小时)\s*前)/.test(text) ||
-    standaloneDuration ||
-    lower === 'now' ||
-    lower === 'remind me now' ||
-    lower.includes('现在') ||
-    lower.includes('马上') ||
-    lower === 'no' ||
-    lower === 'nah' ||
-    lower === 'no need' ||
-    lower.includes('不用') ||
-    lower.includes('不需要')
-  )
-}
-
-function isLikelyNewReminderCommand(text: string): boolean {
-  const lower = text.toLowerCase().trim()
-
-  return (
-    lower.includes('remind me to') ||
-    lower.includes('remind me about') ||
-    lower.includes('remind me at') ||
-    lower.includes('remind me in') ||
-    lower.includes('提醒我') ||
-    lower.includes('叫我') ||
-    lower.includes('erinnere mich') ||
-    lower.includes('erinner mich')
-  )
-}
-
-function isLikelyListRemindersRequest(text: string): boolean {
-  const lower = text.toLowerCase().trim()
-  const existingChecks =
-    lower.includes('list reminders') ||
-    lower.includes('show reminders') ||
-    lower.includes('what reminders do i have') ||
-    lower.includes('upcoming reminders') ||
-    lower.includes('my reminders') ||
-    lower.includes('我的提醒') ||
-    lower.includes('提醒列表') ||
-    lower.includes('有哪些提醒') ||
-    lower.includes('welche erinnerungen habe ich') ||
-    lower.includes('meine erinnerungen')
-  const hasListWord =
-    lower.includes('list') ||
-    lower.includes('show') ||
-    lower.includes('see') ||
-    lower.includes('view') ||
-    lower.includes('all') ||
-    lower.includes('有哪些') ||
-    lower.includes('列表') ||
-    lower.includes('zeige') ||
-    lower.includes('anzeigen')
-  const hasReminderWord =
-    lower.includes('reminder') ||
-    lower.includes('reminders') ||
-    lower.includes('提醒') ||
-    lower.includes('erinnerung') ||
-    lower.includes('erinnerungen')
-
-  return existingChecks || (hasListWord && hasReminderWord)
-}
-
-function isLikelyCancelReminderRequest(text: string): boolean {
-  const lower = text.toLowerCase().trim()
-  return (
-    lower.includes('cancel latest reminder') ||
-    lower.includes('cancel last reminder') ||
-    lower.includes('cancel my latest reminder') ||
-    lower.includes('delete latest reminder') ||
-    lower.includes('cancel next reminder') ||
-    lower.includes('delete next reminder') ||
-    lower.includes('remove next reminder') ||
-    lower.includes('cancel reminder') ||
-    lower.includes('delete reminder') ||
-    lower.includes('remove reminder') ||
-    lower.includes('取消最新提醒') ||
-    lower.includes('取消提醒')
-  )
-}
-
-function isLikelyRescheduleReminderRequest(text: string): boolean {
-  const lower = text.toLowerCase().trim()
-
-  const hasReminderWord =
-    lower.includes('reminder') || lower.includes('提醒') || lower.includes('erinnerung')
-
-  const hasRescheduleVerb =
-    lower.includes('reschedule') ||
-    lower.includes('move') ||
-    lower.includes('change') ||
-    lower.includes('update') ||
-    lower.includes('改') ||
-    lower.includes('修改') ||
-    lower.includes('verschiebe') ||
-    lower.includes('ändern') ||
-    lower.includes('aendern')
-
-  return hasReminderWord && hasRescheduleVerb
-}
-
-function normalizeTelegramCommand(text: string): TelegramSlashCommand | null {
-  const firstToken = text.trim().split(/\s+/)[0]?.toLowerCase()
-
-  if (!firstToken?.startsWith('/')) {
-    return null
-  }
-
-  const command = firstToken.split('@')[0]
-
-  switch (command) {
-    case '/start':
-    case '/help':
-    case '/privacy':
-    case '/connect_calendar':
-    case '/disconnect_calendar':
-    case '/calendar_status':
-    case '/stop_checkins':
-    case '/checkin_status':
-    case '/pause_checkins':
-    case '/resume_checkins':
-    case '/list_reminders':
-    case '/capture_this':
-    case '/notes':
-      return command
-    default:
-      return null
-  }
-}
-
-function getHelpReply(): string {
-  return `Not sure what to try? Here are a few things Bergi can help with:
-
-• Send me a normal message or voice note
-• Send me a photo and ask something about it
-• ‘remind me to drink water in 30 minutes’
-• ‘log $5 lunch’
-• ‘what did I spend today?’
-• ‘what’s on my calendar tomorrow?’ if Calendar is connected
-• ‘schedule gym tomorrow 7pm’ if Calendar is connected
-• ‘practise German with me’
-
-Useful controls:
-• /connect_calendar — connect Google Calendar
-• /calendar_status — check Calendar connection
-• /stop_checkins — stop proactive check-ins
-• /privacy — see what Bergi stores`
-}
-
-function getAlphaStartReply(): string {
-  return `Hey, I’m Bergi — Min Xie’s private AI companion project, currently in alpha.
-
-For this short private alpha, I can help with:
-
-• chat naturally with you
-• remember useful life notes
-• understand voice messages
-• understand photos you send
-• practise German casually with you
-• set reminders
-• check in proactively, if you enable it
-• log and query simple finance records
-• help with Google Calendar planning, if you connect Calendar
-
-To work properly, I may store things like your messages, reminders, finance logs, calendar connection status, and useful memory notes.
-
-Please don’t send passwords, private keys, or highly sensitive information.
-
-Ready to try Bergi?`
-}
-
-function getAlphaPrivacyReply(): string {
-  return `Bergi stores only what it needs to work during this private alpha: messages, reminders, finance logs, check-in settings, calendar connection status, and useful memory notes.
-
-Please don’t send passwords, private keys, or highly sensitive information.
-
-Calendar requires connecting Google Calendar later.`
-}
-
-function getAlphaAskNameReply(): string {
-  return 'What should I call you?'
-}
-
-function getAlphaProactiveChoiceReply(): string {
-  return `Do you want Bergi to proactively check in with you during this test?
-
-This is one of Bergi’s core features — it lets Bergi message first instead of only replying when you start the chat.`
-}
-
-function getAlphaCalendarChoiceReply(): string {
-  return `Want to connect Google Calendar?
-
-This lets Bergi help you check your schedule, find free time, and create calendar events after confirmation.`
-}
-
-function getAlphaOnboardingDoneReply(): string {
-  return `You’re set.
-
-Try asking me:
-• send me a voice note
-• send me a photo and ask what I think
-• remind me to drink water in 30 minutes
-• what’s on my calendar tomorrow?
-• when am I free today?
-• schedule gym tomorrow 7pm
-• log $5 lunch
-• check in with me tomorrow morning`
-}
-
-function getAlphaCalendarUnavailableReply(): string {
-  return 'Please connect Google Calendar first.'
-}
-
-function getRuntimeAddress(params: { isOwner: boolean; preferredName?: string | null }): string | null {
-  if (params.isOwner) {
-    return 'minxie'
-  }
-
-  const preferredName = params.preferredName?.trim()
-  return preferredName ? preferredName : null
-}
-
-function getVoiceTooLongReply(params: { isOwner: boolean; preferredName?: string | null }): string {
-  const address = getRuntimeAddress(params)
-  return address
-    ? `wah ${address} this voice note too long sia 😭 keep it under 40 seconds first`
-    : 'wah this voice note too long sia 😭 keep it under 40 seconds first'
-}
-
-function getGenericWebhookErrorReply(params: { isOwner: boolean; preferredName?: string | null }): string {
-  const address = getRuntimeAddress(params)
-  return address
-    ? `eh ${address} I glitch a bit just now 😵‍💫 try again later can?`
-    : 'I glitched a bit just now 😵‍💫 try again later can?'
-}
-
-function getAlphaCalendarNotConfiguredReply(): string {
-  return 'Google Calendar connection is not configured yet. I can still help with reminders and planning in chat.'
 }
 
 function getGoogleCalendarConnectUrl(params: { telegramUserId: number; chatId: number }): string | null {
@@ -730,26 +408,6 @@ function getGoogleCalendarConnectUrl(params: { telegramUserId: number; chatId: n
     return url.toString()
   } catch {
     return null
-  }
-}
-
-function getGoogleCalendarConnectReplyMarkup(connectUrl: string): TelegramInlineKeyboardMarkup {
-  return {
-    inline_keyboard: [[{ text: 'Connect Google Calendar', url: connectUrl }]],
-  }
-}
-
-function getGoogleCalendarConnectReply(connectUrl: string | null): {
-  text: string
-  replyMarkup?: TelegramInlineKeyboardMarkup
-} {
-  if (!connectUrl) {
-    return { text: getAlphaCalendarNotConfiguredReply() }
-  }
-
-  return {
-    text: 'Tap below to connect Google Calendar.',
-    replyMarkup: getGoogleCalendarConnectReplyMarkup(connectUrl),
   }
 }
 
@@ -804,164 +462,6 @@ async function resolveTelegramCalendarAccess(params: {
 
 function getCalendarAccessParams(access: CalendarAccessResolution | null): GoogleCalendarAccess | undefined {
   return access?.canUseCalendar && access.mode === 'oauth' ? access.access : undefined
-}
-
-function getFeatureUnavailableReply(feature: string): string {
-  return `${feature} isn’t available in this alpha yet.`
-}
-
-function getAlphaStartReplyMarkup(): TelegramInlineKeyboardMarkup {
-  return {
-    inline_keyboard: [
-      [{ text: 'Agree and start', callback_data: 'alpha_onboarding_agree' }],
-      [{ text: 'Privacy details', callback_data: 'alpha_onboarding_privacy' }],
-    ],
-  }
-}
-
-function getAlphaProactiveReplyMarkup(): TelegramInlineKeyboardMarkup {
-  return {
-    inline_keyboard: [
-      [{ text: 'Light check-ins — recommended', callback_data: 'alpha_onboarding_proactive_light' }],
-      [{ text: 'No, only reply when I message', callback_data: 'alpha_onboarding_proactive_none' }],
-    ],
-  }
-}
-
-function getAlphaCalendarReplyMarkup(): TelegramInlineKeyboardMarkup {
-  return {
-    inline_keyboard: [
-      [{ text: 'Connect Google Calendar — recommended', callback_data: 'alpha_onboarding_calendar_connect' }],
-      [{ text: 'Skip for now', callback_data: 'alpha_onboarding_calendar_skip' }],
-    ],
-  }
-}
-
-function getProactiveCheckinControlActionFromCommand(
-  command: TelegramSlashCommand | null
-): ProactiveCheckinControlAction | null {
-  switch (command) {
-    case '/checkin_status':
-      return 'status'
-    case '/stop_checkins':
-    case '/pause_checkins':
-      return 'pause'
-    case '/resume_checkins':
-      return 'resume'
-    default:
-      return null
-  }
-}
-
-function getProactiveCheckinControlAction(text: string): ProactiveCheckinControlAction | null {
-  const normalized = text
-    .toLowerCase()
-    .replace(/[’']/g, '')
-    .replace(/[-_]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-  const mentionsCheckins =
-    normalized.includes('check in') ||
-    normalized.includes('checkins') ||
-    normalized.includes('proactive') ||
-    normalized.includes('proactive check') ||
-    normalized.includes('proactive message')
-
-  if (!mentionsCheckins) {
-    return null
-  }
-
-  if (
-    normalized.includes('pause') ||
-    normalized.includes('stop') ||
-    normalized.includes('turn off') ||
-    normalized.includes('disable')
-  ) {
-    return 'pause'
-  }
-
-  if (
-    normalized.includes('resume') ||
-    normalized.includes('start') ||
-    normalized.includes('turn on') ||
-    normalized.includes('enable')
-  ) {
-    return 'resume'
-  }
-
-  if (
-    normalized.includes('status') ||
-    normalized.includes('settings') ||
-    normalized.includes('setting') ||
-    normalized.includes('are check ins on') ||
-    normalized.includes('are checkins on')
-  ) {
-    return 'status'
-  }
-
-  return null
-}
-
-function isThoughtCaptureCommand(text: string): boolean {
-  if (normalizeTelegramCommand(text) === '/capture_this') {
-    return true
-  }
-
-  const normalized = text
-    .toLowerCase()
-    .replace(/[“”]/g, '"')
-    .replace(/[’']/g, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-
-  return (
-    normalized === 'save this thought' ||
-    normalized === 'capture this' ||
-    normalized === 'save that thought' ||
-    normalized === 'remember this as a thread note'
-  )
-}
-
-function isNaturalMemorySummaryRequest(text: string): boolean {
-  const normalized = text
-    .toLowerCase()
-    .replace(/[’']/g, '')
-    .replace(/[?!.。！？]+$/g, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-
-  return (
-    normalized === 'what do you remember from recently' ||
-    normalized === 'what do you remember about me recently' ||
-    normalized === 'what have i been thinking about' ||
-    normalized === 'what did i ask you to keep track of' ||
-    normalized === 'what are my recent thoughts' ||
-    normalized === 'what have i captured recently' ||
-    normalized === 'what did you remember'
-  )
-}
-
-function isMeaningfulThoughtSource(content: string): boolean {
-  const normalized = content
-    .toLowerCase()
-    .replace(/[’']/g, '')
-    .replace(/[.!?。！？]+$/g, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-
-  if (normalized.length < 8) {
-    return false
-  }
-
-  if (normalized.startsWith('/')) {
-    return false
-  }
-
-  if (isThoughtCaptureCommand(content)) {
-    return false
-  }
-
-  return !['yes', 'no', 'ok', 'okay', 'haha', 'idk', 'lol', 'nah', 'yep', 'nope'].includes(normalized)
 }
 
 function cleanJsonResponse(raw: string): string {
